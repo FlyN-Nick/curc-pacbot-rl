@@ -14,33 +14,34 @@ use pyo3::prelude::*;
 use rand::{seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "python")]
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-#[cfg_attr(feature = "python", pyclass)]
+#[pyclass]
 pub struct PacmanGymConfiguration {
     /// If true, other "random" options apply; in addition:
     /// - Pacman starting position is randomized
     /// - Sometimes some of the pellets are wiped from the board
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub random_start: bool,
     /// If this && `random_start`, randomize the ghosts' starting positions
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub randomize_ghosts: bool,
 
     /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub random_ticks: bool,
     /// If `random_ticks`, the minimum number of game ticks per pacman action (randomized per game)
     ///
     /// - Default 4 (3 gu/s), meaning the game steps 4 times for each action Pacman takes
     /// - See [`NORMAL_TICKS_PER_STEP`]
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub random_ticks_per_step_min: u32,
     /// If `random_ticks`, the maximum number of game ticks per pacman action (randomized per game)
     ///
     /// - Default 14 (~0.86 gu/s), meaning the game steps 14 times for each action Pacman takes
     /// - See [`NORMAL_TICKS_PER_STEP`]
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub random_ticks_per_step_max: u32,
 
     /// If true, regular pellets should never appear in the observation, even if present in the game
@@ -48,14 +49,52 @@ pub struct PacmanGymConfiguration {
     /// - Default false
     ///
     /// Note: super pellets may still appear
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
     pub obs_ignore_regular_pellets: bool,
     /// If true, super pellets should never appear in the observation, even if present in the game
     ///
     /// - Default false
     ///
     /// Note: regular pellets may still appear
-    #[cfg_attr(feature = "python", pyo3(get, set))]
+    #[pyo3(get, set)]
+    pub obs_ignore_super_pellets: bool,
+}
+
+#[cfg(not(feature = "python"))]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PacmanGymConfiguration {
+    /// If true, other "random" options apply; in addition:
+    /// - Pacman starting position is randomized
+    /// - Sometimes some of the pellets are wiped from the board
+    pub random_start: bool,
+    /// If this && `random_start`, randomize the ghosts' starting positions
+    pub randomize_ghosts: bool,
+
+    /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
+    pub random_ticks: bool,
+    /// If `random_ticks`, the minimum number of game ticks per pacman action (randomized per game)
+    ///
+    /// - Default 4 (3 gu/s), meaning the game steps 4 times for each action Pacman takes
+    /// - See [`NORMAL_TICKS_PER_STEP`]
+    pub random_ticks_per_step_min: u32,
+    /// If `random_ticks`, the maximum number of game ticks per pacman action (randomized per game)
+    ///
+    /// - Default 14 (~0.86 gu/s), meaning the game steps 14 times for each action Pacman takes
+    /// - See [`NORMAL_TICKS_PER_STEP`]
+    pub random_ticks_per_step_max: u32,
+
+    /// If true, regular pellets should never appear in the observation, even if present in the game
+    ///
+    /// - Default false
+    ///
+    /// Note: super pellets may still appear
+    pub obs_ignore_regular_pellets: bool,
+    /// If true, super pellets should never appear in the observation, even if present in the game
+    ///
+    /// - Default false
+    ///
+    /// Note: regular pellets may still appear
     pub obs_ignore_super_pellets: bool,
 }
 
@@ -163,18 +202,31 @@ impl IntoPy<PyObject> for Action {
     }
 }
 
+#[cfg(feature = "python")]
 #[derive(Clone)]
-#[cfg_attr(feature = "python", pyclass)]
+#[pyclass]
 pub struct PacmanGym {
     pub game_state: GameState,
     last_score: u16,
     last_action: Action,
-    #[cfg_attr(feature = "python", pyo3(get, set))]
-    purgatory_pellets: u16,
-    #[cfg_attr(feature = "python", pyo3(get, set))]
-    ghost_proximities: u32,
+    #[pyo3(get, set)]
+    pub purgatory_pellets: u16,
+    #[pyo3(get, set)]
+    pub ghost_proximities: u32,
 
-    ticks_per_step: u32,
+    pub ticks_per_step: u32,
+}
+
+#[cfg(not(feature = "python"))]
+#[derive(Clone)]
+pub struct PacmanGym {
+    pub game_state: GameState,
+    last_score: u16,
+    last_action: Action,
+    pub purgatory_pellets: u16,
+    pub ghost_proximities: u32,
+
+    pub ticks_per_step: u32,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -195,9 +247,8 @@ fn loc_to_pos(loc: LocationState) -> Option<(usize, usize)> {
     }
 }
 
-#[cfg_attr(feature = "python", pymethods)]
+// Common Rust Implementation
 impl PacmanGym {
-    #[cfg_attr(feature = "python", new)]
     pub fn new(config: &PacmanGymConfiguration) -> Self {
         let mut s = Self {
             purgatory_pellets: 0,
@@ -432,12 +483,6 @@ impl PacmanGym {
         ]
     }
 
-    /// Returns an observation array/tensor constructed from the game state.
-    #[cfg(feature = "python")]
-    pub fn obs_numpy(&self, py: Python<'_>, config: &PacmanGymConfiguration) -> Py<PyArray3<f32>> {
-        self.obs(config).into_pyarray_bound(py).into()
-    }
-
     /// Prints a representation of the game state to standard output.
     pub fn print_game_state(&self) {
         // Print the score.
@@ -488,9 +533,7 @@ impl PacmanGym {
             println!();
         }
     }
-}
 
-impl PacmanGym {
     pub fn set_state(&mut self, new_state: GameState, ticks_per_step: u32) {
         self.game_state = new_state;
         self.ticks_per_step = ticks_per_step;
@@ -636,4 +679,86 @@ impl PacmanGym {
             })
             .sum::<u32>()
     }
+}
+
+// Python Wrappers
+#[cfg(feature = "python")]
+#[pymethods]
+impl PacmanGym {
+    #[new]
+    pub fn py_new(config: &PacmanGymConfiguration) -> Self {
+        Self::new(config)
+    }
+
+    #[pyo3(name = "reset")]
+    pub fn py_reset(&mut self, config: &PacmanGymConfiguration) {
+        self.reset(config)
+    }
+
+    #[pyo3(name = "step")]
+    pub fn py_step(&mut self, action: Action) -> (i32, bool) {
+        self.step(action)
+    }
+
+    #[pyo3(name = "score")]
+    pub fn py_score(&self) -> u32 {
+        self.score()
+    }
+
+    #[pyo3(name = "lives")]
+    pub fn py_lives(&self) -> u8 {
+        self.lives()
+    }
+
+    #[pyo3(name = "is_done")]
+    pub fn py_is_done(&self) -> bool {
+        self.is_done()
+    }
+
+    #[pyo3(name = "first_ai_done")]
+    pub fn py_first_ai_done(&self) -> bool {
+        self.first_ai_done()
+    }
+
+    #[pyo3(name = "all_ghosts_freed")]
+    pub fn py_all_ghosts_freed(&self) -> bool {
+        self.all_ghosts_freed()
+    }
+
+    #[pyo3(name = "all_ghosts_not_frightened")]
+    pub fn py_all_ghosts_not_frightened(&self) -> bool {
+        self.all_ghosts_not_frightened()
+    }
+
+    #[pyo3(name = "are_ghosts_close")]
+    pub fn py_are_ghosts_close(&self) -> bool {
+        self.are_ghosts_close()
+    }
+
+    #[pyo3(name = "remaining_pellets")]
+    pub fn py_remaining_pellets(&self) -> u16 {
+        self.remaining_pellets()
+    }
+
+    #[pyo3(name = "action_mask")]
+    pub fn py_action_mask(&self) -> [bool; 5] {
+        self.action_mask()
+    }
+
+    #[pyo3(name = "purgatory_action_mask")]
+    pub fn py_purgatory_action_mask(&self) -> [bool; 5] {
+        self.purgatory_action_mask()
+    }
+
+    /// Returns an observation array/tensor constructed from the game state.
+    pub fn obs_numpy(&self, py: Python<'_>, config: &PacmanGymConfiguration) -> Py<PyArray3<f32>> {
+        self.obs(config).into_pyarray_bound(py).into()
+    }
+
+    #[pyo3(name = "print_game_state")]
+    pub fn py_print_game_state(&self) {
+        self.print_game_state()
+    }
+
+    // ghost_proximities and purgatory_pellets are properties (get, set) on struct, so no need for methods.
 }
