@@ -8,22 +8,26 @@ edition = "2021"
 name = "pacbot_rs"
 crate-type = ["lib", "cdylib"]
 
+[features]
+default = ["python"]
+python = ["dep:pyo3", "dep:numpy", "dep:serde-pyobject"]
+
 [dependencies]
 array-init = "2.1.0"
 arrayvec = "0.7.4"
 itertools = "0.14.0"
 ndarray = "0.15.6"
 num_enum = "0.7.1"
-numpy = { version = "0.22.0", features = ["gil-refs"] }
+numpy = { version = "0.22.0", features = ["gil-refs"], optional = true }
 ordered-float = "4.1.1"
 phf = "0.11.2"
-pyo3 = { version = "0.22.6", features = ["gil-refs", "py-clone"] }
+pyo3 = { version = "0.22.6", features = ["gil-refs", "py-clone"], optional = true }
 rand = "0.8.5"
 rand_distr = "0.4.3"
 static_assertions = "1.1.0"
 serde = "1.0.217"
 serde_json = "1.0.134"
-serde-pyobject = "0.4.0"
+serde-pyobject = { version = "0.4.0", optional = true }
 
 candle-core = { version = "0.8.1" }
 candle-nn = { version = "0.8.1" }
