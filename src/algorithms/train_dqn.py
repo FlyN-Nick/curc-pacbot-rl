@@ -33,8 +33,8 @@ hyperparam_defaults = {
     "experience_steps": 4,
     "target_network_update_steps": 500,  # Update the target network every ___ steps.
     "evaluate_steps": 10,  # Evaluate every ___ steps.
-    "initial_epsilon": 0.1,
-    "final_epsilon": 0.1 * 0.05,
+    "initial_epsilon": 0.3,
+    "final_epsilon": 0.1,
     "discount_factor": 0.99,
     "reward_scale": 1 / 50,
     "grad_clip_norm": 10_000,
