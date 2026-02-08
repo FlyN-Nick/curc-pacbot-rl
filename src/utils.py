@@ -85,3 +85,46 @@ def step_env_until_done(env: PacmanGym, policy: Policy, device, max_steps: int =
         if done:
             break
     return (env.is_done(), step_num)
+
+def select_device(preferred: str | None = None) -> torch.device:
+    """Select a torch.device with the following preference order:
+    1. If `preferred` is provided, return torch.device(preferred).
+    2. If MPS is available, return 'mps' (Apple Metal on Apple Silicon).
+    3. If CUDA is available, return 'cuda'.
+    4. Otherwise return 'cpu'.
+
+    This helper centralizes device selection so the rest of the codebase can
+    consistently prefer MPS on macOS with Apple Silicon.
+    """
+    if preferred:
+        return torch.device(preferred)
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def to_device(obj, device: torch.device):
+    """Recursively move tensors (or models) to `device`.
+
+    - torch.Tensor -> tensor.to(device)
+    - list/tuple -> same container type with elements moved
+    - dict -> dict with values moved
+    - nn.Module -> module.to(device)
+    - other types are returned as-is
+    """
+    # Import here to avoid circular imports in some execution orders.
+    import torch.nn as nn
+
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, nn.Module):
+        return obj.to(device)
+    if isinstance(obj, list):
+        return [to_device(x, device) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(to_device(x, device) for x in obj)
+    if isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    return obj
