@@ -20,7 +20,7 @@ import models
 from policies import EpsilonGreedy, MaxQPolicy
 from replay_buffer import ReplayBuffer
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION
 
 
 hyperparam_defaults = {
@@ -59,7 +59,7 @@ args = parser.parse_args()
 if not hasattr(models, args.model):
     parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
-device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+device = select_device(args.device)
 print(f"Using device: {device}")
 
 
