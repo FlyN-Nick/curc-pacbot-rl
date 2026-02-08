@@ -48,6 +48,7 @@ parser.add_argument("--no-wandb", action="store_true")
 parser.add_argument("--no-eval", action="store_true")
 parser.add_argument("--checkpoint-dir", default="checkpoints")
 parser.add_argument("--device", default=None)
+parser.add_argument("--save-legacy-checkpoint", action="store_true")
 for name, default_value in hyperparam_defaults.items():
     parser.add_argument(
         f"--{name}",
@@ -64,7 +65,9 @@ print(f"Using device: {device}")
 
 
 reward_scale: float = args.reward_scale
-wandb.init(
+# Prepare wandb init kwargs. We may want to resume an existing run when finetuning from
+# a checkpoint that recorded its wandb run id.
+wandb_init_kwargs = dict(
     project="pacbot-ind-study",
     tags=["DQN"] + (["finetuning"] if args.finetune else []),
     config={
@@ -74,14 +77,60 @@ wandb.init(
     mode="disabled" if args.eval or args.no_wandb else "online",
 )
 
+# If finetuning from a checkpoint, try to read a metadata checkpoint to obtain the
+# original wandb run id so we can resume the run instead of creating a new one.
+if args.finetune and not (args.eval or args.no_wandb):
+    try:
+        ckpt_path = Path(args.finetune)
+        if ckpt_path.exists():
+            # Attempt to load as a metadata dict first (recommended). If it's a legacy
+            # full-model .pt, torch.load will still return a Module instance and we
+            # won't find metadata.
+            data = torch.load(ckpt_path, map_location="cpu")
+            if isinstance(data, dict) and "wandb_run_id" in data:
+                wandb_init_kwargs.update({"id": data.get("wandb_run_id"), "resume": "allow"})
+                print(f"Will resume wandb run id {data.get('wandb_run_id')} from checkpoint {ckpt_path}")
+    except Exception:
+        # Don't block training just because metadata couldn't be read; fall back to
+        # starting a new run.
+        pass
+
+wandb.init(**wandb_init_kwargs)
+
 
 # Initialize the Q network.
 model_class = getattr(models, wandb.config.model)
 q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
 print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
+
+# variables used when resuming from a checkpoint (finetuning)
+resume_iter = 0
+resume_epsilon = 0
 if args.finetune:
-    q_net = torch.load(args.finetune, map_location=device)
-    print(f"Finetuning from parameters from {args.finetune}")
+    # Load checkpoint. Support two formats:
+    # 1) metadata dict: {
+    #      "state_dict": ..., "wandb_run_id": "<id>", "iter_num": int, "config": {...}
+    #    }
+    # 2) legacy: a full torch-saved Module instance.
+    ckpt_path = Path(args.finetune)
+    if ckpt_path.exists():
+        loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+            print(f"Finetuning from checkpoint metadata {args.finetune}")
+            q_net.load_state_dict(loaded["state_dict"])  # type: ignore[arg-type]
+            # If the checkpoint recorded the training iteration or epsilon, record
+            # them so we can resume training exactly where it left off.
+            resume_iter = int(loaded.get("iter_num", 0))
+            resume_epsilon = loaded.get("epsilon", None)
+            ckpt_wandb_id = loaded.get("wandb_run_id")
+            if ckpt_wandb_id:
+                print(f"Loaded checkpoint was created by wandb run id: {ckpt_wandb_id}")
+        else:
+            # Legacy checkpoint saved as full model.
+            print(f"Finetuning from parameters from legacy checkpoint {args.finetune}")
+            q_net = loaded
+    else:
+        raise FileNotFoundError(f"--finetune checkpoint not found: {args.finetune}")
 
 
 @torch.no_grad()
@@ -112,14 +161,16 @@ def train():
         policy=EpsilonGreedy(
             MaxQPolicy(q_net),
             NUM_ACTIONS,
-            wandb.config.initial_epsilon if args.finetune else 1.0,
+            # use epsilon recovered from checkpoint if finetuning,
+            # otherwise use configured initial epsilon
+            resume_epsilon if resume_epsilon is not None else (wandb.config.initial_epsilon if args.finetune else 1.0),
         ),
         num_parallel_envs=wandb.config.num_parallel_envs,
         random_start_proportion=wandb.config.random_start_proportion,
         device=device,
     )
     replay_buffer.fill()
-    replay_buffer.policy.epsilon = wandb.config.initial_epsilon
+    replay_buffer.policy.epsilon = float(resume_epsilon) if resume_epsilon is not None else wandb.config.initial_epsilon
 
     # Initialize the optimizer.
     optimizer = torch.optim.Adam(q_net.parameters(), lr=wandb.config.learning_rate)
@@ -131,7 +182,7 @@ def train():
         torch.autocast(device_type=device.type, dtype=torch.float16) if use_amp else nullcontext()
     )
 
-    for iter_num in tqdm(range(wandb.config.num_iters), smoothing=0.01):
+    for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if iter_num % wandb.config.target_network_update_steps == 0:
             with time_block("Update target network"):
                 # Update the target network.
@@ -238,15 +289,39 @@ def train():
                 checkpoint_dir = Path(args.checkpoint_dir)
                 checkpoint_dir.mkdir(exist_ok=True)
                 pt_path = checkpoint_dir / "q_net-latest.pt"
-                torch.save(q_net, pt_path)
-                shutil.copyfile(pt_path, checkpoint_dir / f"q_net-iter{iter_num:07}.pt")
+                # Legacy: save the full model object as a pickle file for backwards compatibility.
+                if args.save_legacy_checkpoint:
+                    torch.save(q_net, pt_path)
+                    shutil.copyfile(pt_path, checkpoint_dir / f"q_net-iter{iter_num:07}.pt")
+
+                # saves a metadata checkpoint containing the state_dict and
+                # metadata like wandb run id and iteration number in order to resume wandb runs
+                metadata_path = checkpoint_dir / "q_net-latest.ckpt.pt"
+                metadata = {
+                    "state_dict": q_net.state_dict(),
+                    "iter_num": iter_num,
+                    "epsilon": replay_buffer.policy.epsilon,
+                    "config": dict(wandb.config) if hasattr(wandb, "config") else {},
+                }
+                # If wandb has an active run and it has an id, record it.
+                try:
+                    if wandb.run is not None and getattr(wandb.run, "id", None):
+                        metadata["wandb_run_id"] = wandb.run.id
+                except Exception:
+                    pass
+                torch.save(metadata, metadata_path)
+                shutil.copyfile(metadata_path, checkpoint_dir / f"q_net-iter{iter_num:07}.ckpt.pt")
 
                 if iter_num % 1_000 == 0:
-                    # Log checkpoints to WandB.
+                    # upload checkpoint to wandb
                     safetensors_path = checkpoint_dir / "q_net-latest.safetensors"
                     safetensors.torch.save_file(q_net.state_dict(), safetensors_path)
-                    wandb.log_artifact(safetensors_path, type="model")
-                    wandb.log_artifact(pt_path, type="model")
+                    try:
+                        wandb.log_artifact(safetensors_path, type="model")
+                        wandb.log_artifact(metadata_path, type="model")
+                    except Exception:
+                        # Non-fatal: logging artifacts may fail if wandb is disabled.
+                        pass
 
         # Anneal the exploration policy's epsilon.
         replay_buffer.policy.epsilon = lerp(
