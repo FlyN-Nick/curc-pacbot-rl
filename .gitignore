@@ -11,3 +11,7 @@ __pycache__/
 # Artifacts
 wandb/
 src/checkpoints/
+
+# MacOS
+.DS_Store
+

@@ -288,8 +288,7 @@ def train():
                 # Save a checkpoint.
                 checkpoint_dir = Path(args.checkpoint_dir)
                 checkpoint_dir.mkdir(exist_ok=True)
-                pt_path = checkpoint_dir / "q_net-latest.pt"
-                # Legacy: save the full model object as a pickle file for backwards compatibility.
+                pt_path = checkpoint_dir / "q_net-latest.eval.pt"
                 if args.save_legacy_checkpoint:
                     torch.save(q_net, pt_path)
                     shutil.copyfile(pt_path, checkpoint_dir / f"q_net-iter{iter_num:07}.pt")
@@ -364,7 +363,7 @@ def visualize_agent():
 
 
 if args.eval:
-    q_net = torch.load(args.eval, map_location=device)
+    q_net = torch.load(args.eval, map_location=device, weights_only=False)
 else:
     try:
         train()
