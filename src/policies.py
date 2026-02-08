@@ -23,22 +23,28 @@ class EpsilonGreedy(Generic[P]):
 
     def __call__(self, obs: torch.FloatTensor, action_masks: torch.BoolTensor) -> torch.IntTensor:
         batch_size = obs.shape[0]
+        # Determine device from observations and ensure all tensors live there.
+        device = obs.device
 
-        with obs.device:
-            # Sample uniformly-random valid actions.
-            actions = [
-                random.choice([i for i, valid in enumerate(action_mask) if valid])
-                for action_mask in action_masks.cpu()
-            ]
-            actions = torch.tensor(actions)
+        # Sample uniformly-random valid actions (use Python lists for sampling).
+        actions = [
+            random.choice([i for i, valid in enumerate(action_mask.tolist()) if valid])
+            for action_mask in action_masks
+        ]
+        # Create the tensor on the same device as `obs`.
+        actions = torch.tensor(actions, device=device, dtype=torch.int64)
 
-            # Generate a mask that will determine which actions will be greedy.
-            greedy_mask = torch.rand(batch_size) > self.epsilon
+        # Generate a mask that will determine which actions will be greedy (on same device).
+        greedy_mask = (torch.rand(batch_size, device=device) > self.epsilon)
 
-            # Replace the designated actions with actions from the wrapped policy.
-            actions[greedy_mask] = self.original_policy(obs[greedy_mask], action_masks[greedy_mask])
+        # If any indices are greedy, replace those actions with the wrapped policy's choices.
+        if greedy_mask.any():
+            greedy_actions = self.original_policy(obs[greedy_mask], action_masks[greedy_mask])
+            # Ensure dtype and device match before assignment.
+            greedy_actions = greedy_actions.to(device=device)
+            actions[greedy_mask] = greedy_actions
 
-            return actions
+        return actions
 
 
 class MaxQPolicy:
