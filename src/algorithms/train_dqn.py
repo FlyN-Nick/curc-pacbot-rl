@@ -27,13 +27,13 @@ hyperparam_defaults = {
     "learning_rate": 0.0001,
     "batch_size": 512,
     "num_iters": 2_000_000,
-    "replay_buffer_size": 10_000,
+    "replay_buffer_size": 30_000,
     "num_parallel_envs": 32,
     "random_start_proportion": 0.5,
     "experience_steps": 4,
-    "target_network_update_steps": 500,  # Update the target network every ___ steps.
+    "target_network_update_steps": 5_000,  # Update the target network every ___ steps.
     "evaluate_steps": 10,  # Evaluate every ___ steps.
-    "initial_epsilon": 0.3,
+    "initial_epsilon": 0.8,
     "final_epsilon": 0.1,
     "discount_factor": 0.99,
     "reward_scale": 1 / 50,
@@ -363,7 +363,21 @@ def visualize_agent():
 
 
 if args.eval:
-    q_net = torch.load(args.eval, map_location=device, weights_only=False)
+    # handle loading from both legacy checkpoints and metadata checkpoints
+    
+    model_class = getattr(models, wandb.config.model)
+    q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
+    print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
+    
+    ckpt_path = Path(args.eval)
+    if ckpt_path.exists():
+        loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+            q_net.load_state_dict(loaded["state_dict"])
+        else:
+            q_net = loaded
+    else:
+        raise FileNotFoundError(f"--eval checkpoint not found: {args.eval}")
 else:
     try:
         train()
