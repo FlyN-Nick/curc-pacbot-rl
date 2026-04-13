@@ -53,14 +53,13 @@ def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_devi
         'iter_num': iter_num,
         'epsilon': epsilon,
         'config': config,
-        'n_games': n_games,
         'avg_score': float(np.mean(scores)),
         'max_score': float(np.max(scores)),
         'min_score': float(np.min(scores)),
-        'avg_pellets': float(np.mean(pellets)),
-        'board_cleared_rate': float(np.mean(cleared)),
         'score_variance': float(np.var(scores)),
         'score_std': float(np.std(scores)),
+        'avg_pellets': float(np.mean(pellets)),
+        'board_cleared_rate': float(np.mean(cleared)),
     }
 
 # ── 4. Pick N evenly spaced checkpoints from a run ────────────────────────────
@@ -158,12 +157,14 @@ def plot_results(all_run_results: dict, n_games: int, save_image: bool = True):
 def print_hyperparam_table(all_run_results: dict):
     print("\n=== Hyperparameter Comparison ===")
     
+    # Get the first result for each run that actually has a config
     first_results = {
         run_name: results[0] 
         for run_name, results in all_run_results.items() 
-        if results
+        if results and 'config' in results[0]
     }
     if not first_results:
+        print("Config information not available (likely loaded from CSV).")
         return
     
     keys = list(next(iter(first_results.values()))['config'].keys())
@@ -185,16 +186,9 @@ def print_hyperparam_table(all_run_results: dict):
         print(marker)
 
 # ── 8. Export to CSV ──────────────────────────────────────────────────────────
-def export_csv(all_run_results: dict, filename: str = 'eval_results.csv'):
+def export_csv(all_run_results: dict, n_games: int, filename: str = 'eval_results.csv'):
     fieldnames = ['run_name', 'iter_num', 'epsilon', 'avg_score', 'max_score', 'min_score', 'score_std', 'avg_pellets', 'board_cleared_rate', 'score_variance']
     
-    # Extract n_games for metadata if available
-    n_games = "N/A"
-    for results in all_run_results.values():
-        if results:
-            n_games = results[0].get('n_games', "N/A")
-            break
-
     with open(filename, mode='w', newline='') as f:
         f.write(f"# Evaluation metadata: n_games_per_checkpoint={n_games}\n")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -207,9 +201,54 @@ def export_csv(all_run_results: dict, filename: str = 'eval_results.csv'):
                 writer.writerow(row)
     print(f"\nSaved results to {filename}")
 
-# ── 9. Main ───────────────────────────────────────────────────────────────────
+# ── 9. Import from CSV ────────────────────────────────────────────────────────
+def load_csv(filename: str):
+    results_by_run = {}
+    n_games = None
+    with open(filename, mode='r') as f:
+        # Check for metadata line
+        pos = f.tell()
+        first_line = f.readline()
+        if first_line.startswith("# Evaluation metadata:"):
+             parts = first_line.split("n_games_per_checkpoint=")
+             if len(parts) > 1:
+                 try:
+                     n_games = int(parts[1].strip())
+                 except ValueError:
+                     n_games = None
+        else:
+            f.seek(pos)
+            
+        reader = csv.DictReader(f)
+        for row in reader:
+            run_name = row['run_name']
+            if run_name not in results_by_run:
+                results_by_run[run_name] = []
+            
+            # Convert types
+            processed_row = {
+                'iter_num': int(row['iter_num']),
+                'epsilon': float(row['epsilon']),
+                'avg_score': float(row['avg_score']),
+                'max_score': float(row['max_score']),
+                'min_score': float(row['min_score']),
+                'score_std': float(row['score_std']),
+                'avg_pellets': float(row['avg_pellets']),
+                'board_cleared_rate': float(row['board_cleared_rate']),
+                'score_variance': float(row['score_variance'])
+            }
+            results_by_run[run_name].append(processed_row)
+            
+    # Sort results by iter_num for each run
+    for run_name in results_by_run:
+        results_by_run[run_name].sort(key=lambda r: r['iter_num'])
+            
+    return results_by_run, n_games
+
+# ── 10. Main ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate PacBot training runs and plot results.")
+    parser.add_argument("--csv", type=str, help="Path to an existing eval_results.csv file to analyze.")
     parser.add_argument("--n-checkpoints", type=int, default=20, help="Number of checkpoints to evaluate per run (default: 20).")
     parser.add_argument("--n-games", type=int, default=10, help="Number of games to play per checkpoint (default: 10).")
     parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers (default: 4).")
@@ -222,22 +261,29 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    runs = {
-        'run1 (urlriljg)': 'checkpoints_EC2/checkpoints/checkpoints',
-        'run2 (jhx7hq3e)': 'checkpoints_EC2/second-checkpoints/checkpoints',
-        'winnie':          'checkpoints_EC2/winnie-checkpoints/checkpoints',
-    }
+    if args.csv:
+        print(f"Loading results from {args.csv}...")
+        all_run_results, loaded_n_games = load_csv(args.csv)
+        n_games = loaded_n_games if loaded_n_games is not None else args.n_games
+    else:
+        runs = {
+            'run1 (urlriljg)': 'checkpoints_EC2/checkpoints/checkpoints',
+            'run2 (jhx7hq3e)': 'checkpoints_EC2/second-checkpoints/checkpoints',
+            'winnie':          'checkpoints_EC2/winnie-checkpoints/checkpoints',
+        }
 
-    all_run_results = evaluate_all_runs(
-        runs,
-        n_checkpoints=args.n_checkpoints,
-        n_games=args.n_games,
-        max_workers=args.max_workers,
-        all_checkpoints=args.all_checkpoints,
-        device=args.device
-    )
+        all_run_results = evaluate_all_runs(
+            runs,
+            n_checkpoints=args.n_checkpoints,
+            n_games=args.n_games,
+            max_workers=args.max_workers,
+            all_checkpoints=args.all_checkpoints,
+            device=args.device
+        )
+        n_games = args.n_games
+        
+        if args.save_csv:
+            export_csv(all_run_results, n_games=n_games)
     
     print_hyperparam_table(all_run_results)
-    if args.save_csv:
-        export_csv(all_run_results)
-    plot_results(all_run_results, n_games=args.n_games, save_image=args.save_image)
+    plot_results(all_run_results, n_games=n_games, save_image=args.save_image)
