@@ -53,11 +53,14 @@ def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_devi
         'iter_num': iter_num,
         'epsilon': epsilon,
         'config': config,
+        'n_games': n_games,
         'avg_score': float(np.mean(scores)),
         'max_score': float(np.max(scores)),
+        'min_score': float(np.min(scores)),
         'avg_pellets': float(np.mean(pellets)),
         'board_cleared_rate': float(np.mean(cleared)),
         'score_variance': float(np.var(scores)),
+        'score_std': float(np.std(scores)),
     }
 
 # ── 4. Pick N evenly spaced checkpoints from a run ────────────────────────────
@@ -115,9 +118,9 @@ def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max
     return results_by_run
 
 # ── 6. Plot results ────────────────────────────────────────────────────────────
-def plot_results(all_run_results: dict, save_image: bool = True):
+def plot_results(all_run_results: dict, n_games: int, save_image: bool = True):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('PacBot Training Run Comparison', fontsize=16)
+    fig.suptitle(f'PacBot Training Run Comparison ({n_games} games/checkpoint)', fontsize=16)
 
     metrics = [
         ('avg_score', 'Average Score'),
@@ -183,8 +186,17 @@ def print_hyperparam_table(all_run_results: dict):
 
 # ── 8. Export to CSV ──────────────────────────────────────────────────────────
 def export_csv(all_run_results: dict, filename: str = 'eval_results.csv'):
-    fieldnames = ['run_name', 'iter_num', 'epsilon', 'avg_score', 'max_score', 'avg_pellets', 'board_cleared_rate', 'score_variance']
+    fieldnames = ['run_name', 'iter_num', 'epsilon', 'avg_score', 'max_score', 'min_score', 'score_std', 'avg_pellets', 'board_cleared_rate', 'score_variance']
+    
+    # Extract n_games for metadata if available
+    n_games = "N/A"
+    for results in all_run_results.values():
+        if results:
+            n_games = results[0].get('n_games', "N/A")
+            break
+
     with open(filename, mode='w', newline='') as f:
+        f.write(f"# Evaluation metadata: n_games_per_checkpoint={n_games}\n")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for run_name, results in all_run_results.items():
@@ -228,4 +240,4 @@ if __name__ == "__main__":
     print_hyperparam_table(all_run_results)
     if args.save_csv:
         export_csv(all_run_results)
-    plot_results(all_run_results, save_image=args.save_image)
+    plot_results(all_run_results, n_games=args.n_games, save_image=args.save_image)
