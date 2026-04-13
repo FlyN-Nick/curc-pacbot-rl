@@ -9,6 +9,7 @@ import models
 from policies import MaxQPolicy
 from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done
 import argparse
+from tqdm import tqdm
 
 # ── 1. Load model ──────────────────────────────────────────────────────────────
 def load_checkpoint(ckpt_path: str, device: torch.device):
@@ -102,14 +103,17 @@ def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max
             future = executor.submit(evaluate_checkpoint_worker, ckpt, n_games, worker_device)
             future_to_task[future] = (run_name, ckpt)
             
-        for future in as_completed(future_to_task):
-            run_name, ckpt = future_to_task[future]
-            try:
-                result = future.result()
-                results_by_run[run_name].append(result)
-                print(f"  [{run_name}] iter={result['iter_num']}, avg_score={result['avg_score']:.1f}, max_score={result['max_score']}")
-            except Exception as e:
-                print(f"  [{run_name}] {ckpt} failed: {e}")
+        with tqdm(total=len(tasks), desc="Evaluating checkpoints") as pbar:
+            for future in as_completed(future_to_task):
+                run_name, ckpt = future_to_task[future]
+                try:
+                    result = future.result()
+                    results_by_run[run_name].append(result)
+                    # pbar.set_postfix({"run": run_name, "iter": result['iter_num'], "score": f"{result['avg_score']:.1f}"})
+                except Exception as e:
+                    tqdm.write(f"  [{run_name}] {ckpt} failed: {e}")
+                finally:
+                    pbar.update(1)
     
     for run_name in results_by_run:
         results_by_run[run_name].sort(key=lambda r: r['iter_num'])
