@@ -2,6 +2,7 @@ import torch
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
+import csv
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pacbot_rs import PacmanGym
 import models
@@ -175,7 +176,21 @@ def print_hyperparam_table(all_run_results: dict):
             print(f"{v:<{col_width}}", end="")
         print(marker)
 
-# ── 8. Main ───────────────────────────────────────────────────────────────────
+# ── 8. Export to CSV ──────────────────────────────────────────────────────────
+def export_csv(all_run_results: dict, filename: str = 'eval_results.csv'):
+    fieldnames = ['run_name', 'iter_num', 'epsilon', 'avg_score', 'max_score', 'avg_pellets', 'board_cleared_rate', 'score_variance']
+    with open(filename, mode='w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for run_name, results in all_run_results.items():
+            for r in results:
+                row = {'run_name': run_name}
+                for field in fieldnames[1:]:
+                    row[field] = r.get(field, '')
+                writer.writerow(row)
+    print(f"\nSaved results to {filename}")
+
+# ── 9. Main ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate PacBot training runs and plot results.")
     parser.add_argument("--n-checkpoints", type=int, default=20, help="Number of checkpoints to evaluate per run (default: 20).")
@@ -184,6 +199,8 @@ if __name__ == "__main__":
     parser.add_argument("--all-checkpoints", action="store_true", help="Evaluate all available checkpoints (overrides --n-checkpoints).")
     parser.add_argument("--save-image", action="store_true", default=True, help="Save the plot as 'eval_results.png' (default: True).")
     parser.add_argument("--no-save-image", action="store_false", dest="save_image", help="Do not save the plot as an image.")
+    parser.add_argument("--save-csv", action="store_true", default=True, help="Save the results as 'eval_results.csv' (default: True).")
+    parser.add_argument("--no-save-csv", action="store_false", dest="save_csv", help="Do not save the results as a CSV.")
     
     args = parser.parse_args()
 
@@ -202,4 +219,6 @@ if __name__ == "__main__":
     )
     
     print_hyperparam_table(all_run_results)
+    if args.save_csv:
+        export_csv(all_run_results)
     plot_results(all_run_results, save_image=args.save_image)
