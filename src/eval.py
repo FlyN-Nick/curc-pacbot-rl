@@ -3,7 +3,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import csv
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pacbot_rs import PacmanGym
 import models
 from policies import MaxQPolicy
@@ -37,7 +38,7 @@ def evaluate_episode(q_net, device: torch.device, max_steps: int = 1000):
     }
 
 # ── 3. Evaluate one checkpoint (runs in separate process) ─────────────────────
-def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_device: str = None):
+def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_device: str = None, progress_queue=None):
     """This function runs in a separate process."""
     device = select_device(preferred_device)
     q_net, iter_num, epsilon, config = load_checkpoint(ckpt_path, device)
@@ -48,6 +49,8 @@ def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_devi
         scores.append(result['score'])
         pellets.append(result['pellets_eaten'])
         cleared.append(result['board_cleared'])
+        if progress_queue is not None:
+            progress_queue.put(1)
     
     return {
         'ckpt_path': ckpt_path,
@@ -95,25 +98,36 @@ def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max
     print(f"Evaluating {len(tasks)} checkpoints across {len(runs)} runs ({max_workers} workers)...")
     
     results_by_run = {run_name: [] for run_name in runs}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_task = {}
-        for i, (run_name, ckpt) in enumerate(tasks):
-            # Cycle through devices for each task
-            worker_device = device_list[i % len(device_list)]
-            future = executor.submit(evaluate_checkpoint_worker, ckpt, n_games, worker_device)
-            future_to_task[future] = (run_name, ckpt)
-            
-        with tqdm(total=len(tasks), desc="Evaluating checkpoints") as pbar:
-            for future in as_completed(future_to_task):
-                run_name, ckpt = future_to_task[future]
-                try:
-                    result = future.result()
-                    results_by_run[run_name].append(result)
-                    # pbar.set_postfix({"run": run_name, "iter": result['iter_num'], "score": f"{result['avg_score']:.1f}"})
-                except Exception as e:
-                    tqdm.write(f"  [{run_name}] {ckpt} failed: {e}")
-                finally:
-                    pbar.update(1)
+    with multiprocessing.Manager() as manager:
+        progress_queue = manager.Queue()
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {}
+            for i, (run_name, ckpt) in enumerate(tasks):
+                # Cycle through devices for each task
+                worker_device = device_list[i % len(device_list)]
+                future = executor.submit(evaluate_checkpoint_worker, ckpt, n_games, worker_device, progress_queue)
+                future_to_task[future] = (run_name, ckpt)
+                
+            with tqdm(total=len(tasks) * n_games, desc="Evaluating games") as pbar:
+                pending = list(future_to_task.keys())
+                while pending:
+                    # Wait for any future to finish, but time out frequently to update progress
+                    done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                    
+                    # Update progress bar from queue
+                    while not progress_queue.empty():
+                        try:
+                            pbar.update(progress_queue.get_nowait())
+                        except:
+                            break
+                    
+                    for future in done:
+                        run_name, ckpt = future_to_task[future]
+                        try:
+                            result = future.result()
+                            results_by_run[run_name].append(result)
+                        except Exception as e:
+                            tqdm.write(f"  [{run_name}] {ckpt} failed: {e}")
     
     for run_name in results_by_run:
         results_by_run[run_name].sort(key=lambda r: r['iter_num'])
