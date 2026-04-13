@@ -134,12 +134,7 @@ def plot_results(all_run_results: dict, n_games: int, save_image: bool = True):
                 continue
             iters = [r['iter_num'] for r in results]
             values = [r[metric] for r in results]
-            ax.plot(iters, values, marker='o', label=run_name)
-
-            for r in results:
-                if r['epsilon'] < 0.5:
-                    ax.axvline(x=r['iter_num'], color='red', linestyle='--', alpha=0.3, label='ε < 0.5')
-                    break
+            ax.plot(iters, values, label=run_name)
 
         ax.set_title(title)
         ax.set_xlabel('Iteration')
@@ -199,7 +194,33 @@ def export_csv(all_run_results: dict, n_games: int, filename: str = 'eval_result
                 for field in fieldnames[1:]:
                     row[field] = r.get(field, '')
                 writer.writerow(row)
-    print(f"\nSaved results to {filename}")
+    print(f"Saved results to {filename}")
+
+def export_hyperparams_csv(all_run_results: dict, filename: str = 'eval_hyperparams.csv'):
+    # Get the first result for each run that actually has a config
+    first_results = {
+        run_name: results[0] 
+        for run_name, results in all_run_results.items() 
+        if results and 'config' in results[0]
+    }
+    if not first_results:
+        return
+    
+    keys = list(next(iter(first_results.values()))['config'].keys())
+    run_names = list(first_results.keys())
+    
+    with open(filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        # Header: Hyperparameter, Run1, Run2, ...
+        writer.writerow(['Hyperparameter'] + run_names)
+        
+        for key in keys:
+            row = [key]
+            for run_name in run_names:
+                val = first_results[run_name]['config'].get(key, 'N/A')
+                row.append(val)
+            writer.writerow(row)
+    print(f"Saved hyperparameters to {filename}")
 
 # ── 9. Import from CSV ────────────────────────────────────────────────────────
 def load_csv(filename: str):
@@ -284,6 +305,7 @@ if __name__ == "__main__":
         
         if args.save_csv:
             export_csv(all_run_results, n_games=n_games)
+            export_hyperparams_csv(all_run_results)
     
     print_hyperparam_table(all_run_results)
     plot_results(all_run_results, n_games=n_games, save_image=args.save_image)
