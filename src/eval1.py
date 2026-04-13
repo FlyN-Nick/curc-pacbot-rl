@@ -7,6 +7,7 @@ from pacbot_rs import PacmanGym
 import models
 from policies import MaxQPolicy
 from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done
+import argparse
 
 device = select_device(None)
 
@@ -60,21 +61,25 @@ def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10):
     }
 
 # ── 4. Pick N evenly spaced checkpoints from a run ────────────────────────────
-def pick_checkpoints(run_dir: str, n: int = 5):
+def pick_checkpoints(run_dir: str, n: int = 5, all_checkpoints: bool = False):
     ckpts = sorted(
         [p for p in Path(run_dir).glob("*.ckpt.pt") if 'latest' not in p.name],
         key=lambda p: int(p.stem.split('iter')[1].split('.')[0])
     )
     if not ckpts:
         return []
+    
+    if all_checkpoints:
+        return [str(p) for p in ckpts]
+        
     indices = np.linspace(0, len(ckpts) - 1, min(n, len(ckpts)), dtype=int)
     return [str(ckpts[i]) for i in indices]
 
 # ── 5. Evaluate all runs in parallel ──────────────────────────────────────────
-def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max_workers: int = 4):
+def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max_workers: int = 4, all_checkpoints: bool = False):
     tasks = []
     for run_name, run_dir in runs.items():
-        ckpts = pick_checkpoints(run_dir, n=n_checkpoints)
+        ckpts = pick_checkpoints(run_dir, n=n_checkpoints, all_checkpoints=all_checkpoints)
         if not ckpts:
             print(f"No checkpoints found in {run_dir}, skipping.")
             continue
@@ -104,7 +109,7 @@ def evaluate_all_runs(runs: dict, n_checkpoints: int = 5, n_games: int = 10, max
     return results_by_run
 
 # ── 6. Plot results ────────────────────────────────────────────────────────────
-def plot_results(all_run_results: dict):
+def plot_results(all_run_results: dict, save_image: bool = True):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle('PacBot Training Run Comparison', fontsize=16)
 
@@ -135,8 +140,9 @@ def plot_results(all_run_results: dict):
         ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig('eval_results.png', dpi=150)
-    print("\nSaved graphs to eval_results.png")
+    if save_image:
+        plt.savefig('eval_results.png', dpi=150)
+        print("\nSaved graphs to eval_results.png")
     plt.show()
 
 # ── 7. Print hyperparameter comparison table ──────────────────────────────────
@@ -171,6 +177,16 @@ def print_hyperparam_table(all_run_results: dict):
 
 # ── 8. Main ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate PacBot training runs and plot results.")
+    parser.add_argument("--n-checkpoints", type=int, default=20, help="Number of checkpoints to evaluate per run (default: 20).")
+    parser.add_argument("--n-games", type=int, default=10, help="Number of games to play per checkpoint (default: 10).")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers (default: 4).")
+    parser.add_argument("--all-checkpoints", action="store_true", help="Evaluate all available checkpoints (overrides --n-checkpoints).")
+    parser.add_argument("--save-image", action="store_true", default=True, help="Save the plot as 'eval_results.png' (default: True).")
+    parser.add_argument("--no-save-image", action="store_false", dest="save_image", help="Do not save the plot as an image.")
+    
+    args = parser.parse_args()
+
     runs = {
         'run1 (urlriljg)': 'checkpoints_EC2/checkpoints/checkpoints',
         'run2 (jhx7hq3e)': 'checkpoints_EC2/second-checkpoints/checkpoints',
@@ -179,10 +195,11 @@ if __name__ == "__main__":
 
     all_run_results = evaluate_all_runs(
         runs,
-        n_checkpoints=5,
-        n_games=10,
-        max_workers=4,
+        n_checkpoints=args.n_checkpoints,
+        n_games=args.n_games,
+        max_workers=args.max_workers,
+        all_checkpoints=args.all_checkpoints
     )
     
     print_hyperparam_table(all_run_results)
-    plot_results(all_run_results)
+    plot_results(all_run_results, save_image=args.save_image)
