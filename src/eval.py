@@ -185,6 +185,29 @@ def print_hyperparam_table(all_run_results: dict):
         print(marker)
 
 # ── 8. Export to CSV ──────────────────────────────────────────────────────────
+def print_best_checkpoints(all_run_results: dict, top_n: int = 5):
+    all_checkpoints = []
+    for run_name, results in all_run_results.items():
+        for r in results:
+            ckpt_info = r.copy()
+            ckpt_info['run_name'] = run_name
+            all_checkpoints.append(ckpt_info)
+    
+    if not all_checkpoints:
+        return
+
+    print(f"\n=== Top {top_n} Checkpoints by Average Score ===")
+    top_avg = sorted(all_checkpoints, key=lambda x: x['avg_score'], reverse=True)[:top_n]
+    print(f"{'Run':<20} {'Iter':<10} {'Avg Score':<12} {'Max Score':<12} {'Clear Rate':<12}")
+    for r in top_avg:
+        print(f"{r['run_name'][:20]:<20} {r['iter_num']:<10} {r['avg_score']:<12.1f} {r['max_score']:<12.1f} {r.get('board_cleared_rate', 0):<12.2%}")
+
+    print(f"\n=== Top {top_n} Checkpoints by Highest Score ===")
+    top_max = sorted(all_checkpoints, key=lambda x: x['max_score'], reverse=True)[:top_n]
+    print(f"{'Run':<20} {'Iter':<10} {'Max Score':<12} {'Avg Score':<12} {'Clear Rate':<12}")
+    for r in top_max:
+        print(f"{r['run_name'][:20]:<20} {r['iter_num']:<10} {r['max_score']:<12.1f} {r['avg_score']:<12.1f} {r.get('board_cleared_rate', 0):<12.2%}")
+
 def export_csv(all_run_results: dict, n_games: int, filename: str = 'eval_results.csv'):
     fieldnames = ['run_name', 'iter_num', 'epsilon', 'avg_score', 'max_score', 'min_score', 'score_std', 'avg_pellets', 'board_cleared_rate', 'score_variance']
     
@@ -312,4 +335,5 @@ if __name__ == "__main__":
             export_hyperparams_csv(all_run_results)
     
     print_hyperparam_table(all_run_results)
+    print_best_checkpoints(all_run_results)
     plot_results(all_run_results, n_games=n_games, save_image=args.save_image)
