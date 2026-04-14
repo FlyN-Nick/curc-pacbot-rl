@@ -41,11 +41,12 @@ def safetensors_qnet(filename: str, force_reload: bool=False, device="cpu") -> P
     """
     Safe to call in a loop, uses cached policies
     """
-    if not force_reload and filename in LOADED_POLICIES:
-        return LOADED_POLICIES[filename]
+    cache_key = (filename, str(device))
+    if not force_reload and cache_key in LOADED_POLICIES:
+        return LOADED_POLICIES[cache_key]
     
-    LOADED_POLICIES[filename] = load_qnetv2_from_file(filename, device)
-    return LOADED_POLICIES[filename]
+    LOADED_POLICIES[cache_key] = load_qnetv2_from_file(filename, device)
+    return LOADED_POLICIES[cache_key]
 
 def _step_always_with(env: PacmanGym, policy: Policy, config: PacmanGymConfiguration, action_mask: list[bool], device) -> tuple[int, bool]:
     obs = torch.from_numpy(env.obs_numpy(config)).to(device).unsqueeze(0)
