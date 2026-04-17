@@ -4,10 +4,10 @@ import copy
 import itertools
 from pathlib import Path
 import shutil
+import signal
 import time
 import numpy as np
 
-import safetensors.torch
 import torch
 import torch.nn.functional as F
 import wandb
@@ -15,6 +15,20 @@ from tqdm import tqdm
 
 
 from pacbot_rs import PacmanGym
+
+
+_exit_requested = False
+
+def _request_exit(signum, frame):
+    global _exit_requested
+    _exit_requested = True
+    print("\nExit requested — saving checkpoint before stopping...")
+
+
+def atomic_torch_save(obj, path: Path) -> None:
+    tmp = path.with_suffix(".tmp")
+    torch.save(obj, tmp)
+    tmp.rename(path)
 
 import models
 from policies import EpsilonGreedy, MaxQPolicy
@@ -34,7 +48,7 @@ hyperparam_defaults = {
     "target_network_update_steps": 5_000,  # Update the target network every ___ steps.
     "evaluate_steps": 10,  # Evaluate every ___ steps.
     "initial_epsilon": 0.8,
-    "final_epsilon": 0.1,
+    "final_epsilon": 0.4,
     "discount_factor": 0.99,
     "reward_scale": 1 / 50,
     "grad_clip_norm": 10_000,
@@ -106,6 +120,8 @@ print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
 # variables used when resuming from a checkpoint (finetuning)
 resume_iter = 0
 resume_epsilon = 0
+resume_optimizer_state = None
+resume_best_eval_score = -float("inf")
 if args.finetune:
     # Load checkpoint. Support two formats:
     # 1) metadata dict: {
@@ -122,6 +138,8 @@ if args.finetune:
             # them so we can resume training exactly where it left off.
             resume_iter = int(loaded.get("iter_num", 0))
             resume_epsilon = loaded.get("epsilon", None)
+            resume_optimizer_state = loaded.get("optimizer_state_dict", None)
+            resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
             ckpt_wandb_id = loaded.get("wandb_run_id")
             if ckpt_wandb_id:
                 print(f"Loaded checkpoint was created by wandb run id: {ckpt_wandb_id}")
@@ -174,6 +192,9 @@ def train():
 
     # Initialize the optimizer.
     optimizer = torch.optim.Adam(q_net.parameters(), lr=wandb.config.learning_rate)
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+        print("Restored optimizer state from checkpoint")
 
     # Automatic Mixed Precision stuff.
     use_amp = False  # device.type == "cuda"
@@ -182,7 +203,35 @@ def train():
         torch.autocast(device_type=device.type, dtype=torch.float16) if use_amp else nullcontext()
     )
 
+    best_eval_score = resume_best_eval_score
+
+    def build_metadata(iter_num: int) -> dict:
+        metadata = {
+            "state_dict": q_net.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "iter_num": iter_num,
+            "epsilon": replay_buffer.policy.epsilon,
+            "best_eval_score": best_eval_score,
+            "config": dict(wandb.config) if hasattr(wandb, "config") else {},
+        }
+        try:
+            if wandb.run is not None and getattr(wandb.run, "id", None):
+                metadata["wandb_run_id"] = wandb.run.id
+        except Exception:
+            pass
+        return metadata
+
+    prev_sigint = signal.signal(signal.SIGINT, _request_exit)
+
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
+        if _exit_requested:
+            checkpoint_dir = Path(args.checkpoint_dir)
+            checkpoint_dir.mkdir(exist_ok=True)
+            metadata_path = checkpoint_dir / "q_net-latest.ckpt.pt"
+            atomic_torch_save(build_metadata(iter_num), metadata_path)
+            shutil.copyfile(metadata_path, checkpoint_dir / f"q_net-iter{iter_num:07}.ckpt.pt")
+            print(f"Checkpoint saved at iter {iter_num}.")
+            break
         if iter_num % wandb.config.target_network_update_steps == 0:
             with time_block("Update target network"):
                 # Update the target network.
@@ -281,6 +330,11 @@ def train():
                         purgatory_pellets=purgatory_pellets,
                         ghost_proximities=ghost_proximities,
                     )
+                    if eval_episode_score > best_eval_score:
+                        best_eval_score = eval_episode_score
+                        checkpoint_dir = Path(args.checkpoint_dir)
+                        checkpoint_dir.mkdir(exist_ok=True)
+                        atomic_torch_save(build_metadata(iter_num), checkpoint_dir / "q_net-best.ckpt.pt")
             wandb.log(metrics)
 
         if iter_num % 500 == 0:
@@ -290,34 +344,19 @@ def train():
                 checkpoint_dir.mkdir(exist_ok=True)
                 pt_path = checkpoint_dir / "q_net-latest.eval.pt"
                 if args.save_legacy_checkpoint:
-                    torch.save(q_net, pt_path)
+                    atomic_torch_save(q_net, pt_path)
                     shutil.copyfile(pt_path, checkpoint_dir / f"q_net-iter{iter_num:07}.pt")
 
                 # saves a metadata checkpoint containing the state_dict and
                 # metadata like wandb run id and iteration number in order to resume wandb runs
                 metadata_path = checkpoint_dir / "q_net-latest.ckpt.pt"
-                metadata = {
-                    "state_dict": q_net.state_dict(),
-                    "iter_num": iter_num,
-                    "epsilon": replay_buffer.policy.epsilon,
-                    "config": dict(wandb.config) if hasattr(wandb, "config") else {},
-                }
-                # If wandb has an active run and it has an id, record it.
-                try:
-                    if wandb.run is not None and getattr(wandb.run, "id", None):
-                        metadata["wandb_run_id"] = wandb.run.id
-                except Exception:
-                    pass
-                torch.save(metadata, metadata_path)
-                shutil.copyfile(metadata_path, checkpoint_dir / f"q_net-iter{iter_num:07}.ckpt.pt")
+                iter_ckpt_path = checkpoint_dir / f"q_net-iter{iter_num:07}.ckpt.pt"
+                atomic_torch_save(build_metadata(iter_num), metadata_path)
+                shutil.copyfile(metadata_path, iter_ckpt_path)
 
                 if iter_num % 1_000 == 0:
-                    # upload checkpoint to wandb
-                    safetensors_path = checkpoint_dir / "q_net-latest.safetensors"
-                    safetensors.torch.save_file(q_net.state_dict(), safetensors_path)
                     try:
-                        wandb.log_artifact(safetensors_path, type="model")
-                        wandb.log_artifact(metadata_path, type="model")
+                        wandb.log_artifact(str(iter_ckpt_path), name=f"q_net-iter{iter_num:07}", type="model")
                     except Exception:
                         # Non-fatal: logging artifacts may fail if wandb is disabled.
                         pass
@@ -333,6 +372,8 @@ def train():
         with time_block("Collect experience"):
             for _ in range(wandb.config.experience_steps):
                 replay_buffer.generate_experience_step()
+
+    signal.signal(signal.SIGINT, prev_sigint)
 
 
 @torch.no_grad()
