@@ -223,6 +223,9 @@ def train():
 
     prev_sigint = signal.signal(signal.SIGINT, _request_exit)
 
+    target_q_net = copy.deepcopy(q_net)
+    target_q_net.eval()
+
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if _exit_requested:
             checkpoint_dir = Path(args.checkpoint_dir)
