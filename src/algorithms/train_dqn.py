@@ -2,6 +2,7 @@ from argparse import ArgumentParser
 from contextlib import nullcontext
 import copy
 import itertools
+import json
 from pathlib import Path
 import shutil
 import signal
@@ -37,23 +38,8 @@ from timing import time_block
 from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION
 
 
-hyperparam_defaults = {
-    "learning_rate": 0.0001,
-    "batch_size": 512,
-    "num_iters": 2_000_000,
-    "replay_buffer_size": 30_000,
-    "num_parallel_envs": 32,
-    "random_start_proportion": 0.5,
-    "experience_steps": 4,
-    "target_network_update_steps": 5_000,  # Update the target network every ___ steps.
-    "evaluate_steps": 10,  # Evaluate every ___ steps.
-    "initial_epsilon": 0.8,
-    "final_epsilon": 0.4,
-    "discount_factor": 0.99,
-    "reward_scale": 1 / 50,
-    "grad_clip_norm": 10_000,
-    "model": "QNetV2"
-}
+_hyperparams_path = Path(__file__).parent / "hyperparams.json"
+hyperparam_defaults: dict = json.loads(_hyperparams_path.read_text())
 
 parser = ArgumentParser()
 parser.add_argument("--eval", metavar="CHECKPOINT", default=None)
