@@ -329,10 +329,13 @@ if __name__ == "__main__":
         n_games = loaded_n_games if loaded_n_games is not None else args.n_games
     else:
         runs = {
-            'nick_ec2': 'checkpoints_EC2/carl/checkpoints',
-            'nick_local': 'checkpoints/',
-            'winnie_ec2': 'checkpoints_EC2/winnie-new/checkpoints',
-            
+            'winnie_ec2': 'checkpoints_all/winnie_ec2/checkpoints',
+            'nick_ec2': 'checkpoints_all/nick_ec2/checkpoints',
+            'nick_local_current': 'checkpoints/',
+            'nick_local_first': 'checkpoints_all/nick_local_first/checkpoints',
+            'nick_local_second': 'checkpoints/nick_local_second/checkpoints',
+            'nick_local_third': 'checkpoints/nick_local_third/checkpoints',
+            'nick_local_fourth': 'checkpoints/nick_local_fourth/checkpoints',
         }
 
         all_run_results = evaluate_all_runs(
