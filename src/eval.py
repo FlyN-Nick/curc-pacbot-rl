@@ -69,7 +69,7 @@ def evaluate_checkpoint_worker(ckpt_path: str, n_games: int = 10, preferred_devi
 # ── 4. Pick N evenly spaced checkpoints from a run ────────────────────────────
 def pick_checkpoints(run_dir: str, n: int = 5, all_checkpoints: bool = False):
     ckpts = sorted(
-        [p for p in Path(run_dir).glob("*.ckpt.pt") if 'latest' not in p.name],
+        [p for p in Path(run_dir).glob("*.ckpt.pt") if 'latest' not in p.name and 'best' not in p.name],
         key=lambda p: int(p.stem.split('iter')[1].split('.')[0])
     )
     if not ckpts:
@@ -329,9 +329,10 @@ if __name__ == "__main__":
         n_games = loaded_n_games if loaded_n_games is not None else args.n_games
     else:
         runs = {
-            'run1 (urlriljg)': 'checkpoints_EC2/checkpoints/checkpoints',
-            'run2 (jhx7hq3e)': 'checkpoints_EC2/second-checkpoints/checkpoints',
-            'winnie':          'checkpoints_EC2/winnie-checkpoints/checkpoints',
+            'nick_ec2': 'checkpoints_EC2/carl/checkpoints',
+            'nick_local': 'checkpoints/',
+            'winnie_ec2': 'checkpoints_EC2/winnie-new/checkpoints',
+            
         }
 
         all_run_results = evaluate_all_runs(
