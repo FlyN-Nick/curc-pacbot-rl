@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "pacbot-rl-models"
+version = "0.1.0"
+description = "Runtime neural network models for PacBot reinforcement learning."
+authors = ["Quinn Tucker <qxzcraft@gmail.com>"]
+packages = [{ include = "pacbot_rl_models" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "^2.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
