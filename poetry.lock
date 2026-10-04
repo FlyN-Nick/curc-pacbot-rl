@@ -1779,6 +1779,23 @@ files = [
 ]
 
 [[package]]
+name = "pacbot-rl-models"
+version = "0.1.0"
+description = "Runtime neural network models for PacBot reinforcement learning."
+optional = false
+python-versions = "^3.10"
+groups = ["main"]
+files = []
+develop = true
+
+[package.dependencies]
+torch = "^2.1.0"
+
+[package.source]
+type = "directory"
+url = "model_package"
+
+[[package]]
 name = "packaging"
 version = "26.0"
 description = "Core utilities for Python packages"
@@ -3183,4 +3200,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "8e0d25044e8cf10a7cf9ddb4ae0895ccfebac5444aac699599dbc0a8ccc72431"
+content-hash = "268b0584cbe633484946bcd81e3bf26379daf10c0b25d7eb7c5193202464be9e"
