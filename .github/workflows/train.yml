@@ -20,20 +20,16 @@ jobs:
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: '3.11'
 
-      - name: Install poetry
-        uses: abatilo/actions-poetry@v4
-      - name: Setup a local virtual environment
-        run: |
-          poetry config virtualenvs.create true --local
-          poetry config virtualenvs.in-project true --local
       - name: Install the project dependencies
-        run: poetry install
+        run: uv sync --locked --python 3.11
 
-      - run: poetry run pacbot_rs/build_and_install.sh
+      - name: Build Rust extension
+        run: uv run --project .. maturin develop --release
+        working-directory: pacbot_rs
 
-      - run: poetry run -n python3 -m algorithms.train_dqn --device cpu --no-wandb --num_iters 3 --no-eval
+      - run: uv run --project .. python -m algorithms.train_dqn --device cpu --no-wandb --num_iters 3 --no-eval
         working-directory: src

@@ -11,7 +11,7 @@ The game environment, as well as some other performance-sentitive code such as t
 
 # Usage
 
-Python 3.11 and newer is supported (Python 3.11–3.14 is currently checked). The Poetry environment currently has a temporary Python `<3.15` cap because of its Triton dependency. Install a Python interpreter with uv, then install [Poetry](https://python-poetry.org/docs/#installing-with-the-official-installer) and [Rust](https://www.rust-lang.org/tools/install):
+Python 3.11 and newer is supported (Python 3.11–3.14 is currently checked). The project currently has a temporary Python `<3.15` cap because of its Triton dependency. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and [Rust](https://www.rust-lang.org/tools/install), then install a Python interpreter with uv:
 
 ```sh
 uv python install 3.11
@@ -21,25 +21,22 @@ DQN has generally worked better than PPO and AlphaZero for us, so the main scrip
 
 ## Setup
 
-Select the uv-managed interpreter and install the locked dependencies:
+Install the locked dependencies. uv creates a project-local `.venv` automatically:
 
 ```sh
-poetry env use "$(uv python find 3.11)"
-poetry install
+uv sync --python 3.11
 ```
 
-Initially, and after making changes to any of the Rust code in `pacbot_rs/`, you'll need to build the Rust extension module and install it into the Python environment:
-```bash
-pacbot_rs/build_and_install.sh
+Initially, and after making changes to Rust code in `pacbot_rs/`, build the extension and install it into the project environment:
+```sh
+uv run --project . --directory pacbot_rs maturin develop --release
 ```
 
 ## Training
 
-First, make sure your working directory is `src/`.
-
-To start a training run, invoke `train_dqn.py`:
+To start a training run:
 ```bash
-python3 -m algorithms.train_dqn
+uv run --project . --directory src python -m algorithms.train_dqn
 ```
  - To fine-tune (start from an existing checkpoint instead of initializing the model randomly), pass `--finetune path/to/checkpoint`.
  - By default, model checkpoints will be saved to `./checkpoints/`. You can change this by passing `--checkpoint-dir path/to/dir`.
@@ -54,5 +51,5 @@ You can also change **hyperparameters** with command-line arguments. To see the 
 
 To show an animated visualization in the terminal of the agent being controlled by a particular checkpoint, use `--eval`:
 ```bash
-python3 -m algorithms.train_dqn --eval path/to/checkpoint.pt
+uv run --project . --directory src python -m algorithms.train_dqn --eval path/to/checkpoint.pt
 ```

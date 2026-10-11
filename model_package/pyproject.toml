@@ -1,14 +1,15 @@
-[tool.poetry]
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "pacbot-rl-models"
 version = "0.1.0"
 description = "Runtime neural network models for PacBot reinforcement learning."
-authors = ["Quinn Tucker <qxzcraft@gmail.com>"]
-packages = [{ include = "pacbot_rl_models" }]
+authors = [{ name = "Quinn Tucker", email = "qxzcraft@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = ["torch>=2.1,<3"]
 
-[tool.poetry.dependencies]
-python = ">=3.11"
-torch = "^2.1.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pacbot_rl_models*"]

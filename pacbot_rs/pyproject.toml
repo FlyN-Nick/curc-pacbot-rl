@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "pacbot_rs"
 version = "1.0.0"
-requires-python = ">=3.7"
+requires-python = ">=3.11,<3.15"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
