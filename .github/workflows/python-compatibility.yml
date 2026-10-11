@@ -4,41 +4,46 @@ on:
   push:
     paths:
       - "pyproject.toml"
-      - "poetry.lock"
+      - "uv.lock"
       - "model_package/**"
+      - "pacbot_rs/**"
       - "src/**"
       - "tests/**"
       - ".github/workflows/python-compatibility.yml"
   pull_request:
     paths:
       - "pyproject.toml"
-      - "poetry.lock"
+      - "uv.lock"
       - "model_package/**"
+      - "pacbot_rs/**"
       - "src/**"
       - "tests/**"
       - ".github/workflows/python-compatibility.yml"
 
 jobs:
   rl:
-    name: RL Python ${{ matrix.python-version }} on macOS
-    runs-on: macos-14
+    name: RL Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-14, ubuntu-22.04, windows-2025]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install matrix Python
-        run: uv python install ${{ matrix.python-version }}
-      - uses: snok/install-poetry@v1
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Check lockfile
+        run: uv lock --check
       - name: Install locked dependencies
-        run: |
-          poetry env use "$(uv python find ${{ matrix.python-version }})"
-          poetry sync --no-interaction
+        run: uv sync --locked --python ${{ matrix.python-version }}
+      - name: Build Rust extension
+        run: uv run --project .. maturin develop --release
+        working-directory: pacbot_rs
       - name: Test model package compatibility
-        run: poetry run python -m unittest discover -s tests -v
+        run: uv run --locked python -m unittest discover -s tests -v
         env:
           PYTHONPATH: src
