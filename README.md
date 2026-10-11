@@ -11,13 +11,22 @@ The game environment, as well as some other performance-sentitive code such as t
 
 # Usage
 
-Make sure you have [Poetry](https://python-poetry.org/docs/#installing-with-the-official-installer) and [Rust](https://www.rust-lang.org/tools/install) installed.
+Python 3.11 and newer is supported (Python 3.11–3.14 is currently checked). The Poetry environment currently has a temporary Python `<3.15` cap because of its Triton dependency. Install a Python interpreter with uv, then install [Poetry](https://python-poetry.org/docs/#installing-with-the-official-installer) and [Rust](https://www.rust-lang.org/tools/install):
+
+```sh
+uv python install 3.11
+```
 
 DQN has generally worked better than PPO and AlphaZero for us, so the main script you should run is `src/algorithms/train_dqn.py`.
 
 ## Setup
 
-Make sure you have the poetry environment activated (by running `poetry shell` within the repo; make sure you have also installed dependencies with `poetry install`).
+Select the uv-managed interpreter and install the locked dependencies:
+
+```sh
+poetry env use "$(uv python find 3.11)"
+poetry install
+```
 
 Initially, and after making changes to any of the Rust code in `pacbot_rs/`, you'll need to build the Rust extension module and install it into the Python environment:
 ```bash
