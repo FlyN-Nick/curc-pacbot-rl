@@ -40,3 +40,5 @@ jobs:
           poetry sync --no-interaction
       - name: Test model package compatibility
         run: poetry run python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src
