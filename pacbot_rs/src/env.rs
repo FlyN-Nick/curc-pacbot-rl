@@ -119,7 +119,7 @@ impl Default for PacmanGymConfiguration {
 impl PacmanGymConfiguration {
     #[new]
     pub fn new(configuration: Py<PyAny>) -> Self {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             serde_pyobject::from_pyobject(configuration.bind(py).clone()).unwrap()
         })
     }
@@ -187,18 +187,23 @@ impl From<Action> for Direction {
 }
 
 #[cfg(feature = "python")]
-impl<'source> FromPyObject<'source> for Action {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
-        let ob = ob.as_borrowed();
+impl<'a, 'py> FromPyObject<'a, 'py> for Action {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let index: u8 = ob.extract()?;
         Action::try_from_primitive(index).map_err(|_| PyValueError::new_err("Invalid action"))
     }
 }
 
 #[cfg(feature = "python")]
-impl IntoPy<PyObject> for Action {
-    fn into_py(self, py: Python<'_>) -> PyObject {
-        u8::from(self).into_py(py)
+impl<'py> IntoPyObject<'py> for Action {
+    type Target = pyo3::types::PyInt;
+    type Output = Bound<'py, Self::Target>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        u8::from(self).into_pyobject(py)
     }
 }
 
@@ -752,7 +757,7 @@ impl PacmanGym {
 
     /// Returns an observation array/tensor constructed from the game state.
     pub fn obs_numpy(&self, py: Python<'_>, config: &PacmanGymConfiguration) -> Py<PyArray3<f32>> {
-        self.obs(config).into_pyarray_bound(py).into()
+        self.obs(config).into_pyarray(py).into()
     }
 
     #[pyo3(name = "print_game_state")]
