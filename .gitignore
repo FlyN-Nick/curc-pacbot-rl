@@ -14,6 +14,8 @@ __pycache__/
 # Artifacts
 wandb/
 src/checkpoints/
+checkpoint_eval_results/
+/src/downloaded_checkpoint_*.csv
 
 # MacOS
 .DS_Store
