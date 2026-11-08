@@ -53,3 +53,8 @@ To show an animated visualization in the terminal of the agent being controlled 
 ```bash
 uv run --project . --directory src python -m algorithms.train_dqn --eval path/to/checkpoint.pt
 ```
+
+For example, to visualize the best tracked checkpoint (the path is relative to `src/`):
+```bash
+uv run --project . --directory src python -m algorithms.train_dqn --eval best_checkpoints/urlriljg/q_net-iter0619000.ckpt.pt
+```
