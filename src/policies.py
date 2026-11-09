@@ -26,10 +26,11 @@ class EpsilonGreedy(Generic[P]):
         # Determine device from observations and ensure all tensors live there.
         device = obs.device
 
-        # Sample uniformly-random valid actions (use Python lists for sampling).
+        # Sample uniformly-random valid actions (use Python lists for sampling). Converting the
+        # masks once, rather than row by row, avoids one device sync per environment.
         actions = [
-            random.choice([i for i, valid in enumerate(action_mask.tolist()) if valid])
-            for action_mask in action_masks
+            random.choice([i for i, valid in enumerate(action_mask) if valid])
+            for action_mask in action_masks.tolist()
         ]
         # Create the tensor on the same device as `obs`.
         actions = torch.tensor(actions, device=device, dtype=torch.int64)

@@ -7,7 +7,7 @@ import numpy as np
 
 import pacbot_rs
 
-from utils import reset_env, NUM_ACTIONS, P, REPLAY_BUFFER_OBS_GYM_CONFIGURATION, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_while_not_policy
+from utils import reset_env, NUM_ACTIONS, P, REPLAY_BUFFER_OBS_GYM_CONFIGURATION, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -61,24 +61,33 @@ class ReplayBuffer(Generic[P]):
         """Generates one step of experience for each parallel env and adds them to the buffer."""
 
         # if other models should take actions in the current state of the games, let them go first
-        for env in self._envs:
-            step_while_not_policy(env, self.device, reset_if_necessary=True)
+        step_envs_while_not_policy(self._envs, self.device)
 
         # Choose an action using the provided policy.
         action_masks = [replay_buffer_action_mask(env) for env in self._envs]
         action_masks = torch.from_numpy(np.stack(action_masks)).to(self.device)
-        actions = self.policy(self._last_obs, action_masks)
+        actions = self.policy(self._last_obs, action_masks).tolist()
 
-        next_obs_stack = []
-        for env, last_obs, action in zip(self._envs, self._last_obs, actions.tolist()):
-            # Perform the action and observe the transition.
+        # Step every environment (resetting finished ones, in order, as before), then move all
+        # the new observations to the device in one transfer instead of one per environment.
+        transitions = []
+        new_obs = []
+        for env, action in zip(self._envs, actions):
             reward, done = env.step(action)
             if done:
-                next_obs = None
                 next_action_mask = [False] * NUM_ACTIONS
+                reset_env(env, REPLAY_BUFFER_OBS_GYM_CONFIGURATION)
             else:
-                next_obs = torch.from_numpy(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION)).to(self.device)
                 next_action_mask = replay_buffer_action_mask(env)
+            transitions.append((action, reward, done, next_action_mask))
+            new_obs.append(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION))
+        new_obs = torch.from_numpy(np.stack(new_obs)).to(self.device)
+
+        for last_obs, obs, (action, reward, done, next_action_mask) in zip(
+            self._last_obs, new_obs, transitions
+        ):
+            # A finished game has no next observation; its row of new_obs is the reset game.
+            next_obs = None if done else obs
 
             # # Subsample to focus training on end-game states.
             # keep_prob = 1.0 if env.remaining_pellets() < 140 else 0.1
@@ -90,14 +99,7 @@ class ReplayBuffer(Generic[P]):
             # Add the transition to the replay buffer.
             self._buffer.append(ReplayItem(last_obs, action, reward, next_obs, next_action_mask))
 
-            # Reset the environment if necessary and update last_obs.
-            if next_obs is None:
-                reset_env(env, REPLAY_BUFFER_OBS_GYM_CONFIGURATION)
-                next_obs_stack.append(torch.from_numpy(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION)).to(self.device))
-            else:
-                next_obs_stack.append(next_obs)
-
-        self._last_obs = torch.stack(next_obs_stack)
+        self._last_obs = new_obs
 
     def sample_batch(self, batch_size: int) -> list[ReplayItem]:
         """Samples a batch of transitions from the buffer."""

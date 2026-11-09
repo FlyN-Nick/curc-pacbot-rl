@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import numpy as np
 import torch
 from typing import TypeVar
 
@@ -27,6 +30,10 @@ def make_gym(config: "PacmanGymConfiguration", env_version: int) -> PacmanGym:
     env.env_version = env_version
     return env
 
+
+# The fixed model that plays outside purgatory (see step_env_once), found relative to this
+# file so training, evaluation and tests work from any directory.
+SUPER_PELLET_MODEL_PATH = str(Path(__file__).resolve().parent / "checkpoints_known" / "superpelletmode.safetensors")
 
 DEFAULT_GYM_CONFIGURATION = PacmanGymConfiguration({})
 DETERMINISTIC_START_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": False})
@@ -86,19 +93,50 @@ def step_env_once(env: PacmanGym, policy: Policy, device) -> tuple[int, bool]:
     else:
         # temporary - end game when super pellet mode hits
         #return 0, True
-        return _step_always_with(env, safetensors_qnet("checkpoints_known/superpelletmode.safetensors", device=device), SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
+        return _step_always_with(env, safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=device), SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
 
 def step_while_not_policy(env: PacmanGym, device, reset_if_necessary: bool = True):
     # purgatory mode is when all ghosts are free and not frightened 
     while env.are_ghosts_close() or not env.all_ghosts_not_frightened():
         # temporary - end game when super pellet mode hits
         # return reset_env(env, DEFAULT_GYM_CONFIGURATION)
-         _, done = _step_always_with(env, safetensors_qnet("checkpoints_known/superpelletmode.safetensors", device=device), SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
+         _, done = _step_always_with(env, safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=device), SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
          if done:
              if reset_if_necessary:
                  reset_env(env, DEFAULT_GYM_CONFIGURATION)
              else:
                  return
+
+
+
+def in_purgatory(env: PacmanGym) -> bool:
+    """Whether the policy being trained acts in this state (see step_env_once)."""
+    return not env.are_ghosts_close() and env.all_ghosts_not_frightened()
+
+
+@torch.no_grad()
+def step_envs_while_not_policy(envs: list[PacmanGym], device) -> None:
+    """
+    step_while_not_policy(env, device, reset_if_necessary=True) for many environments at once:
+    the super pellet model plays every environment that is outside purgatory, resetting those
+    that finish, until all of them are back in purgatory. Each round runs the model once on a
+    batch of all environments that still need it, instead of once per environment and step.
+    """
+    active = [env for env in envs if not in_purgatory(env)]
+    if not active:
+        return
+    policy = safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=device)
+    while active:
+        obs = torch.from_numpy(
+            np.stack([env.obs_numpy(SUPER_PELLET_MODE_CONFIGUARTION) for env in active])
+        ).to(device)
+        masks = torch.from_numpy(np.array([env.action_mask() for env in active])).to(device)
+        for env, action in zip(active, policy(obs, masks).tolist()):
+            _, done = env.step(action)
+            if done:
+                reset_env(env, DEFAULT_GYM_CONFIGURATION)
+        active = [env for env in active if not in_purgatory(env)]
+
 
 def step_env_until_done(env: PacmanGym, policy: Policy, device, max_steps: int = 1000) -> tuple[bool, int]:
     for step_num in range(1, max_steps + 1):
