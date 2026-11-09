@@ -138,6 +138,15 @@ pub const TICKS_PER_UPDATE: u32 = 12;
 /// - Convert to average grid units per second using: 12 / ticks/step
 const NORMAL_TICKS_PER_STEP: u32 = 8;
 
+/// Version of the environment rules. Checkpoints record the version they were
+/// trained with (as `env_version` in their metadata) so they can be evaluated
+/// and deployed under the same rules.
+///
+/// 1. [`PacmanGym::are_ghosts_close`] summed ghost distances in an `i8`, which
+///    wrapped at 128, so far-away or not-yet-spawned ghosts counted as close.
+/// 2. The sum no longer overflows, and only ghosts on the board count.
+pub const LATEST_ENV_VERSION: u32 = 2;
+
 /// Penalty for turning.
 const TURN_PENALTY: i32 = -2;
 
@@ -220,6 +229,11 @@ pub struct PacmanGym {
     pub ghost_proximities: u32,
 
     pub ticks_per_step: u32,
+
+    /// Version of the environment rules; see [`LATEST_ENV_VERSION`].
+    /// Kept across resets.
+    #[pyo3(get)]
+    pub env_version: u32,
 }
 
 #[cfg(not(feature = "python"))]
@@ -232,6 +246,10 @@ pub struct PacmanGym {
     pub ghost_proximities: u32,
 
     pub ticks_per_step: u32,
+
+    /// Version of the environment rules; see [`LATEST_ENV_VERSION`].
+    /// Kept across resets.
+    pub env_version: u32,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -262,6 +280,7 @@ impl PacmanGym {
             last_action: Action::Stay,
             game_state: GameState::new(),
             ticks_per_step: NORMAL_TICKS_PER_STEP,
+            env_version: LATEST_ENV_VERSION,
         };
         s.reset(config);
         s
@@ -444,14 +463,24 @@ impl PacmanGym {
 
     pub fn are_ghosts_close(&self) -> bool {
         // are the ghosts collectively close enough?
-        let mut total_distance = 0;
-        let p = self.game_state.pacman_loc;
-        for ghost in self.game_state.ghosts {
-            let g = ghost.loc;
-            total_distance += (p.row - g.row).abs() + (p.col - g.col).abs()
-        }
         // for now, acceptable distance maximum is 30
-        return total_distance < 30;
+        let p = self.game_state.pacman_loc;
+        let distance = |g: LocationState| (p.row - g.row).abs() + (p.col - g.col).abs();
+        if self.env_version < 2 {
+            // Version 1 summed in an i8 that wrapped at 128 (and would panic in
+            // debug builds); reproduced for checkpoints trained with it.
+            let mut total_distance: i8 = 0;
+            for ghost in self.game_state.ghosts {
+                total_distance = total_distance.wrapping_add(distance(ghost.loc));
+            }
+            return total_distance < 30;
+        }
+        // Ghosts that aren't on the board (not yet spawned) are neither close nor far.
+        let mut on_board = self.game_state.ghosts.iter().filter(|g| loc_to_pos(g.loc).is_some()).peekable();
+        if on_board.peek().is_none() {
+            return false;
+        }
+        on_board.map(|g| distance(g.loc) as i32).sum::<i32>() < 30
     }
 
     pub fn remaining_pellets(&self) -> u16 {
@@ -776,6 +805,20 @@ impl PacmanGym {
         let new_state = GameState::from_bytes(state, rand::random())
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.set_state(new_state, ticks_per_step);
+        Ok(())
+    }
+
+    #[classattr]
+    const LATEST_ENV_VERSION: u32 = LATEST_ENV_VERSION;
+
+    #[setter]
+    pub fn set_env_version(&mut self, version: u32) -> PyResult<()> {
+        if !(1..=LATEST_ENV_VERSION).contains(&version) {
+            return Err(PyValueError::new_err(format!(
+                "env_version must be 1..={LATEST_ENV_VERSION}, got {version}"
+            )));
+        }
+        self.env_version = version;
         Ok(())
     }
 

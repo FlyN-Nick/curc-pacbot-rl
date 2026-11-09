@@ -19,7 +19,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pacbot_rs import PacmanGym
 import models
 from policies import MaxQPolicy
-from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done
+from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done, checkpoint_env_version, make_gym
 import argparse
 from tqdm import tqdm
 
@@ -66,12 +66,12 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
     q_net.load_state_dict(loaded['state_dict'])
     q_net.eval()
-    return q_net, loaded['iter_num'], loaded['epsilon'], loaded['config']
+    return q_net, loaded['iter_num'], loaded['epsilon'], loaded['config'], checkpoint_env_version(loaded)
 
 # ── 2. Evaluate one episode ────────────────────────────────────────────────────
 @torch.no_grad()
-def evaluate_episode(q_net, device: torch.device, max_steps: int = 1000):
-    gym = PacmanGym(DETERMINISTIC_START_CONFIGURATION)
+def evaluate_episode(q_net, device: torch.device, env_version: int, max_steps: int = 1000):
+    gym = make_gym(DETERMINISTIC_START_CONFIGURATION, env_version)
     pellets_start = gym.remaining_pellets()
     policy = MaxQPolicy(q_net)
     done, step_num = step_env_until_done(gym, policy, device, max_steps=max_steps)
@@ -87,11 +87,11 @@ def evaluate_episode(q_net, device: torch.device, max_steps: int = 1000):
 # ── 3. Worker (runs in a separate process) ─────────────────────────────────────
 def worker(label: str, ckpt_path: str, n_games: int, preferred_device: str, progress_queue):
     device = select_device(preferred_device)
-    q_net, iter_num, epsilon, config = load_checkpoint(ckpt_path, device)
+    q_net, iter_num, epsilon, config, env_version = load_checkpoint(ckpt_path, device)
 
     scores, pellets, steps_list, cleared = [], [], [], []
     for _ in range(n_games):
-        r = evaluate_episode(q_net, device)
+        r = evaluate_episode(q_net, device, env_version)
         scores.append(r['score'])
         pellets.append(r['pellets_eaten'])
         steps_list.append(r['steps'])

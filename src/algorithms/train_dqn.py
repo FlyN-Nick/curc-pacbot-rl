@@ -35,7 +35,7 @@ import models
 from policies import EpsilonGreedy, MaxQPolicy
 from replay_buffer import ReplayBuffer
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, make_gym
 
 
 _hyperparams_path = Path(__file__).parent / "hyperparams.json"
@@ -126,6 +126,9 @@ if args.finetune:
             resume_epsilon = loaded.get("epsilon", None)
             resume_optimizer_state = loaded.get("optimizer_state_dict", None)
             resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
+            if checkpoint_env_version(loaded) != ENV_VERSION:
+                print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
+                      f"finetuning continues with version {ENV_VERSION}")
             ckpt_wandb_id = loaded.get("wandb_run_id")
             if ckpt_wandb_id:
                 print(f"Loaded checkpoint was created by wandb run id: {ckpt_wandb_id}")
@@ -199,6 +202,7 @@ def train():
             "epsilon": replay_buffer.policy.epsilon,
             "best_eval_score": best_eval_score,
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
+            "env_version": ENV_VERSION,
         }
         try:
             if wandb.run is not None and getattr(wandb.run, "id", None):
@@ -367,7 +371,7 @@ def train():
 
 @torch.no_grad()
 def visualize_agent():
-    gym = PacmanGym(DETERMINISTIC_START_CONFIGURATION)
+    gym = make_gym(DETERMINISTIC_START_CONFIGURATION, visualize_env_version)
 
     q_net.eval()
     policy = MaxQPolicy(q_net)
@@ -392,6 +396,8 @@ def visualize_agent():
             break
 
 
+# Visualize under the rules the shown model was trained with.
+visualize_env_version = ENV_VERSION
 if args.eval:
     # handle loading from both legacy checkpoints and metadata checkpoints
     
@@ -402,6 +408,8 @@ if args.eval:
     ckpt_path = Path(args.eval)
     if ckpt_path.exists():
         loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
+        visualize_env_version = checkpoint_env_version(loaded)
+        print(f"Using environment version {visualize_env_version}")
         if isinstance(loaded, dict) and "state_dict" in loaded:
             q_net.load_state_dict(loaded["state_dict"])
         else:

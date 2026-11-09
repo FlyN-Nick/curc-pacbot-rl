@@ -8,6 +8,26 @@ import models
 from policies import MaxQPolicy
 import safetensors.torch
 
+# Version of the environment rules (see LATEST_ENV_VERSION in pacbot_rs/src/env.rs).
+# Checkpoints record the version they were trained with as "env_version";
+# checkpoints saved before that field existed are version 1.
+ENV_VERSION: int = PacmanGym.LATEST_ENV_VERSION
+
+
+def checkpoint_env_version(loaded) -> int:
+    """The environment version a loaded checkpoint was trained with."""
+    if isinstance(loaded, dict):
+        return int(loaded.get("env_version", 1))
+    return 1  # legacy full-module checkpoint
+
+
+def make_gym(config: "PacmanGymConfiguration", env_version: int) -> PacmanGym:
+    """A PacmanGym following the rules of the given environment version."""
+    env = PacmanGym(config)
+    env.env_version = env_version
+    return env
+
+
 DEFAULT_GYM_CONFIGURATION = PacmanGymConfiguration({})
 DETERMINISTIC_START_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": False})
 OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURATION).shape
