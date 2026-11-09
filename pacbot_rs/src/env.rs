@@ -765,5 +765,25 @@ impl PacmanGym {
         self.print_game_state()
     }
 
+    /// Returns the game state serialized in the competition server's wire format,
+    /// the same bytes the bot client parses from server updates.
+    pub fn game_state_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.game_state.to_bytes())
+    }
+
+    /// Replaces the game state with one in the competition server's wire format.
+    pub fn set_game_state_bytes(&mut self, state: &[u8], ticks_per_step: u32) -> PyResult<()> {
+        let new_state = GameState::from_bytes(state, rand::random())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.set_state(new_state, ticks_per_step);
+        Ok(())
+    }
+
+    /// Game ticks per Pacman action (see `NORMAL_TICKS_PER_STEP`).
+    #[getter]
+    pub fn ticks_per_step(&self) -> u32 {
+        self.ticks_per_step
+    }
+
     // ghost_proximities and purgatory_pellets are properties (get, set) on struct, so no need for methods.
 }
