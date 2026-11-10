@@ -42,9 +42,10 @@ class ActorReplayBufferTests(unittest.TestCase):
         for _ in range(ahead // steps + 1):
             buffer.start_collection(steps, 0.0)
             buffer.finish_collection()
-        buffer._buffer.clear()
+        first = buffer.storage.total
         buffer.start_collection(steps, 0.0)
         buffer.finish_collection()
+        return [buffer.storage.transition(t) for t in range(first, buffer.storage.total)]
 
     def test_transitions_chain_per_environment(self):
         q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
@@ -53,16 +54,18 @@ class ActorReplayBufferTests(unittest.TestCase):
             for _ in range(3):
                 buffer.start_collection(4, 0.5)
                 buffer.finish_collection()
-            items = list(buffer._buffer)
+            storage = buffer.storage
+            items = [storage.transition(t) for t in range(storage.total)]
             self.assertEqual(len(items), 3 * 4 * 5)
+            self.assertEqual(storage.codec.mismatches(), 0)
             steps = [items[i:i + 5] for i in range(0, len(items), 5)]
             chained = 0
             for prev, cur in zip(steps, steps[1:]):
                 for j in range(5):
-                    self.assertEqual(len(cur[j].next_action_mask), NUM_ACTIONS)
-                    if prev[j].next_obs is not None:
+                    self.assertEqual(len(cur[j]["next_action_mask"]), NUM_ACTIONS)
+                    if prev[j]["next_obs"] is not None:
                         # This step's observation is the previous step's next observation
-                        self.assertTrue(torch.equal(cur[j].obs, prev[j].next_obs), (j,))
+                        self.assertTrue(torch.equal(cur[j]["obs"], prev[j]["next_obs"]), (j,))
                         chained += 1
             self.assertGreater(chained, 40)
         finally:
@@ -73,12 +76,12 @@ class ActorReplayBufferTests(unittest.TestCase):
         buffer = self.make_buffer(q_net, ahead=4)
         try:
             favor(q_net, stay_bias=1e6)
-            self.collect_with_new_weights(buffer, ahead=4)
-            self.assertTrue(all(item.action == STAY for item in buffer._buffer))
+            items = self.collect_with_new_weights(buffer, ahead=4)
+            self.assertTrue(all(item["action"] == STAY for item in items))
 
             favor(q_net, stay_bias=-1e6)
-            self.collect_with_new_weights(buffer, ahead=4)
-            moves = [item.action != STAY for item in buffer._buffer]
+            items = self.collect_with_new_weights(buffer, ahead=4)
+            moves = [item["action"] != STAY for item in items]
             self.assertGreater(sum(moves) / len(moves), 0.9)
         finally:
             buffer.close()
@@ -88,8 +91,8 @@ class ActorReplayBufferTests(unittest.TestCase):
         procs = list(buffer._procs)
         try:
             buffer.fill()
-            self.assertEqual(len(buffer._buffer), 100)
-            self.assertEqual(len(buffer.sample_batch(32)), 32)
+            self.assertEqual(len(buffer), 100)
+            self.assertEqual(buffer.sample(32).obs.shape[0], 32)
         finally:
             buffer.close()
         self.assertFalse(any(p.is_alive() for p in procs))

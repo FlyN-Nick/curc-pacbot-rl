@@ -36,6 +36,8 @@ def atomic_torch_save(obj, path: Path) -> None:
 import models
 from policies import EpsilonGreedy, MaxQPolicy
 from replay_buffer import ReplayBuffer
+from replay_storage import ReplayStorage
+from dqn_update import EagerUpdate, GraphedUpdate, set_capturable
 from timing import time_block
 from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, make_gym
 import parallel_training
@@ -56,6 +58,10 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-legacy-checkpoint", action="store_true")
     parser.add_argument("--timing", action="store_true", help="Print how long each part of every iteration takes")
+    parser.add_argument(
+        "--no-cuda-graph", action="store_true",
+        help="On CUDA, run each update eagerly instead of replaying it as a CUDA graph",
+    )
     parser.add_argument(
         "--bf16", choices=["none", "update", "all"], default="none",
         help="Run the network's convolutions and matrix products in bfloat16 on a CUDA GPU: "
@@ -232,14 +238,8 @@ class DeferredMetrics:
         self.pinned = device.type == "cuda"
         self._pending = None
 
-    def add(self, host_metrics: dict, loss, grad_norm, all_predicted_q_values, target_q_values):
-        """Queues this iteration's metrics and logs the previous iteration's."""
-        values = torch.stack([
-            loss.detach().float(),
-            grad_norm.detach().float(),
-            all_predicted_q_values.detach().float().amax(dim=1).mean() / self.reward_scale,
-            target_q_values.float().mean() / self.reward_scale,
-        ])
+    def add(self, host_metrics: dict, values: torch.Tensor):
+        """Queues this iteration's metrics (values from dqn_update) and logs the previous ones."""
         if self.pinned:
             host = torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
             host.copy_(values, non_blocking=True)
@@ -265,6 +265,16 @@ class DeferredMetrics:
                 "so the parameters can't be trusted. Stopping."
             )
         wandb.log({**values, **host_metrics})
+
+
+def check_replay_storage(replay_buffer) -> None:
+    """Stops training if any stored observation didn't decode back exactly (waits for the GPU)."""
+    mismatches = replay_buffer.storage.codec.mismatches()
+    if mismatches:
+        raise RuntimeError(
+            f"{mismatches} stored observation values didn't decode back exactly; the "
+            "observation format may have changed (see replay_storage.ObsCodec). Stopping."
+        )
 
 
 def cpu_copy(obj):
@@ -310,6 +320,9 @@ def train():
                 num_parallel_envs=wandb.config.num_parallel_envs,
                 random_start_proportion=wandb.config.random_start_proportion,
                 device=device,
+                storage=ReplayStorage(
+                    wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device
+                ),
             )
         _train(replay_buffer, evaluator, actors)
     finally:
@@ -322,22 +335,14 @@ def _train(replay_buffer, evaluator, actors: bool):
     replay_buffer.fill()
     replay_buffer.policy.epsilon = float(resume_epsilon) if resume_epsilon is not None else wandb.config.initial_epsilon
 
-    # Initialize the optimizer.
-    optimizer = torch.optim.Adam(q_net.parameters(), lr=wandb.config.learning_rate)
+    # Initialize the optimizer. Replaying the update as a CUDA graph needs Adam's capturable
+    # form; checkpoints load either way.
+    graphed = device.type == "cuda" and not args.no_cuda_graph
+    optimizer = torch.optim.Adam(q_net.parameters(), lr=wandb.config.learning_rate, capturable=graphed)
     if resume_optimizer_state is not None:
         optimizer.load_state_dict(resume_optimizer_state)
+        set_capturable(optimizer, graphed)
         print("Restored optimizer state from checkpoint")
-
-    # Automatic Mixed Precision stuff. float16 (with loss scaling) is off; bfloat16 is opt-in
-    # with --bf16 and needs no scaling (it has float32's range).
-    use_amp = False  # device.type == "cuda"
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    def bf16_autocast(enabled: bool):
-        if not enabled:
-            return nullcontext()
-        # No cast cache: copies cast under no_grad (the target passes) can't carry gradients
-        return torch.autocast(device_type=device.type, dtype=torch.bfloat16, cache_enabled=False)
 
     best_eval_score = resume_best_eval_score
 
@@ -362,6 +367,15 @@ def _train(replay_buffer, evaluator, actors: bool):
 
     target_q_net = copy.deepcopy(q_net)
     target_q_net.eval()
+    q_net.train()
+    update = (GraphedUpdate if graphed else EagerUpdate)(
+        q_net, target_q_net, optimizer, replay_buffer.storage, wandb.config.batch_size,
+        reward_scale=wandb.config.reward_scale,
+        discount_factor=wandb.config.discount_factor,
+        grad_clip_norm=wandb.config.grad_clip_norm,
+        bf16=args.bf16,
+    )
+    print(f"Updates: {'CUDA graph' if graphed else 'eager'}")
 
     deferred_metrics = DeferredMetrics(device, wandb.config.reward_scale)
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
@@ -376,9 +390,8 @@ def _train(replay_buffer, evaluator, actors: bool):
             break
         if iter_num % wandb.config.target_network_update_steps == 0:
             with time_block("Update target network"):
-                # Update the target network.
-                target_q_net = copy.deepcopy(q_net)
-                target_q_net.eval()
+                # Update the target network (in place: a CUDA graph keeps using its tensors)
+                target_q_net.load_state_dict(q_net.state_dict())
 
         if actors:
             # The actors play this iteration's experience while this process updates the
@@ -392,74 +405,10 @@ def _train(replay_buffer, evaluator, actors: bool):
                 ),
             )
 
-        with time_block("Collate batch"):
-            # Sample and collate a batch.
-            with device:
-                batch = replay_buffer.sample_batch(wandb.config.batch_size)
-                obs_batch = torch.stack([item.obs for item in batch])
-                next_obs_batch = torch.stack(
-                    [
-                        torch.zeros(OBS_SHAPE) if item.next_obs is None else item.next_obs
-                        for item in batch
-                    ]
-                )
-                # The per-transition values go to the device in one copy, from pinned memory so
-                # the CPU doesn't wait for the GPU to finish its queued work first.
-                packed = torch.tensor(
-                    [(item.next_obs is None, *item.next_action_mask, item.action, item.reward) for item in batch],
-                    dtype=torch.float64, device="cpu",
-                )
-                if device.type == "cuda":
-                    packed = packed.pin_memory()
-                packed = packed.to(device, non_blocking=True)
-                done_mask = packed[:, 0].bool()
-                next_action_masks = packed[:, 1:1 + NUM_ACTIONS].bool()
-                action_batch = packed[:, 1 + NUM_ACTIONS].long()
-                reward_batch = (packed[:, 2 + NUM_ACTIONS] * wandb.config.reward_scale).float()
-
-        with time_block("Compute target Q values"):
-            # Get the target Q values.
-            double_dqn = True
-            with torch.no_grad():
-                with bf16_autocast(args.bf16 == "all"):
-                    # masked_fill and gather instead of boolean-mask assignment and
-                    # range indexing: the same values, without making the CPU wait for the GPU
-                    next_q_values = target_q_net(next_obs_batch)
-                    next_q_values = next_q_values.masked_fill(~next_action_masks, -torch.inf)
-                    if double_dqn:
-                        online_next_q_values = q_net(next_obs_batch)
-                        online_next_q_values = online_next_q_values.masked_fill(~next_action_masks, -torch.inf)
-                        next_actions = online_next_q_values.argmax(dim=1)
-                    else:
-                        next_actions = next_q_values.argmax(dim=1)
-                    returns = next_q_values.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-                    discounted_returns = wandb.config.discount_factor * returns
-                    discounted_returns = discounted_returns.masked_fill(done_mask, 0.0)
-                    target_q_values = reward_batch + discounted_returns
-
-        with time_block("Compute loss and update parameters"):
-            # Compute the loss and update the parameters.
-            with time_block("optimizer.zero_grad()"):
-                q_net.train()
-                optimizer.zero_grad()
-
-            with time_block("Forward pass"):
-                with bf16_autocast(args.bf16 in ("update", "all")):
-                    all_predicted_q_values = q_net(obs_batch)
-                    predicted_q_values = all_predicted_q_values.gather(1, action_batch.unsqueeze(1)).squeeze(1)
-                    loss = F.mse_loss(predicted_q_values, target_q_values)
-
-            with time_block("Backward pass"):
-                grad_scaler.scale(loss).backward()
-            with time_block("Clip grad norm"):
-                # A non-finite norm is caught by DeferredMetrics (error_if_nonfinite would wait for the GPU)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    q_net.parameters(),
-                    max_norm=wandb.config.grad_clip_norm,
-                )
-            with time_block("Step optimizer"):
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+        with time_block("Update the network"):
+            # Sample a batch (indices drawn on the device; see replay_storage) and update the
+            # network on it (see dqn_update)
+            update_metrics = update.run(replay_buffer.storage.sample_indices(wandb.config.batch_size))
 
         with torch.no_grad():
             # Log metrics. The GPU values are logged by DeferredMetrics a step later.
@@ -491,11 +440,12 @@ def _train(replay_buffer, evaluator, actors: bool):
                         checkpoint_dir.mkdir(exist_ok=True)
                         atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
                 metrics["skipped_evals"] = evaluator.skipped
-            deferred_metrics.add(metrics, loss, grad_norm, all_predicted_q_values, target_q_values)
+            deferred_metrics.add(metrics, update_metrics)
 
         if iter_num % 500 == 0:
-            # Check this update before saving it
+            # Check this update, and that stored observations decode exactly, before saving
             deferred_metrics.flush()
+            check_replay_storage(replay_buffer)
             with time_block("Save checkpoint"):
                 # Save a checkpoint.
                 checkpoint_dir = Path(args.checkpoint_dir)

@@ -27,7 +27,8 @@ import torch
 
 import models
 from policies import EpsilonGreedy, MaxQPolicy
-from replay_buffer import ReplayBuffer, ReplayItem
+from replay_buffer import ReplayBuffer
+from replay_storage import ReplayStorage
 from utils import (
     DETERMINISTIC_START_CONFIGURATION,
     NUM_ACTIONS,
@@ -271,8 +272,8 @@ class ActorReplayBuffer:
     they were just played with weights up to a few updates older. Running ahead keeps an
     actor stuck in a long super pellet phase from holding up every iteration.
 
-    Offers the parts of ReplayBuffer's interface train_dqn uses: policy.epsilon, fill(),
-    generate_experience_step(), and sample_batch().
+    Transitions go to a replay_storage.ReplayStorage. Offers the parts of ReplayBuffer's
+    interface train_dqn uses: policy.epsilon, fill(), generate_experience_step(), and sample().
     """
 
     def __init__(
@@ -293,7 +294,7 @@ class ActorReplayBuffer:
         if any(True for _ in q_net.buffers()):
             raise ValueError("ActorReplayBuffer only shares parameters; this model has buffers")
 
-        self._buffer = deque[ReplayItem](maxlen=maxlen)
+        self.storage = ReplayStorage(maxlen, num_parallel_envs, device)
         # train_dqn reads and sets the exploration rate through policy.epsilon
         self.policy = SimpleNamespace(epsilon=epsilon)
         self.device = device
@@ -344,13 +345,14 @@ class ActorReplayBuffer:
                 self._procs.append(proc)
                 self._conns.append(parent)
             # Each actor writes its starting observations to slot 0 before saying it's ready
-            self._last_obs = []
+            first_obs = []
             for conn, view in zip(self._conns, self._obs_views):
                 self._receive(conn)
-                self._last_obs.append(self._to_device(view[0]))
+                first_obs.append(self._to_device(view[0]))
             self._sync()
             for conn in self._conns:
                 conn.send(("free", 0))
+            self.storage.set_initial_obs(torch.cat(first_obs))
         except BaseException:
             self.close()
             raise
@@ -436,22 +438,24 @@ class ActorReplayBuffer:
         """Takes the next `steps` experience steps from every actor into the buffer."""
         steps, self._pending_steps = self._pending_steps, 0
         taken = []
+        received = []
         for _ in range(steps):
-            for i, (conn, view) in enumerate(zip(self._conns, self._obs_views)):
+            step_obs, step_transitions = [], []
+            for conn, view in zip(self._conns, self._obs_views):
                 _, slot, transitions = self._receive(conn)
-                new_obs = self._to_device(view[slot])
+                step_obs.append(self._to_device(view[slot]))
+                step_transitions.extend(transitions)
                 taken.append((conn, slot))
-                last_obs = self._last_obs[i]
-                for j, (action, reward, done, next_action_mask) in enumerate(transitions):
-                    next_obs = None if done else new_obs[j]
-                    self._buffer.append(
-                        ReplayItem(last_obs[j], action, reward, next_obs, next_action_mask)
-                    )
-                self._last_obs[i] = new_obs
+            received.append((step_obs, step_transitions))
         # Hand the slots back once their copies are done
         self._sync()
         for conn, slot in taken:
             conn.send(("free", slot))
+        # Step by step, environments in actor order, as ReplayBuffer adds them (in one call)
+        self.storage.add_steps(
+            torch.cat([obs for step_obs, _ in received for obs in step_obs]),
+            *zip(*(t for _, step_transitions in received for t in step_transitions)),
+        )
 
     def generate_experience_step(self) -> None:
         self.start_collection(1, self.policy.epsilon)
@@ -459,12 +463,16 @@ class ActorReplayBuffer:
 
     def fill(self) -> None:
         """Collects experience until the buffer is filled to capacity."""
-        while len(self._buffer) < self._buffer.maxlen:
+        while len(self.storage) < self.storage.capacity:
             self.start_collection(self._max_steps, self.policy.epsilon)
             self.finish_collection()
 
-    def sample_batch(self, batch_size: int) -> list[ReplayItem]:
-        return random.sample(self._buffer, k=batch_size)
+    def __len__(self) -> int:
+        return len(self.storage)
+
+    def sample(self, batch_size: int):
+        """Samples a replay_storage.Batch."""
+        return self.storage.sample(batch_size)
 
     def close(self) -> None:
         for conn in self._conns:

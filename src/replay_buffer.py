@@ -28,8 +28,15 @@ class ReplayBuffer(Generic[P]):
         num_parallel_envs: int,
         random_start_proportion: float,
         device: torch.device = torch.device("cpu"),
+        storage: "ReplayStorage | None" = None,
     ) -> None:
+        """
+        With `storage` (a replay_storage.ReplayStorage), transitions go there, and are sampled
+        with sample(); otherwise they're kept as ReplayItems, sampled with sample_batch().
+        """
         self._buffer = deque[ReplayItem](maxlen=maxlen)
+        self._maxlen = maxlen
+        self.storage = storage
         self.policy = policy
         self.device = device
 
@@ -42,6 +49,11 @@ class ReplayBuffer(Generic[P]):
             for i in range(num_parallel_envs)
         ]
         self._last_obs = self._make_current_obs()
+        if storage is not None:
+            storage.set_initial_obs(self._last_obs)
+
+    def __len__(self) -> int:
+        return len(self._buffer) if self.storage is None else len(self.storage)
 
     def _make_current_obs(self) -> torch.Tensor:
         obs = [env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION) for env in self._envs]
@@ -53,7 +65,7 @@ class ReplayBuffer(Generic[P]):
 
     def fill(self) -> None:
         """Generates experience until the buffer is filled to capacity."""
-        while len(self._buffer) < self._buffer.maxlen:
+        while len(self) < self._maxlen:
             self.generate_experience_step()
 
     @torch.no_grad()
@@ -83,6 +95,11 @@ class ReplayBuffer(Generic[P]):
             new_obs.append(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION))
         new_obs = torch.from_numpy(np.stack(new_obs)).to(self.device)
 
+        if self.storage is not None:
+            self.storage.add_step(new_obs, *zip(*transitions))
+            self._last_obs = new_obs
+            return
+
         for last_obs, obs, (action, reward, done, next_action_mask) in zip(
             self._last_obs, new_obs, transitions
         ):
@@ -102,5 +119,9 @@ class ReplayBuffer(Generic[P]):
         self._last_obs = new_obs
 
     def sample_batch(self, batch_size: int) -> list[ReplayItem]:
-        """Samples a batch of transitions from the buffer."""
+        """Samples a batch of transitions from the buffer (without storage)."""
         return random.sample(self._buffer, k=batch_size)
+
+    def sample(self, batch_size: int):
+        """Samples a replay_storage.Batch (with storage)."""
+        return self.storage.sample(batch_size)
