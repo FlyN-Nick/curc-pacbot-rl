@@ -53,6 +53,8 @@ To run several trainings at once on one machine, split the CPU cores between the
 | 2 | `--num-actors 2 --actor-threads 2 --eval-workers 1` |
 | 3 | `--num-actors 2 --actor-threads 1 --eval-workers 1` |
 
+`--bf16` (opt-in, CUDA only) runs the network's convolutions and matrix products in bfloat16: `update` for the gradient pass only, `all` for the target passes too. It mainly helps runs that share a GPU (there, two runs reached about 115 iterations/s combined and three about 130 with `all`), at the cost of rounding those results to about 0.4% instead of TF32's 0.05%. Weights, the optimizer, the loss and game play stay in float32. It hasn't been compared with the default over a long run; the setting is recorded in the W&B config and checkpoint metadata.
+
 Checkpoints record the version of the environment rules they were trained with as `env_version` (see `LATEST_ENV_VERSION` in `pacbot_rs/src/env.rs`); checkpoints without it are version 1. The evaluation scripts, `--eval`, and the bot client use each checkpoint's version, so older checkpoints keep the rules they were trained with. When changing rules that affect what the agent sees or which model plays, add a new version instead of changing an old one.
 
 You can also change **hyperparameters** with command-line arguments. To see the full list, pass `--help` or take a look at the `hyperparam_defaults` dictionary near the top of `train_dqn.py`. In particular:

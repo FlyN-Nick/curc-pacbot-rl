@@ -56,6 +56,13 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-legacy-checkpoint", action="store_true")
     parser.add_argument("--timing", action="store_true", help="Print how long each part of every iteration takes")
+    parser.add_argument(
+        "--bf16", choices=["none", "update", "all"], default="none",
+        help="Run the network's convolutions and matrix products in bfloat16 on a CUDA GPU: "
+        "'update' for the gradient pass only, 'all' for the target passes too. Faster, but "
+        "rounds those results to ~0.4%% (TF32, the default for convolutions, rounds to "
+        "~0.05%%). Weights, optimizer, loss and game play stay in float32. Default: %(default)s",
+    )
     cpus = os.cpu_count() or 1
     parser.add_argument(
         # Actors' inference is compute-bound, so hyperthreads add little: about one 2-thread
@@ -88,6 +95,10 @@ if __name__ == "__main__":
         time_block = nullcontext
     device = select_device(args.device)
     print(f"Using device: {device}")
+    if args.bf16 != "none":
+        if device.type != "cuda":
+            parser.error("--bf16 needs a CUDA device")
+        print(f"bfloat16: {args.bf16}")
     if not args.eval:
         print(f"Actors: {args.num_actors} ({args.actor_threads} threads each), "
               f"evaluation workers: {args.eval_workers}")
@@ -101,6 +112,7 @@ if __name__ == "__main__":
         tags=["DQN"] + (["finetuning"] if args.finetune else []),
         config={
             "device": str(device),
+            "bf16": args.bf16,
             **{name: getattr(args, name) for name in hyperparam_defaults.keys()},
         },
         mode="disabled" if args.eval or args.no_wandb else "online",
@@ -223,10 +235,10 @@ class DeferredMetrics:
     def add(self, host_metrics: dict, loss, grad_norm, all_predicted_q_values, target_q_values):
         """Queues this iteration's metrics and logs the previous iteration's."""
         values = torch.stack([
-            loss.detach(),
-            grad_norm.detach(),
-            all_predicted_q_values.detach().amax(dim=1).mean() / self.reward_scale,
-            target_q_values.mean() / self.reward_scale,
+            loss.detach().float(),
+            grad_norm.detach().float(),
+            all_predicted_q_values.detach().float().amax(dim=1).mean() / self.reward_scale,
+            target_q_values.float().mean() / self.reward_scale,
         ])
         if self.pinned:
             host = torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
@@ -316,12 +328,16 @@ def _train(replay_buffer, evaluator, actors: bool):
         optimizer.load_state_dict(resume_optimizer_state)
         print("Restored optimizer state from checkpoint")
 
-    # Automatic Mixed Precision stuff.
+    # Automatic Mixed Precision stuff. float16 (with loss scaling) is off; bfloat16 is opt-in
+    # with --bf16 and needs no scaling (it has float32's range).
     use_amp = False  # device.type == "cuda"
     grad_scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    autocast = (
-        torch.autocast(device_type=device.type, dtype=torch.float16) if use_amp else nullcontext()
-    )
+
+    def bf16_autocast(enabled: bool):
+        if not enabled:
+            return nullcontext()
+        # No cast cache: copies cast under no_grad (the target passes) can't carry gradients
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16, cache_enabled=False)
 
     best_eval_score = resume_best_eval_score
 
@@ -405,7 +421,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             # Get the target Q values.
             double_dqn = True
             with torch.no_grad():
-                with autocast:
+                with bf16_autocast(args.bf16 == "all"):
                     # masked_fill and gather instead of boolean-mask assignment and
                     # range indexing: the same values, without making the CPU wait for the GPU
                     next_q_values = target_q_net(next_obs_batch)
@@ -428,7 +444,7 @@ def _train(replay_buffer, evaluator, actors: bool):
                 optimizer.zero_grad()
 
             with time_block("Forward pass"):
-                with autocast:
+                with bf16_autocast(args.bf16 in ("update", "all")):
                     all_predicted_q_values = q_net(obs_batch)
                     predicted_q_values = all_predicted_q_values.gather(1, action_batch.unsqueeze(1)).squeeze(1)
                     loss = F.mse_loss(predicted_q_values, target_q_values)
