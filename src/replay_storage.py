@@ -86,7 +86,7 @@ class Batch(NamedTuple):
     done: torch.Tensor
     next_action_mask: torch.Tensor
     action: torch.Tensor
-    reward: torch.Tensor  # unscaled, float64
+    reward: torch.Tensor  # unscaled; float64, or float32 on MPS (see ReplayStorage)
 
 
 class BatchIndices(NamedTuple):
@@ -115,7 +115,10 @@ class ReplayStorage:
         self._obs_reward = torch.zeros((self._rows, _H, _W), dtype=torch.float32, device=device)
         self._obs_speed = torch.zeros(self._rows, dtype=torch.float32, device=device)
         self._action = torch.zeros(capacity, dtype=torch.long, device=device)
-        self._reward = torch.zeros(capacity, dtype=torch.float64, device=device)
+        # Rewards are kept (and scaled) in float64 like the original Python code did, except on
+        # MPS, which has no float64; rewards are integers, so float32 holds them exactly too.
+        self._float = torch.float32 if device.type == "mps" else torch.float64
+        self._reward = torch.zeros(capacity, dtype=self._float, device=device)
         self._done = torch.zeros(capacity, dtype=torch.bool, device=device)
         self._next_mask = torch.zeros((capacity, NUM_ACTIONS), dtype=torch.bool, device=device)
         self._initialized = False
@@ -176,10 +179,10 @@ class ReplayStorage:
         # One copy to the device, from pinned memory: a copy from ordinary memory would make
         # the CPU wait for the device's queued work first.
         packed = torch.cat([
-            torch.as_tensor(actions, dtype=torch.float64).view(n, 1),
-            torch.as_tensor(rewards, dtype=torch.float64).view(n, 1),
-            torch.as_tensor(dones, dtype=torch.float64).view(n, 1),
-            torch.as_tensor(next_action_masks, dtype=torch.float64).view(n, NUM_ACTIONS),
+            torch.as_tensor(actions, dtype=self._float).view(n, 1),
+            torch.as_tensor(rewards, dtype=self._float).view(n, 1),
+            torch.as_tensor(dones, dtype=self._float).view(n, 1),
+            torch.as_tensor(next_action_masks, dtype=self._float).view(n, NUM_ACTIONS),
         ], dim=1)
         if self.device.type == "cuda":
             packed = packed.pin_memory()
