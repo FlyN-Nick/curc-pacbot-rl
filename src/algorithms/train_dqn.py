@@ -4,6 +4,7 @@ import copy
 import itertools
 import json
 from pathlib import Path
+import os
 import shutil
 import signal
 import time
@@ -36,146 +37,215 @@ from policies import EpsilonGreedy, MaxQPolicy
 from replay_buffer import ReplayBuffer
 from timing import time_block
 from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, make_gym
+import parallel_training
 
 
-_hyperparams_path = Path(__file__).parent / "hyperparams.json"
-hyperparam_defaults: dict = json.loads(_hyperparams_path.read_text())
+# Everything that runs the script is under this guard: worker processes (see
+# parallel_training) re-import this module, and must only get its definitions.
+if __name__ == "__main__":
+    _hyperparams_path = Path(__file__).parent / "hyperparams.json"
+    hyperparam_defaults: dict = json.loads(_hyperparams_path.read_text())
 
-parser = ArgumentParser()
-parser.add_argument("--eval", metavar="CHECKPOINT", default=None)
-parser.add_argument("--finetune", metavar="CHECKPOINT", default=None)
-parser.add_argument("--no-wandb", action="store_true")
-parser.add_argument("--no-eval", action="store_true")
-parser.add_argument("--checkpoint-dir", default="checkpoints")
-parser.add_argument("--device", default=None)
-parser.add_argument("--save-legacy-checkpoint", action="store_true")
-for name, default_value in hyperparam_defaults.items():
+    parser = ArgumentParser()
+    parser.add_argument("--eval", metavar="CHECKPOINT", default=None)
+    parser.add_argument("--finetune", metavar="CHECKPOINT", default=None)
+    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--save-legacy-checkpoint", action="store_true")
+    cpus = os.cpu_count() or 1
     parser.add_argument(
-        f"--{name}",
-        type=type(default_value),
-        default=default_value,
-        help="Default: %(default)s",
+        "--num-actors", type=int, default=max(1, min(6, (cpus - 4) // 2)),
+        help="Processes that collect experience on the CPU while this one trains "
+        "(0: collect here, between updates, as before). Default for this machine: %(default)s",
     )
-args = parser.parse_args()
-if not hasattr(models, args.model):
-    parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
+    parser.add_argument(
+        "--actor-threads", type=int, default=2,
+        help="CPU threads per actor process. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--eval-workers", type=int, default=3 if cpus >= 12 else 1,
+        help="Processes that play the evaluation games on the CPU in the background "
+        "(0: play them here, blocking training, as before). Default for this machine: %(default)s",
+    )
+    for name, default_value in hyperparam_defaults.items():
+        parser.add_argument(
+            f"--{name}",
+            type=type(default_value),
+            default=default_value,
+            help="Default: %(default)s",
+        )
+    args = parser.parse_args()
+    if not hasattr(models, args.model):
+        parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
-device = select_device(args.device)
-print(f"Using device: {device}")
+    device = select_device(args.device)
+    print(f"Using device: {device}")
+    if not args.eval:
+        print(f"Actors: {args.num_actors} ({args.actor_threads} threads each), "
+              f"evaluation workers: {args.eval_workers}")
 
 
-reward_scale: float = args.reward_scale
-# Prepare wandb init kwargs. We may want to resume an existing run when finetuning from
-# a checkpoint that recorded its wandb run id.
-wandb_init_kwargs = dict(
-    project="pacbot-ind-study",
-    tags=["DQN"] + (["finetuning"] if args.finetune else []),
-    config={
-        "device": str(device),
-        **{name: getattr(args, name) for name in hyperparam_defaults.keys()},
-    },
-    mode="disabled" if args.eval or args.no_wandb else "online",
-)
+    reward_scale: float = args.reward_scale
+    # Prepare wandb init kwargs. We may want to resume an existing run when finetuning from
+    # a checkpoint that recorded its wandb run id.
+    wandb_init_kwargs = dict(
+        project="pacbot-ind-study",
+        tags=["DQN"] + (["finetuning"] if args.finetune else []),
+        config={
+            "device": str(device),
+            **{name: getattr(args, name) for name in hyperparam_defaults.keys()},
+        },
+        mode="disabled" if args.eval or args.no_wandb else "online",
+    )
 
-# If finetuning from a checkpoint, try to read a metadata checkpoint to obtain the
-# original wandb run id so we can resume the run instead of creating a new one.
-if args.finetune and not (args.eval or args.no_wandb):
-    try:
+    # If finetuning from a checkpoint, try to read a metadata checkpoint to obtain the
+    # original wandb run id so we can resume the run instead of creating a new one.
+    if args.finetune and not (args.eval or args.no_wandb):
+        try:
+            ckpt_path = Path(args.finetune)
+            if ckpt_path.exists():
+                # Attempt to load as a metadata dict first (recommended). If it's a legacy
+                # full-model .pt, torch.load will still return a Module instance and we
+                # won't find metadata.
+                data = torch.load(ckpt_path, map_location="cpu")
+                if isinstance(data, dict) and "wandb_run_id" in data:
+                    wandb_init_kwargs.update({"id": data.get("wandb_run_id"), "resume": "allow"})
+                    print(f"Will resume wandb run id {data.get('wandb_run_id')} from checkpoint {ckpt_path}")
+        except Exception:
+            # Don't block training just because metadata couldn't be read; fall back to
+            # starting a new run.
+            pass
+
+    wandb.init(**wandb_init_kwargs)
+
+
+    # Initialize the Q network.
+    model_class = getattr(models, wandb.config.model)
+    q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
+    print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
+
+    # variables used when resuming from a checkpoint (finetuning)
+    resume_iter = 0
+    resume_epsilon = 0
+    resume_optimizer_state = None
+    resume_best_eval_score = -float("inf")
+    if args.finetune:
+        # Load checkpoint. Support two formats:
+        # 1) metadata dict: {
+        #      "state_dict": ..., "wandb_run_id": "<id>", "iter_num": int, "config": {...}
+        #    }
+        # 2) legacy: a full torch-saved Module instance.
         ckpt_path = Path(args.finetune)
         if ckpt_path.exists():
-            # Attempt to load as a metadata dict first (recommended). If it's a legacy
-            # full-model .pt, torch.load will still return a Module instance and we
-            # won't find metadata.
-            data = torch.load(ckpt_path, map_location="cpu")
-            if isinstance(data, dict) and "wandb_run_id" in data:
-                wandb_init_kwargs.update({"id": data.get("wandb_run_id"), "resume": "allow"})
-                print(f"Will resume wandb run id {data.get('wandb_run_id')} from checkpoint {ckpt_path}")
-    except Exception:
-        # Don't block training just because metadata couldn't be read; fall back to
-        # starting a new run.
-        pass
-
-wandb.init(**wandb_init_kwargs)
-
-
-# Initialize the Q network.
-model_class = getattr(models, wandb.config.model)
-q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
-print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
-
-# variables used when resuming from a checkpoint (finetuning)
-resume_iter = 0
-resume_epsilon = 0
-resume_optimizer_state = None
-resume_best_eval_score = -float("inf")
-if args.finetune:
-    # Load checkpoint. Support two formats:
-    # 1) metadata dict: {
-    #      "state_dict": ..., "wandb_run_id": "<id>", "iter_num": int, "config": {...}
-    #    }
-    # 2) legacy: a full torch-saved Module instance.
-    ckpt_path = Path(args.finetune)
-    if ckpt_path.exists():
-        loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if isinstance(loaded, dict) and "state_dict" in loaded:
-            print(f"Finetuning from checkpoint metadata {args.finetune}")
-            q_net.load_state_dict(loaded["state_dict"])  # type: ignore[arg-type]
-            # If the checkpoint recorded the training iteration or epsilon, record
-            # them so we can resume training exactly where it left off.
-            resume_iter = int(loaded.get("iter_num", 0))
-            resume_epsilon = loaded.get("epsilon", None)
-            resume_optimizer_state = loaded.get("optimizer_state_dict", None)
-            resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
-            if checkpoint_env_version(loaded) != ENV_VERSION:
-                print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
-                      f"finetuning continues with version {ENV_VERSION}")
-            ckpt_wandb_id = loaded.get("wandb_run_id")
-            if ckpt_wandb_id:
-                print(f"Loaded checkpoint was created by wandb run id: {ckpt_wandb_id}")
+            loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
+            if isinstance(loaded, dict) and "state_dict" in loaded:
+                print(f"Finetuning from checkpoint metadata {args.finetune}")
+                q_net.load_state_dict(loaded["state_dict"])  # type: ignore[arg-type]
+                # If the checkpoint recorded the training iteration or epsilon, record
+                # them so we can resume training exactly where it left off.
+                resume_iter = int(loaded.get("iter_num", 0))
+                resume_epsilon = loaded.get("epsilon", None)
+                resume_optimizer_state = loaded.get("optimizer_state_dict", None)
+                resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
+                if checkpoint_env_version(loaded) != ENV_VERSION:
+                    print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
+                          f"finetuning continues with version {ENV_VERSION}")
+                ckpt_wandb_id = loaded.get("wandb_run_id")
+                if ckpt_wandb_id:
+                    print(f"Loaded checkpoint was created by wandb run id: {ckpt_wandb_id}")
+            else:
+                # Legacy checkpoint saved as full model.
+                print(f"Finetuning from parameters from legacy checkpoint {args.finetune}")
+                q_net = loaded
         else:
-            # Legacy checkpoint saved as full model.
-            print(f"Finetuning from parameters from legacy checkpoint {args.finetune}")
-            q_net = loaded
-    else:
-        raise FileNotFoundError(f"--finetune checkpoint not found: {args.finetune}")
+            raise FileNotFoundError(f"--finetune checkpoint not found: {args.finetune}")
 
 
-@torch.no_grad()
 def evaluate_episode(max_steps: int = 1000) -> tuple[int, int, bool, int, int, int, float]:
     """
     Performs a single evaluation episode.
 
     Returns (score, total_steps, is_board_cleared, pellets_start, pellets_end, purgatory_pellets, ghost_proximities).
     """
-    gym = PacmanGym(DETERMINISTIC_START_CONFIGURATION)
-    pellets_start = gym.remaining_pellets()
+    return parallel_training.evaluate_episode(q_net, device, ENV_VERSION, max_steps=max_steps)
 
-    q_net.eval()
-    policy = MaxQPolicy(q_net)
 
-    done, step_num = step_env_until_done(gym, policy, device, max_steps=max_steps)
+def eval_metrics(result: tuple) -> dict:
+    """Metrics to log for an evaluate_episode() result."""
+    (
+        eval_episode_score,
+        eval_episode_steps,
+        cleared_board,
+        pellets_start,
+        pellets_end,
+        purgatory_pellets,
+        ghost_proximities,
+    ) = result
+    return dict(
+        eval_episode_score=eval_episode_score,
+        eval_episode_steps=eval_episode_steps,
+        cleared_board=int(cleared_board),
+        eval_pellets_start=pellets_start,
+        eval_pellets_end=pellets_end,
+        purgatory_pellets=purgatory_pellets,
+        ghost_proximities=ghost_proximities,
+    )
 
-    is_board_cleared = done and gym.lives() == 3
-    pellets_end = 0 if is_board_cleared else gym.remaining_pellets()
 
-    return (gym.score(), step_num, is_board_cleared, pellets_start, pellets_end, gym.purgatory_pellets, gym.ghost_proximities)
+def cpu_copy(obj):
+    """A copy of obj with every tensor cloned to the CPU (for snapshots of live state)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: cpu_copy(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(cpu_copy(v) for v in obj)
+    return copy.deepcopy(obj)
 
 
 def train():
-    # Initialize the replay buffer.
-    replay_buffer = ReplayBuffer(
-        maxlen=wandb.config.replay_buffer_size,
-        policy=EpsilonGreedy(
-            MaxQPolicy(q_net),
-            NUM_ACTIONS,
-            # use epsilon recovered from checkpoint if finetuning,
-            # otherwise use configured initial epsilon
-            resume_epsilon if resume_epsilon is not None else (wandb.config.initial_epsilon if args.finetune else 1.0),
-        ),
-        num_parallel_envs=wandb.config.num_parallel_envs,
-        random_start_proportion=wandb.config.random_start_proportion,
-        device=device,
-    )
+    actors = args.num_actors > 0
+    evaluator = None
+    replay_buffer = None
+    try:
+        if args.eval_workers > 0:
+            evaluator = parallel_training.BackgroundEvaluator(
+                args.eval_workers, wandb.config.model, ENV_VERSION
+            )
+        # use epsilon recovered from checkpoint if finetuning,
+        # otherwise use configured initial epsilon
+        fill_epsilon = resume_epsilon if resume_epsilon is not None else (wandb.config.initial_epsilon if args.finetune else 1.0)
+        # Initialize the replay buffer.
+        if actors:
+            replay_buffer = parallel_training.ActorReplayBuffer(
+                maxlen=wandb.config.replay_buffer_size,
+                q_net=q_net,
+                model_name=wandb.config.model,
+                epsilon=fill_epsilon,
+                num_parallel_envs=wandb.config.num_parallel_envs,
+                num_actors=args.num_actors,
+                max_steps=wandb.config.experience_steps,
+                device=device,
+                threads_per_actor=args.actor_threads,
+            )
+        else:
+            replay_buffer = ReplayBuffer(
+                maxlen=wandb.config.replay_buffer_size,
+                policy=EpsilonGreedy(MaxQPolicy(q_net), NUM_ACTIONS, fill_epsilon),
+                num_parallel_envs=wandb.config.num_parallel_envs,
+                random_start_proportion=wandb.config.random_start_proportion,
+                device=device,
+            )
+        _train(replay_buffer, evaluator, actors)
+    finally:
+        for resource in (replay_buffer, evaluator):
+            if hasattr(resource, "close"):
+                resource.close()
+
+
+def _train(replay_buffer, evaluator, actors: bool):
     replay_buffer.fill()
     replay_buffer.policy.epsilon = float(resume_epsilon) if resume_epsilon is not None else wandb.config.initial_epsilon
 
@@ -230,6 +300,18 @@ def train():
                 # Update the target network.
                 target_q_net = copy.deepcopy(q_net)
                 target_q_net.eval()
+
+        if actors:
+            # The actors play this iteration's experience while this process updates the
+            # network, with the weights from before the update.
+            replay_buffer.start_collection(
+                wandb.config.experience_steps,
+                lerp(
+                    wandb.config.initial_epsilon,
+                    wandb.config.final_epsilon,
+                    iter_num / (wandb.config.num_iters - 1),
+                ),
+            )
 
         with time_block("Collate batch"):
             # Sample and collate a batch.
@@ -303,31 +385,30 @@ def train():
                 "avg_target_q_value": target_q_values.mean() / wandb.config.reward_scale,
             }
             if iter_num % wandb.config.evaluate_steps == 0:
-                with time_block("Evaluate the current agent"):
-                    # Evaluate the current agent.
-                    (
-                        eval_episode_score,
-                        eval_episode_steps,
-                        cleared_board,
-                        pellets_start,
-                        pellets_end,
-                        purgatory_pellets,
-                        ghost_proximities,
-                    ) = evaluate_episode()
-                    metrics.update(
-                        eval_episode_score=eval_episode_score,
-                        eval_episode_steps=eval_episode_steps,
-                        cleared_board=int(cleared_board),
-                        eval_pellets_start=pellets_start,
-                        eval_pellets_end=pellets_end,
-                        purgatory_pellets=purgatory_pellets,
-                        ghost_proximities=ghost_proximities,
-                    )
-                    if eval_episode_score > best_eval_score:
-                        best_eval_score = eval_episode_score
+                if evaluator is None:
+                    with time_block("Evaluate the current agent"):
+                        # Evaluate the current agent.
+                        result = evaluate_episode()
+                        metrics.update(eval_metrics(result))
+                        if result[0] > best_eval_score:
+                            best_eval_score = result[0]
+                            checkpoint_dir = Path(args.checkpoint_dir)
+                            checkpoint_dir.mkdir(exist_ok=True)
+                            atomic_torch_save(build_metadata(iter_num), checkpoint_dir / "q_net-best.ckpt.pt")
+                else:
+                    # Play it in the background; if every worker is busy, skip this one.
+                    # The snapshot is what gets saved if this turns out to be the best agent.
+                    evaluator.submit(iter_num, q_net, lambda: cpu_copy(build_metadata(iter_num)))
+            if evaluator is not None:
+                for eval_iter, result, snapshot in evaluator.poll():
+                    metrics.update(eval_metrics(result), eval_iter=eval_iter)
+                    if result[0] > best_eval_score:
+                        best_eval_score = result[0]
+                        snapshot["best_eval_score"] = best_eval_score
                         checkpoint_dir = Path(args.checkpoint_dir)
                         checkpoint_dir.mkdir(exist_ok=True)
-                        atomic_torch_save(build_metadata(iter_num), checkpoint_dir / "q_net-best.ckpt.pt")
+                        atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
+                metrics["skipped_evals"] = evaluator.skipped
             wandb.log(metrics)
 
         if iter_num % 500 == 0:
@@ -363,8 +444,11 @@ def train():
 
         # Collect experience.
         with time_block("Collect experience"):
-            for _ in range(wandb.config.experience_steps):
-                replay_buffer.generate_experience_step()
+            if actors:
+                replay_buffer.finish_collection()
+            else:
+                for _ in range(wandb.config.experience_steps):
+                    replay_buffer.generate_experience_step()
 
     signal.signal(signal.SIGINT, prev_sigint)
 
@@ -396,38 +480,39 @@ def visualize_agent():
             break
 
 
-# Visualize under the rules the shown model was trained with.
-visualize_env_version = ENV_VERSION
-if args.eval:
-    # handle loading from both legacy checkpoints and metadata checkpoints
+if __name__ == "__main__":
+    # Visualize under the rules the shown model was trained with.
+    visualize_env_version = ENV_VERSION
+    if args.eval:
+        # handle loading from both legacy checkpoints and metadata checkpoints
     
-    model_class = getattr(models, wandb.config.model)
-    q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
-    print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
+        model_class = getattr(models, wandb.config.model)
+        q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
+        print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
     
-    ckpt_path = Path(args.eval)
-    if ckpt_path.exists():
-        loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
-        visualize_env_version = checkpoint_env_version(loaded)
-        print(f"Using environment version {visualize_env_version}")
-        if isinstance(loaded, dict) and "state_dict" in loaded:
-            q_net.load_state_dict(loaded["state_dict"])
+        ckpt_path = Path(args.eval)
+        if ckpt_path.exists():
+            loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
+            visualize_env_version = checkpoint_env_version(loaded)
+            print(f"Using environment version {visualize_env_version}")
+            if isinstance(loaded, dict) and "state_dict" in loaded:
+                q_net.load_state_dict(loaded["state_dict"])
+            else:
+                q_net = loaded
         else:
-            q_net = loaded
+            raise FileNotFoundError(f"--eval checkpoint not found: {args.eval}")
     else:
-        raise FileNotFoundError(f"--eval checkpoint not found: {args.eval}")
-else:
-    try:
-        train()
-    except KeyboardInterrupt:
-        pass
-    wandb.finish()
-
-if not args.no_eval:
-    while True:
-        visualize_agent()
         try:
-            input("Press enter to view another episode")
+            train()
         except KeyboardInterrupt:
-            print()
-            break
+            pass
+        wandb.finish()
+
+    if not args.no_eval:
+        while True:
+            visualize_agent()
+            try:
+                input("Press enter to view another episode")
+            except KeyboardInterrupt:
+                print()
+                break
