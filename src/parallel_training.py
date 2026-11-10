@@ -60,7 +60,8 @@ def _init_worker(threads: int, seed: int) -> None:
 def _cpu_model(model_name: str) -> torch.nn.Module:
     """
     A model for CPU inference in channels-last layout, which makes these small convolutions
-    up to ~3x faster on the CPU with identical results. Also converts the super pellet model.
+    up to ~3x faster on the CPU. Results differ only by float32 rounding (~1e-7 relative on
+    real observations; no greedy action changed in a check). Also converts the super pellet model.
     """
     safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=_CPU).q_net.to(memory_format=torch.channels_last)
     model = getattr(models, model_name)(OBS_SHAPE, NUM_ACTIONS).eval()
