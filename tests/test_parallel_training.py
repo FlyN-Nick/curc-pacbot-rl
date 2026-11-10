@@ -105,6 +105,13 @@ class CudaActorReplayBufferTests(ActorReplayBufferTests):
     device = torch.device("cuda")
 
 
+@unittest.skipUnless(torch.backends.mps.is_available(), "needs an Apple Silicon GPU (MPS)")
+class MpsActorReplayBufferTests(ActorReplayBufferTests):
+    """The same, with the buffer on an Apple Silicon GPU."""
+
+    device = torch.device("mps")
+
+
 class BackgroundEvaluatorTests(unittest.TestCase):
     def test_evaluates_and_reports_payload(self):
         evaluator = parallel_training.BackgroundEvaluator(1, "QNetV2", env_version=2)

@@ -15,6 +15,7 @@ Observations are stored compactly and restored exactly (see ObsCodec).
 
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from utils import NUM_ACTIONS, OBS_SHAPE
@@ -31,9 +32,12 @@ _SCALES = {12: 180.0, 13: 180.0, 14: 40.0}
 class ObsCodec:
     """
     Encodes observations into about 30% of their float32 size and decodes them exactly: the
-    0/1 channels and the step counts (as integers) are stored in bytes, decoded with the same
-    float32 division the environment uses. Decoding is checked on everything encoded, and
-    mismatches are counted (read with mismatches(); the check makes the CPU wait for nothing).
+    0/1 channels and the step counts (as integers) are stored in bytes, and decoded with the
+    same float32 division the environment uses. CUDA divides with exact IEEE rounding, so it
+    divides directly; other devices (e.g. MPS) may divide less exactly, so they look each byte
+    up in a table computed on the CPU, which is a little slower. Decoding is checked on
+    everything encoded, and mismatches are counted (read with mismatches(); the check makes
+    the CPU wait for nothing).
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -41,6 +45,11 @@ class ObsCodec:
         self._byte_channels = torch.tensor(_BYTE_CHANNELS, device=device)
         scales = [_SCALES.get(c, 1.0) for c in _BYTE_CHANNELS]
         self._scales = torch.tensor(scales, dtype=torch.float32, device=device).view(1, -1, 1, 1)
+        # Decoded value of each byte for each channel: n / scale in float32, as env.rs computes it
+        tables = np.arange(256, dtype=np.float32)[None, :] / np.array(scales, dtype=np.float32)[:, None]
+        self._tables = torch.from_numpy(tables).to(device)
+        self._table_rows = torch.arange(len(scales), device=device).view(1, -1, 1, 1)
+        self._divide = device.type == "cuda"
         self._mismatches = torch.zeros((), dtype=torch.long, device=device)
 
     def encode(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -52,8 +61,12 @@ class ObsCodec:
     def decode(self, byte_part, reward_part, speed_part) -> torch.Tensor:
         n = byte_part.shape[0]
         obs = torch.empty((n, *OBS_SHAPE), dtype=torch.float32, device=byte_part.device)
+        if self._divide:
+            values = byte_part.to(torch.float32) / self._scales
+        else:
+            values = self._tables[self._table_rows, byte_part.long()]
         # index_copy_ with a device index (not a Python list), so this can run in a CUDA graph
-        obs.index_copy_(1, self._byte_channels, byte_part.to(torch.float32) / self._scales)
+        obs.index_copy_(1, self._byte_channels, values)
         obs[:, _REWARD_CHANNEL] = reward_part
         obs[:, _SPEED_CHANNEL] = speed_part.view(n, 1, 1)
         return obs
@@ -187,7 +200,10 @@ class ReplayStorage:
         size = len(self)
         if batch_size > size:
             raise ValueError(f"can't sample {batch_size} of {size} transitions")
-        t = (self.total - size) + torch.randperm(size, device=self.device)[:batch_size]
+        # randperm on the device where it's supported well (CUDA), otherwise on the CPU
+        where = self.device if self.device.type == "cuda" else "cpu"
+        perm = torch.randperm(size, device=where)[:batch_size].to(self.device)
+        t = (self.total - size) + perm
         return BatchIndices(t % self._rows, (t + self.num_envs) % self._rows, t % self.capacity)
 
     def gather(self, idx: BatchIndices) -> Batch:

@@ -21,7 +21,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_replay_buffer_batching import FakeEnv, FakeQNet  # noqa: E402
 from utils import NUM_ACTIONS, OBS_SHAPE, PacmanGymConfiguration
 
-DEVICES = [torch.device("cpu")] + ([torch.device("cuda")] if torch.cuda.is_available() else [])
+DEVICES = [torch.device("cpu")]
+if torch.cuda.is_available():
+    DEVICES.append(torch.device("cuda"))
+if torch.backends.mps.is_available():  # Apple Silicon GPU
+    DEVICES.append(torch.device("mps"))
 
 
 def real_observations(games: int = 40, steps: int = 300) -> torch.Tensor:

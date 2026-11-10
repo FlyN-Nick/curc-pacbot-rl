@@ -412,7 +412,7 @@ class ActorReplayBuffer:
         """
         with torch.no_grad():
             if not self._cuda:
-                self._write_shared(epsilon, self._params_vector().numpy())
+                self._write_shared(epsilon, self._params_vector().cpu().numpy())
                 return
             params = None
             if self._params_copied is not None:
