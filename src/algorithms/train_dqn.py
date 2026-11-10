@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from contextlib import nullcontext
 import copy
+import math
 import itertools
 import json
 from pathlib import Path
@@ -54,9 +55,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-legacy-checkpoint", action="store_true")
+    parser.add_argument("--timing", action="store_true", help="Print how long each part of every iteration takes")
     cpus = os.cpu_count() or 1
     parser.add_argument(
-        "--num-actors", type=int, default=max(1, min(6, (cpus - 4) // 2)),
+        # Actors' inference is compute-bound, so hyperthreads add little: about one 2-thread
+        # actor per 2 physical cores (4 on an 8-core/16-thread CPU) was fastest
+        "--num-actors", type=int, default=max(1, min(4, cpus // 4)),
         help="Processes that collect experience on the CPU while this one trains "
         "(0: collect here, between updates, as before). Default for this machine: %(default)s",
     )
@@ -80,6 +84,8 @@ if __name__ == "__main__":
     if not hasattr(models, args.model):
         parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
+    if not args.timing:
+        time_block = nullcontext
     device = select_device(args.device)
     print(f"Using device: {device}")
     if not args.eval:
@@ -125,6 +131,11 @@ if __name__ == "__main__":
     model_class = getattr(models, wandb.config.model)
     q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
     print(f"q_net has {sum(p.numel() for p in q_net.parameters())} parameters")
+    if device.type == "cuda":
+        # Faster convolutions at the same precision: cuDNN times its algorithms once for each
+        # (fixed) batch shape and keeps the fastest, and channels-last suits its kernels.
+        torch.backends.cudnn.benchmark = True
+        q_net = q_net.to(memory_format=torch.channels_last)
 
     # variables used when resuming from a checkpoint (finetuning)
     resume_iter = 0
@@ -192,6 +203,56 @@ def eval_metrics(result: tuple) -> dict:
         purgatory_pellets=purgatory_pellets,
         ghost_proximities=ghost_proximities,
     )
+
+
+class DeferredMetrics:
+    """
+    Logs each iteration's metrics one iteration later, so reading the GPU values back doesn't
+    make the CPU wait for the GPU every iteration. Also checks the gradient norm then, which
+    clip_grad_norm_(error_if_nonfinite=True) would otherwise do with a wait of its own.
+    """
+
+    names = ("loss", "grad_norm", "avg_predicted_value", "avg_target_q_value")
+
+    def __init__(self, device: torch.device, reward_scale: float):
+        self.device = device
+        self.reward_scale = reward_scale
+        self.pinned = device.type == "cuda"
+        self._pending = None
+
+    def add(self, host_metrics: dict, loss, grad_norm, all_predicted_q_values, target_q_values):
+        """Queues this iteration's metrics and logs the previous iteration's."""
+        values = torch.stack([
+            loss.detach(),
+            grad_norm.detach(),
+            all_predicted_q_values.detach().amax(dim=1).mean() / self.reward_scale,
+            target_q_values.mean() / self.reward_scale,
+        ])
+        if self.pinned:
+            host = torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
+            host.copy_(values, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+        else:
+            host, event = values, None
+        self.flush()
+        self._pending = (host_metrics, host, event)
+
+    def flush(self):
+        """Logs the queued metrics, if any (waiting for the GPU to produce them)."""
+        if self._pending is None:
+            return
+        host_metrics, host, event = self._pending
+        self._pending = None
+        if event is not None:
+            event.synchronize()
+        values = dict(zip(self.names, host.tolist()))
+        if not math.isfinite(values["grad_norm"]):
+            raise RuntimeError(
+                f"The total norm of gradients is non-finite ({values['grad_norm']}), "
+                "so the parameters can't be trusted. Stopping."
+            )
+        wandb.log({**values, **host_metrics})
 
 
 def cpu_copy(obj):
@@ -286,8 +347,10 @@ def _train(replay_buffer, evaluator, actors: bool):
     target_q_net = copy.deepcopy(q_net)
     target_q_net.eval()
 
+    deferred_metrics = DeferredMetrics(device, wandb.config.reward_scale)
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if _exit_requested:
+            deferred_metrics.flush()
             checkpoint_dir = Path(args.checkpoint_dir)
             checkpoint_dir.mkdir(exist_ok=True)
             metadata_path = checkpoint_dir / "q_net-latest.ckpt.pt"
@@ -324,29 +387,38 @@ def _train(replay_buffer, evaluator, actors: bool):
                         for item in batch
                     ]
                 )
-                done_mask = torch.tensor([item.next_obs is None for item in batch])
-                next_action_masks = torch.tensor([item.next_action_mask for item in batch])
-                action_batch = torch.tensor([item.action for item in batch])
-                reward_batch = torch.tensor(
-                    [item.reward * wandb.config.reward_scale for item in batch]
+                # The per-transition values go to the device in one copy, from pinned memory so
+                # the CPU doesn't wait for the GPU to finish its queued work first.
+                packed = torch.tensor(
+                    [(item.next_obs is None, *item.next_action_mask, item.action, item.reward) for item in batch],
+                    dtype=torch.float64, device="cpu",
                 )
+                if device.type == "cuda":
+                    packed = packed.pin_memory()
+                packed = packed.to(device, non_blocking=True)
+                done_mask = packed[:, 0].bool()
+                next_action_masks = packed[:, 1:1 + NUM_ACTIONS].bool()
+                action_batch = packed[:, 1 + NUM_ACTIONS].long()
+                reward_batch = (packed[:, 2 + NUM_ACTIONS] * wandb.config.reward_scale).float()
 
         with time_block("Compute target Q values"):
             # Get the target Q values.
             double_dqn = True
             with torch.no_grad():
                 with autocast:
+                    # masked_fill and gather instead of boolean-mask assignment and
+                    # range indexing: the same values, without making the CPU wait for the GPU
                     next_q_values = target_q_net(next_obs_batch)
-                    next_q_values[~next_action_masks] = -torch.inf
+                    next_q_values = next_q_values.masked_fill(~next_action_masks, -torch.inf)
                     if double_dqn:
                         online_next_q_values = q_net(next_obs_batch)
-                        online_next_q_values[~next_action_masks] = -torch.inf
+                        online_next_q_values = online_next_q_values.masked_fill(~next_action_masks, -torch.inf)
                         next_actions = online_next_q_values.argmax(dim=1)
                     else:
                         next_actions = next_q_values.argmax(dim=1)
-                    returns = next_q_values[range(len(batch)), next_actions]
+                    returns = next_q_values.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                     discounted_returns = wandb.config.discount_factor * returns
-                    discounted_returns[done_mask] = 0.0
+                    discounted_returns = discounted_returns.masked_fill(done_mask, 0.0)
                     target_q_values = reward_batch + discounted_returns
 
         with time_block("Compute loss and update parameters"):
@@ -358,31 +430,25 @@ def _train(replay_buffer, evaluator, actors: bool):
             with time_block("Forward pass"):
                 with autocast:
                     all_predicted_q_values = q_net(obs_batch)
-                    predicted_q_values = all_predicted_q_values[range(len(batch)), action_batch]
+                    predicted_q_values = all_predicted_q_values.gather(1, action_batch.unsqueeze(1)).squeeze(1)
                     loss = F.mse_loss(predicted_q_values, target_q_values)
 
             with time_block("Backward pass"):
                 grad_scaler.scale(loss).backward()
             with time_block("Clip grad norm"):
+                # A non-finite norm is caught by DeferredMetrics (error_if_nonfinite would wait for the GPU)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     q_net.parameters(),
                     max_norm=wandb.config.grad_clip_norm,
-                    error_if_nonfinite=True,
                 )
             with time_block("Step optimizer"):
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
 
         with torch.no_grad():
-            # Log metrics.
+            # Log metrics. The GPU values are logged by DeferredMetrics a step later.
             metrics = {
-                "loss": loss.item(),
-                "grad_norm": grad_norm,
                 "exploration_epsilon": replay_buffer.policy.epsilon,
-                "avg_predicted_value": (
-                    all_predicted_q_values.amax(dim=1).mean().item() / wandb.config.reward_scale
-                ),
-                "avg_target_q_value": target_q_values.mean() / wandb.config.reward_scale,
             }
             if iter_num % wandb.config.evaluate_steps == 0:
                 if evaluator is None:
@@ -409,9 +475,11 @@ def _train(replay_buffer, evaluator, actors: bool):
                         checkpoint_dir.mkdir(exist_ok=True)
                         atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
                 metrics["skipped_evals"] = evaluator.skipped
-            wandb.log(metrics)
+            deferred_metrics.add(metrics, loss, grad_norm, all_predicted_q_values, target_q_values)
 
         if iter_num % 500 == 0:
+            # Check this update before saving it
+            deferred_metrics.flush()
             with time_block("Save checkpoint"):
                 # Save a checkpoint.
                 checkpoint_dir = Path(args.checkpoint_dir)
@@ -450,6 +518,7 @@ def _train(replay_buffer, evaluator, actors: bool):
                 for _ in range(wandb.config.experience_steps):
                     replay_buffer.generate_experience_step()
 
+    deferred_metrics.flush()
     signal.signal(signal.SIGINT, prev_sigint)
 
 

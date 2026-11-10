@@ -32,7 +32,9 @@ from utils import (
     DETERMINISTIC_START_CONFIGURATION,
     NUM_ACTIONS,
     OBS_SHAPE,
+    SUPER_PELLET_MODEL_PATH,
     make_gym,
+    safetensors_qnet,
     step_env_until_done,
 )
 
@@ -52,6 +54,25 @@ def _init_worker(threads: int, seed: int) -> None:
     # Every process would otherwise share torch's fixed default seed.
     random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _cpu_model(model_name: str) -> torch.nn.Module:
+    """
+    A model for CPU inference in channels-last layout, which makes these small convolutions
+    up to ~3x faster on the CPU with identical results. Also converts the super pellet model.
+    """
+    safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=_CPU).q_net.to(memory_format=torch.channels_last)
+    model = getattr(models, model_name)(OBS_SHAPE, NUM_ACTIONS).eval()
+    return model.to(memory_format=torch.channels_last)
+
+
+def _load_vector(vector: torch.Tensor, module: torch.nn.Module) -> None:
+    """Like vector_to_parameters, but copies into the parameters so they keep their layout."""
+    offset = 0
+    with torch.no_grad():
+        for param in module.parameters():
+            param.copy_(vector[offset:offset + param.numel()].view_as(param))
+            offset += param.numel()
 
 
 def state_dict_to_numpy(module: torch.nn.Module) -> dict[str, np.ndarray]:
@@ -92,7 +113,7 @@ def evaluate_episode(
 def _eval_worker(tasks, results, model_name: str, env_version: int, threads: int, seed: int):
     try:
         _init_worker(threads, seed)
-        q_net = getattr(models, model_name)(OBS_SHAPE, NUM_ACTIONS)
+        q_net = _cpu_model(model_name)
         while (task := tasks.get()) is not None:
             iter_num, weights = task
             q_net.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
@@ -159,71 +180,78 @@ class BackgroundEvaluator:
 
 # ── Actors ───────────────────────────────────────────────────────────────────────
 
+# Header of the shared weights block: version, then epsilon, then the parameters
+_HEADER = 2
+
 
 def _actor(
     conn: Connection,
     num_envs: int,
-    max_steps: int,
+    num_slots: int,
     obs_shm_name: str,
     weights_shm_name: str,
+    weights_lock,
     num_params: int,
     model_name: str,
-    epsilon: float,
     threads: int,
     seed: int,
 ) -> None:
-    obs_shm = weights_shm = obs_out = weights = None
+    """
+    Plays this actor's environments continuously. Each experience step goes into a free slot of
+    the shared observation ring and is announced as ("step", slot, transitions); the learner
+    hands slots back with ("free", slot). With every slot waiting on the learner, it pauses.
+    """
+    obs_shm = weights_shm = obs_out = shared = None
     try:
         _init_worker(threads, seed)
         obs_shm = shared_memory.SharedMemory(name=obs_shm_name)
         weights_shm = shared_memory.SharedMemory(name=weights_shm_name)
-        obs_out = np.ndarray((max_steps, num_envs, *OBS_SHAPE), np.float32, buffer=obs_shm.buf)
-        weights = np.ndarray((num_params,), np.float32, buffer=weights_shm.buf)
+        obs_out = np.ndarray((num_slots, num_envs, *OBS_SHAPE), np.float32, buffer=obs_shm.buf)
+        shared = np.ndarray((_HEADER + num_params,), np.float64, buffer=weights_shm.buf)
 
-        q_net = getattr(models, model_name)(OBS_SHAPE, NUM_ACTIONS).eval()
-        policy = EpsilonGreedy(MaxQPolicy(q_net), NUM_ACTIONS, epsilon)
+        q_net = _cpu_model(model_name)
+        policy = EpsilonGreedy(MaxQPolicy(q_net), NUM_ACTIONS, 1.0)
         # The same collection code as single-process training, on this actor's environments
         buffer = ReplayBuffer(
-            maxlen=num_envs * max_steps,
-            policy=policy,
-            num_parallel_envs=num_envs,
-            random_start_proportion=0.0,
-            device=_CPU,
+            maxlen=num_envs, policy=policy, num_parallel_envs=num_envs,
+            random_start_proportion=0.0, device=_CPU,
         )
         obs_out[0] = buffer._last_obs.numpy()
         conn.send(("ready",))
-
+        # Slot 0 holds the starting observations until the learner hands it back
+        free_slots = deque(range(1, num_slots))
         loaded_version = None
+
         while True:
-            message = conn.recv()
-            if message[0] == "stop":
-                break
-            _, version, epsilon, steps = message
-            if version != loaded_version:
-                torch.nn.utils.vector_to_parameters(
-                    torch.from_numpy(weights.copy()), q_net.parameters()
-                )
-                loaded_version = version
-            policy.epsilon = epsilon
-            transitions = []
-            for step in range(steps):
-                buffer.generate_experience_step()
-                obs_out[step] = buffer._last_obs.numpy()
-                transitions.append(
-                    [
-                        (item.action, item.reward, item.next_obs is None, item.next_action_mask)
-                        for item in buffer._buffer
-                    ]
-                )
-                buffer._buffer.clear()
-            conn.send(("done", transitions))
+            # Take back slots the learner is done with; wait for one if none are free.
+            while conn.poll() or not free_slots:
+                message = conn.recv()
+                if message[0] == "stop":
+                    return
+                free_slots.append(message[1])
+            if shared[0] != loaded_version:
+                with weights_lock:
+                    loaded_version = shared[0]
+                    policy.epsilon = float(shared[1])
+                    params = torch.from_numpy(shared[_HEADER:].astype(np.float32))
+                _load_vector(params, q_net)
+
+            buffer.generate_experience_step()
+            slot = free_slots.popleft()
+            obs_out[slot] = buffer._last_obs.numpy()
+            conn.send((
+                "step",
+                slot,
+                [(i.action, i.reward, i.next_obs is None, i.next_action_mask) for i in buffer._buffer],
+            ))
+            buffer._buffer.clear()
     except Exception:
         try:
             conn.send(("error", traceback.format_exc()))
         except Exception:
             pass
     finally:
-        obs_out = weights = None  # views into the shared memory must go before closing it
+        obs_out = shared = None  # views into the shared memory must go before closing it
         for shm in (obs_shm, weights_shm):
             if shm is not None:
                 shm.close()
@@ -234,11 +262,14 @@ class ActorReplayBuffer:
     A replay buffer filled by actor processes that play the parallel environments with a CPU
     copy of the Q network.
 
-    Each training iteration calls start_collection() before its update and
-    finish_collection() after it, so the actors play while the training process updates the
-    network. They play with the weights published at start_collection(), one update older
-    than single-process training uses; otherwise the transitions and the order they enter the
-    buffer match ReplayBuffer's.
+    The actors play continuously, each up to `ahead_steps` experience steps ahead of what the
+    training process has taken, using the most recently published weights. Each training
+    iteration calls start_collection() before its update, which publishes the weights and
+    exploration rate, and finish_collection() after it, which takes `steps` experience steps
+    from every actor. So every environment still contributes the same number of transitions
+    per iteration, in the same buffer order as ReplayBuffer, from the same collection code;
+    they were just played with weights up to a few updates older. Running ahead keeps an
+    actor stuck in a long super pellet phase from holding up every iteration.
 
     Offers the parts of ReplayBuffer's interface train_dqn uses: policy.epsilon, fill(),
     generate_experience_step(), and sample_batch().
@@ -255,6 +286,7 @@ class ActorReplayBuffer:
         max_steps: int,
         device: torch.device,
         threads_per_actor: int = 2,
+        ahead_steps: int | None = None,
     ) -> None:
         if not 1 <= num_actors <= num_parallel_envs:
             raise ValueError(f"num_actors must be 1..{num_parallel_envs}, got {num_actors}")
@@ -268,7 +300,9 @@ class ActorReplayBuffer:
         self._q_net = q_net
         self._max_steps = max_steps
         self._pending_steps = 0
-        self._version = 0
+        # Room for the steps of the iteration being taken plus `ahead_steps` more
+        ahead_steps = 2 * max_steps if ahead_steps is None else ahead_steps
+        num_slots = max_steps + ahead_steps
 
         base, extra = divmod(num_parallel_envs, num_actors)
         env_counts = [base + (i < extra) for i in range(num_actors)]
@@ -277,31 +311,46 @@ class ActorReplayBuffer:
         self._procs = []
         self._conns: list[Connection] = []
         self._obs_views: list[np.ndarray] = []
+        self._registered: list[int] = []
+        self._weights_lock = _CTX.Lock()
+        # On a GPU, observations are copied on their own stream (so waiting for them doesn't
+        # wait for the update), and weights are copied out in the background (see _publish).
+        self._cuda = device.type == "cuda"
+        if self._cuda:
+            self._copy_stream = torch.cuda.Stream(device)
+            self._params_host = torch.empty(num_params, pin_memory=True)
+        self._params_copied = None  # event for the background copy into _params_host
         try:
-            self._weights_shm = self._new_shm(num_params * 4)
-            self._weights = np.ndarray((num_params,), np.float32, buffer=self._weights_shm.buf)
-            self._publish_weights()
+            weights_shm = self._new_shm((_HEADER + num_params) * 8)
+            self._shared = np.ndarray((_HEADER + num_params,), np.float64, buffer=weights_shm.buf)
+            self._shared[0] = 0
+            self._publish(epsilon)
             for count in env_counts:
-                obs_shm = self._new_shm(max_steps * count * int(np.prod(OBS_SHAPE)) * 4)
-                self._obs_views.append(
-                    np.ndarray((max_steps, count, *OBS_SHAPE), np.float32, buffer=obs_shm.buf)
-                )
+                obs_shm = self._new_shm(num_slots * count * int(np.prod(OBS_SHAPE)) * 4)
+                view = np.ndarray((num_slots, count, *OBS_SHAPE), np.float32, buffer=obs_shm.buf)
+                self._obs_views.append(view)
+                self._pin(view)
                 parent, child = _CTX.Pipe()
                 proc = _CTX.Process(
                     target=_actor,
                     args=(
-                        child, count, max_steps, obs_shm.name, self._weights_shm.name,
-                        num_params, model_name, epsilon, threads_per_actor, _fresh_seed(),
+                        child, count, num_slots, obs_shm.name, weights_shm.name,
+                        self._weights_lock, num_params, model_name, threads_per_actor,
+                        _fresh_seed(),
                     ),
                     daemon=True,
                 )
                 proc.start()
                 self._procs.append(proc)
                 self._conns.append(parent)
+            # Each actor writes its starting observations to slot 0 before saying it's ready
             self._last_obs = []
             for conn, view in zip(self._conns, self._obs_views):
                 self._receive(conn)
                 self._last_obs.append(self._to_device(view[0]))
+            self._sync()
+            for conn in self._conns:
+                conn.send(("free", 0))
         except BaseException:
             self.close()
             raise
@@ -311,9 +360,29 @@ class ActorReplayBuffer:
         self._shms.append(shm)
         return shm
 
+    def _pin(self, view: np.ndarray) -> None:
+        """Registers shared memory with CUDA, making copies to the GPU several times faster."""
+        if self.device.type != "cuda":
+            return
+        ptr = view.ctypes.data
+        if torch.cuda.cudart().cudaHostRegister(ptr, view.nbytes, 0) == 0:  # cudaSuccess
+            self._registered.append(ptr)
+
     def _to_device(self, array: np.ndarray) -> torch.Tensor:
-        # Always copy: the shared memory is overwritten by the next collection.
-        return torch.from_numpy(array).to(self.device, copy=True)
+        # Always copy: the slot is reused once handed back. On a GPU the copy may still be
+        # running when this returns, so slots go back only after _sync().
+        if not self._cuda:
+            return torch.from_numpy(array).to(self.device, copy=True)
+        with torch.cuda.stream(self._copy_stream):
+            tensor = torch.from_numpy(array).to(self.device, copy=True, non_blocking=True)
+        # Made on the copy stream, used on the main one: keep its memory until that's done too
+        tensor.record_stream(torch.cuda.current_stream(self.device))
+        return tensor
+
+    def _sync(self) -> None:
+        """Waits for the observation copies (not for the training work on the main stream)."""
+        if self._cuda:
+            self._copy_stream.synchronize()
 
     @staticmethod
     def _receive(conn: Connection):
@@ -322,42 +391,67 @@ class ActorReplayBuffer:
             raise RuntimeError(f"Actor process failed:\n{message[1]}")
         return message
 
-    def _publish_weights(self) -> None:
+    def _params_vector(self) -> torch.Tensor:
+        # reshape, not view: parameters may be in channels-last layout
+        return torch.cat([p.detach().reshape(-1) for p in self._q_net.parameters()])
+
+    def _write_shared(self, epsilon: float, params: np.ndarray | None) -> None:
+        with self._weights_lock:
+            self._shared[1] = epsilon
+            if params is not None:
+                self._shared[_HEADER:] = params
+            self._shared[0] += 1
+
+    def _publish(self, epsilon: float) -> None:
+        """
+        Shares the exploration rate and the network's weights with the actors. On a GPU, the
+        weights are copied out in the background and shared at the next call, so the CPU
+        doesn't wait for the update in progress; actors then play with weights one update older.
+        """
         with torch.no_grad():
-            vector = torch.nn.utils.parameters_to_vector(self._q_net.parameters())
-            self._weights[:] = vector.detach().cpu().numpy()
-        self._version += 1
+            if not self._cuda:
+                self._write_shared(epsilon, self._params_vector().numpy())
+                return
+            params = None
+            if self._params_copied is not None:
+                self._params_copied.synchronize()
+                params = self._params_host.numpy()
+            elif self._shared[0] == 0:  # first publish: wait for the starting weights
+                params = self._params_vector().cpu().numpy()
+            self._write_shared(epsilon, params)
+            self._params_host.copy_(self._params_vector(), non_blocking=True)
+            self._params_copied = torch.cuda.Event()
+            self._params_copied.record()
 
     def start_collection(self, steps: int, epsilon: float) -> None:
-        """Publishes the current weights and has every actor play `steps` steps."""
+        """Publishes the current weights and exploration rate for the actors to play with."""
         if self._pending_steps:
             raise RuntimeError("finish_collection() was not called for the previous collection")
         if not 1 <= steps <= self._max_steps:
             raise ValueError(f"steps must be 1..{self._max_steps}, got {steps}")
-        self._publish_weights()
-        for conn in self._conns:
-            conn.send(("collect", self._version, epsilon, steps))
+        self._publish(epsilon)
         self._pending_steps = steps
 
     def finish_collection(self) -> None:
-        """Waits for the actors and adds their transitions to the buffer."""
+        """Takes the next `steps` experience steps from every actor into the buffer."""
         steps, self._pending_steps = self._pending_steps, 0
-        if not steps:
-            return
-        per_actor = []
-        for conn, view in zip(self._conns, self._obs_views):
-            _, transitions = self._receive(conn)
-            per_actor.append((self._to_device(view[:steps]), transitions))
-        # Step by step, environments in order, as ReplayBuffer adds them
-        for step in range(steps):
-            for i, (new_obs, transitions) in enumerate(per_actor):
+        taken = []
+        for _ in range(steps):
+            for i, (conn, view) in enumerate(zip(self._conns, self._obs_views)):
+                _, slot, transitions = self._receive(conn)
+                new_obs = self._to_device(view[slot])
+                taken.append((conn, slot))
                 last_obs = self._last_obs[i]
-                for j, (action, reward, done, next_action_mask) in enumerate(transitions[step]):
-                    next_obs = None if done else new_obs[step, j]
+                for j, (action, reward, done, next_action_mask) in enumerate(transitions):
+                    next_obs = None if done else new_obs[j]
                     self._buffer.append(
                         ReplayItem(last_obs[j], action, reward, next_obs, next_action_mask)
                     )
-                self._last_obs[i] = new_obs[step]
+                self._last_obs[i] = new_obs
+        # Hand the slots back once their copies are done
+        self._sync()
+        for conn, slot in taken:
+            conn.send(("free", slot))
 
     def generate_experience_step(self) -> None:
         self.start_collection(1, self.policy.epsilon)
@@ -382,9 +476,12 @@ class ActorReplayBuffer:
             proc.join(timeout=10)
             if proc.is_alive():
                 proc.terminate()
+        for ptr in self._registered:
+            torch.cuda.cudart().cudaHostUnregister(ptr)
+        self._registered = []
         # Views into the shared memory must go before closing it
         self._obs_views = []
-        self._weights = None
+        self._shared = None
         for shm in self._shms:
             shm.close()
             try:

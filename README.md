@@ -42,7 +42,16 @@ uv run --project . --directory src python -m algorithms.train_dqn
  - By default, model checkpoints will be saved to `./checkpoints/`. You can change this by passing `--checkpoint-dir path/to/dir`.
  - By default, this will use [Weights & Biases](https://wandb.ai/) to log checkpoints and various metrics to aid debugging and tracking training progress (see [Weights & Biases setup](#weights--biases-setup) below). To disable this, pass `--no-wandb`.
  - By default, the device is picked in this order: `mps` (Apple Silicon GPU) if available, then `cuda` (NVIDIA GPU), then `cpu`. To manually set the PyTorch device, pass `--device <device>` (for example `--device cuda` or `--device cpu`).
- - Games are played in separate CPU processes so the training process only does the network updates on the device. Actor processes (`--num-actors`, each using `--actor-threads` CPU threads) play the parallel environments while the network trains, and evaluation workers (`--eval-workers`) play the periodic evaluation games in the background, skipping an evaluation when they are all busy. Both default to numbers that fit the machine's CPU cores (printed at startup). Actors play with the weights from one update earlier than collecting in the training process would; `--num-actors 0 --eval-workers 0` runs everything in the training process, as before.
+ - Games are played in separate CPU processes so the training process only does the network updates on the device. Actor processes (`--num-actors`, each using `--actor-threads` CPU threads) play the parallel environments continuously, a few steps ahead, with weights a few updates old, while every environment still contributes the same transitions per iteration. Evaluation workers (`--eval-workers`) play the periodic evaluation games in the background, skipping an evaluation when they are all busy (logged as `skipped_evals`). Both default to numbers that fit the machine's CPU cores (printed at startup); `--num-actors 0 --eval-workers 0` runs everything in the training process, as before.
+ - Metrics are logged one iteration late, so reading them back doesn't make the CPU wait for the GPU. Pass `--timing` to print how long each part of every iteration takes (CPU time; GPU work runs asynchronously).
+
+To run several trainings at once on one machine, split the CPU cores between them, and give each its own `--checkpoint-dir`. The runs share the GPU's update time, so together they go only somewhat faster than one run alone: on an RTX 5070 Ti with an 8-core/16-thread CPU, about 70 iterations/s for one run and about 90 combined for two or three. Settings that worked there:
+
+| Runs at once | Per run |
+| --- | --- |
+| 1 | defaults |
+| 2 | `--num-actors 2 --actor-threads 2 --eval-workers 1` |
+| 3 | `--num-actors 2 --actor-threads 1 --eval-workers 1` |
 
 Checkpoints record the version of the environment rules they were trained with as `env_version` (see `LATEST_ENV_VERSION` in `pacbot_rs/src/env.rs`); checkpoints without it are version 1. The evaluation scripts, `--eval`, and the bot client use each checkpoint's version, so older checkpoints keep the rules they were trained with. When changing rules that affect what the agent sees or which model plays, add a new version instead of changing an old one.
 

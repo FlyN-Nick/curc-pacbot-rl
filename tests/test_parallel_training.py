@@ -25,12 +25,26 @@ def favor(q_net: torch.nn.Module, stay_bias: float) -> None:
 
 
 class ActorReplayBufferTests(unittest.TestCase):
-    def make_buffer(self, q_net, num_envs=6, num_actors=2, steps=4, maxlen=10_000):
+    device = CPU
+
+    def make_buffer(self, q_net, num_envs=6, num_actors=2, steps=4, maxlen=10_000, ahead=None):
         return parallel_training.ActorReplayBuffer(
-            maxlen=maxlen, q_net=q_net, model_name="QNetV2", epsilon=0.0,
+            maxlen=maxlen, q_net=q_net.to(self.device), model_name="QNetV2", epsilon=0.0,
             num_parallel_envs=num_envs, num_actors=num_actors, max_steps=steps,
-            device=CPU, threads_per_actor=1,
+            device=self.device, threads_per_actor=1, ahead_steps=ahead,
         )
+
+    def collect_with_new_weights(self, buffer, steps=4, ahead=0):
+        """Publish, drain what was played ahead with older weights, then collect."""
+        buffer.start_collection(steps, 0.0)
+        buffer.finish_collection()
+        # On a GPU, weights reach the actors one publish later
+        for _ in range(ahead // steps + 1):
+            buffer.start_collection(steps, 0.0)
+            buffer.finish_collection()
+        buffer._buffer.clear()
+        buffer.start_collection(steps, 0.0)
+        buffer.finish_collection()
 
     def test_transitions_chain_per_environment(self):
         q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
@@ -56,17 +70,14 @@ class ActorReplayBufferTests(unittest.TestCase):
 
     def test_actors_use_published_weights(self):
         q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
-        buffer = self.make_buffer(q_net)
+        buffer = self.make_buffer(q_net, ahead=4)
         try:
             favor(q_net, stay_bias=1e6)
-            buffer.start_collection(4, 0.0)
-            buffer.finish_collection()
+            self.collect_with_new_weights(buffer, ahead=4)
             self.assertTrue(all(item.action == STAY for item in buffer._buffer))
 
-            buffer._buffer.clear()
             favor(q_net, stay_bias=-1e6)
-            buffer.start_collection(4, 0.0)
-            buffer.finish_collection()
+            self.collect_with_new_weights(buffer, ahead=4)
             moves = [item.action != STAY for item in buffer._buffer]
             self.assertGreater(sum(moves) / len(moves), 0.9)
         finally:
@@ -82,6 +93,13 @@ class ActorReplayBufferTests(unittest.TestCase):
         finally:
             buffer.close()
         self.assertFalse(any(p.is_alive() for p in procs))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA GPU")
+class CudaActorReplayBufferTests(ActorReplayBufferTests):
+    """The same, with the buffer on the GPU (pinned copies, copy stream, background weights)."""
+
+    device = torch.device("cuda")
 
 
 class BackgroundEvaluatorTests(unittest.TestCase):
