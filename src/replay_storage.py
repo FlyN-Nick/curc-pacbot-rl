@@ -185,8 +185,12 @@ class ReplayStorage:
             torch.as_tensor(next_action_masks, dtype=self._float).view(n, NUM_ACTIONS),
         ], dim=1)
         if self.device.type == "cuda":
-            packed = packed.pin_memory()
-        packed = packed.to(self.device, non_blocking=True)
+            # Pinned, so the copy can run in the background (PyTorch keeps the pinned source
+            # alive until it's done)
+            packed = packed.pin_memory().to(self.device, non_blocking=True)
+        else:
+            # Elsewhere (e.g. MPS) a background copy could read this temporary after it's freed
+            packed = packed.to(self.device)
         columns = (
             (self._action, packed[:, 0].long()),
             (self._reward, packed[:, 1]),
