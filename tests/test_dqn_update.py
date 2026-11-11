@@ -103,6 +103,19 @@ class DqnUpdateTests(unittest.TestCase):
                 self.assertTrue(torch.equal(pa, pb))
         self.assertGreater(dones, 0)  # finished games were exercised
 
+    def test_huber_loss_matches_mse_for_small_errors_and_caps_large_ones(self):
+        device = torch.device("cpu")
+        storage = filled_storage(device)
+        batch = storage.sample(64)
+        losses = {}
+        for delta in (0.0, 1e6, 1e-3):
+            net, target = nets(device)
+            opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+            losses[delta] = dqn_update(net, target, opt, batch, huber_delta=delta, **KW)[0].item()
+        # Huber is half the squared error below delta, and grows only linearly above it
+        self.assertAlmostEqual(losses[1e6], losses[0.0] / 2, places=5)
+        self.assertLess(losses[1e-3], losses[1e6])
+
     def test_capturable_optimizer_state_loads_either_way(self):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         storage = filled_storage(device)

@@ -40,7 +40,7 @@ from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
 from dqn_update import EagerUpdate, GraphedUpdate, set_capturable
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, make_gym
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym
 import parallel_training
 
 
@@ -58,6 +58,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-legacy-checkpoint", action="store_true")
+    parser.add_argument(
+        "--single-model", action="store_true",
+        help="Train one network that plays the whole game, without the fixed super pellet model",
+    )
     parser.add_argument("--timing", action="store_true", help="Print how long each part of every iteration takes")
     parser.add_argument(
         "--no-cuda-graph", action="store_true",
@@ -95,6 +99,8 @@ if __name__ == "__main__":
             help="Default: %(default)s",
         )
     args = parser.parse_args()
+    # Before any actor or evaluation process starts, so they inherit it (--eval uses the checkpoint's)
+    set_single_model(args.single_model)
     if not hasattr(models, args.model):
         parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
@@ -120,6 +126,7 @@ if __name__ == "__main__":
         config={
             "device": str(device),
             "bf16": args.bf16,
+            "single_model": args.single_model,
             **{name: getattr(args, name) for name in hyperparam_defaults.keys()},
         },
         mode="disabled" if args.eval or args.no_wandb else "online",
@@ -181,6 +188,11 @@ if __name__ == "__main__":
                 if "best_eval_games" in loaded:
                     # Older checkpoints kept the best single game, which isn't comparable
                     resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
+                if checkpoint_single_model(loaded) != args.single_model:
+                    raise SystemExit(
+                        f"--finetune checkpoint was trained {'with' if checkpoint_single_model(loaded) else 'without'} "
+                        "--single-model; pass the same setting"
+                    )
                 if checkpoint_env_version(loaded) != ENV_VERSION:
                     print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
                           f"finetuning continues with version {ENV_VERSION}")
@@ -377,6 +389,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "best_eval_games": wandb.config.best_eval_games,
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
             "env_version": ENV_VERSION,
+            "single_model": single_model(),
         }
         try:
             if wandb.run is not None and getattr(wandb.run, "id", None):
@@ -395,6 +408,7 @@ def _train(replay_buffer, evaluator, actors: bool):
         reward_scale=wandb.config.reward_scale,
         discount_factor=wandb.config.discount_factor,
         grad_clip_norm=wandb.config.grad_clip_norm,
+        huber_delta=wandb.config.huber_delta,
         bf16=args.bf16,
     )
     print(f"Updates: {'CUDA graph' if graphed else 'eager'}")
@@ -569,6 +583,7 @@ if __name__ == "__main__":
         if ckpt_path.exists():
             loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
             visualize_env_version = checkpoint_env_version(loaded)
+            set_single_model(checkpoint_single_model(loaded))
             print(f"Using environment version {visualize_env_version}")
             if isinstance(loaded, dict) and "state_dict" in loaded:
                 q_net.load_state_dict(loaded["state_dict"])

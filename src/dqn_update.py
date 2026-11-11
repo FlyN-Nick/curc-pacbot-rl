@@ -32,11 +32,16 @@ def dqn_update(
     discount_factor: float,
     grad_clip_norm: float,
     bf16: str = "none",
+    huber_delta: float = 0.0,
     zero_grad: bool = True,
 ) -> torch.Tensor:
     """
     One update on `batch`. Returns, as one float32 tensor: loss, gradient norm (before
     clipping), mean of the max predicted Q values and mean target Q value (both unscaled).
+
+    The loss is MSE, or with huber_delta > 0 the Huber loss: quadratic for errors up to
+    huber_delta (in scaled reward units, so 1.0 is 1 / reward_scale game points), linear
+    beyond, so a few large errors (deaths, ghosts eaten) don't dominate the gradient.
     """
     device = batch.obs.device
     reward = (batch.reward * reward_scale).float()
@@ -60,7 +65,10 @@ def dqn_update(
     with _autocast(device, bf16 in ("update", "all")):
         all_predicted_q_values = q_net(batch.obs)
         predicted_q_values = all_predicted_q_values.gather(1, batch.action.unsqueeze(1)).squeeze(1)
-        loss = F.mse_loss(predicted_q_values.float(), target_q_values.float())
+        if huber_delta > 0:
+            loss = F.huber_loss(predicted_q_values.float(), target_q_values.float(), delta=huber_delta)
+        else:
+            loss = F.mse_loss(predicted_q_values.float(), target_q_values.float())
     loss.backward()
     # A non-finite norm is caught later (error_if_nonfinite would make the CPU wait for the GPU)
     grad_norm = torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=grad_clip_norm)

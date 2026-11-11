@@ -7,7 +7,7 @@ import numpy as np
 
 import pacbot_rs
 
-from utils import reset_env, NUM_ACTIONS, P, REPLAY_BUFFER_OBS_GYM_CONFIGURATION, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
+from utils import reset_env, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -56,7 +56,7 @@ class ReplayBuffer(Generic[P]):
         return len(self._buffer) if self.storage is None else len(self.storage)
 
     def _make_current_obs(self) -> torch.Tensor:
-        obs = [env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION) for env in self._envs]
+        obs = [env.obs_numpy(replay_buffer_obs_config()) for env in self._envs]
         return torch.from_numpy(np.stack(obs)).to(self.device)
 
     @property
@@ -88,11 +88,11 @@ class ReplayBuffer(Generic[P]):
             reward, done = env.step(action)
             if done:
                 next_action_mask = [False] * NUM_ACTIONS
-                reset_env(env, REPLAY_BUFFER_OBS_GYM_CONFIGURATION)
+                reset_env(env, replay_buffer_obs_config())
             else:
                 next_action_mask = replay_buffer_action_mask(env)
             transitions.append((action, reward, done, next_action_mask))
-            new_obs.append(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION))
+            new_obs.append(env.obs_numpy(replay_buffer_obs_config()))
         new_obs = torch.from_numpy(np.stack(new_obs)).to(self.device)
 
         if self.storage is not None:

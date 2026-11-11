@@ -16,5 +16,6 @@
     "discount_factor": 0.99,
     "reward_scale": 0.02,
     "grad_clip_norm": 10000,
+    "huber_delta": 0.0,
     "model": "QNetV2"
 }

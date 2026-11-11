@@ -19,7 +19,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pacbot_rs import PacmanGym
 import models
 from policies import MaxQPolicy
-from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done, checkpoint_env_version, make_gym
+from utils import OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, select_device, step_env_until_done, checkpoint_env_version, checkpoint_single_model, set_single_model, make_gym
 import argparse
 from tqdm import tqdm
 
@@ -66,6 +66,8 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     q_net = model_class(OBS_SHAPE, NUM_ACTIONS).to(device)
     q_net.load_state_dict(loaded['state_dict'])
     q_net.eval()
+    # Plays the way it was trained: alone, or with the super pellet model
+    set_single_model(checkpoint_single_model(loaded))
     return q_net, loaded['iter_num'], loaded['epsilon'], loaded['config'], checkpoint_env_version(loaded)
 
 # ── 2. Evaluate one episode ────────────────────────────────────────────────────

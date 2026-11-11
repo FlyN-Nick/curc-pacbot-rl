@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,25 @@ import safetensors.torch
 # Checkpoints record the version they were trained with as "env_version";
 # checkpoints saved before that field existed are version 1.
 ENV_VERSION: int = PacmanGym.LATEST_ENV_VERSION
+
+
+# Single-model mode: the trained network plays the whole game (super pellets included, normal
+# action mask), instead of handing over to the fixed super pellet model outside purgatory.
+# Kept in the environment so spawned actor and evaluation processes inherit it.
+_SINGLE_MODEL_ENV = "PACBOT_SINGLE_MODEL"
+
+
+def set_single_model(enabled: bool) -> None:
+    os.environ[_SINGLE_MODEL_ENV] = "1" if enabled else "0"
+
+
+def single_model() -> bool:
+    return os.environ.get(_SINGLE_MODEL_ENV) == "1"
+
+
+def checkpoint_single_model(loaded) -> bool:
+    """Whether a loaded checkpoint was trained in single-model mode."""
+    return isinstance(loaded, dict) and bool(loaded.get("single_model", False))
 
 
 def checkpoint_env_version(loaded) -> int:
@@ -40,8 +60,11 @@ DETERMINISTIC_START_CONFIGURATION = PacmanGymConfiguration({"random_start": Fals
 OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURATION).shape
 
 REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True, "obs_ignore_super_pellets": True})
+SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True})
+def replay_buffer_obs_config() -> PacmanGymConfiguration:
+    return SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION if single_model() else REPLAY_BUFFER_OBS_GYM_CONFIGURATION
 def replay_buffer_action_mask(env: PacmanGym) -> list[bool]:
-    return env.purgatory_action_mask()
+    return env.action_mask() if single_model() else env.purgatory_action_mask()
 
 P = TypeVar("P", bound=Policy)
 
@@ -87,6 +110,8 @@ SUPER_PELLET_MODE_CONFIGUARTION = PacmanGymConfiguration({})
 PURGATORY_MODE_CONFIGUARTION = PacmanGymConfiguration({"obs_ignore_super_pellets": True})
 
 def step_env_once(env: PacmanGym, policy: Policy, device) -> tuple[int, bool]:
+    if single_model():
+        return _step_always_with(env, policy, SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
     # purgatory mode is when not all ghosts are free and all ghosts are not frightened 
     if not env.are_ghosts_close() and env.all_ghosts_not_frightened():
         return _step_always_with(env, policy, PURGATORY_MODE_CONFIGUARTION, env.purgatory_action_mask(), device)
@@ -96,6 +121,8 @@ def step_env_once(env: PacmanGym, policy: Policy, device) -> tuple[int, bool]:
         return _step_always_with(env, safetensors_qnet(SUPER_PELLET_MODEL_PATH, device=device), SUPER_PELLET_MODE_CONFIGUARTION, env.action_mask(), device)
 
 def step_while_not_policy(env: PacmanGym, device, reset_if_necessary: bool = True):
+    if single_model():
+        return
     # purgatory mode is when all ghosts are free and not frightened 
     while env.are_ghosts_close() or not env.all_ghosts_not_frightened():
         # temporary - end game when super pellet mode hits
@@ -111,7 +138,7 @@ def step_while_not_policy(env: PacmanGym, device, reset_if_necessary: bool = Tru
 
 def in_purgatory(env: PacmanGym) -> bool:
     """Whether the policy being trained acts in this state (see step_env_once)."""
-    return not env.are_ghosts_close() and env.all_ghosts_not_frightened()
+    return single_model() or not env.are_ghosts_close() and env.all_ghosts_not_frightened()
 
 
 @torch.no_grad()
