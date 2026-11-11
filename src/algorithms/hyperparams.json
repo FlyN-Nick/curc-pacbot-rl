@@ -9,7 +9,6 @@
     "target_network_update_steps": 5000,
     "evaluate_steps": 10,
     "best_eval_steps": 20000,
-    "best_eval_games": 32,
     "initial_epsilon": 0.8,
     "final_epsilon": 0.4,
     "epsilon_decay_fraction": 1.0,

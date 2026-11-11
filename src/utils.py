@@ -57,6 +57,21 @@ SUPER_PELLET_MODEL_PATH = str(Path(__file__).resolve().parent / "checkpoints_kno
 
 DEFAULT_GYM_CONFIGURATION = PacmanGymConfiguration({})
 DETERMINISTIC_START_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": False})
+
+# A game from the normal start is deterministic (the ghosts have no randomness): the only
+# thing that varies between training games is Pacman's speed, in game ticks per action,
+# drawn per game from these (PacmanGymConfiguration's random_ticks_per_step_min..max).
+# 8 is the normal speed (DETERMINISTIC_START_CONFIGURATION).
+TRAINING_SPEEDS = tuple(range(4, 15))
+NORMAL_SPEED = 8
+
+
+def speed_configuration(ticks_per_step: int) -> PacmanGymConfiguration:
+    """The normal start, with Pacman moving every `ticks_per_step` game ticks."""
+    return PacmanGymConfiguration({
+        "random_start": False, "random_ticks": True,
+        "random_ticks_per_step_min": ticks_per_step, "random_ticks_per_step_max": ticks_per_step,
+    })
 OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURATION).shape
 
 REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True, "obs_ignore_super_pellets": True})

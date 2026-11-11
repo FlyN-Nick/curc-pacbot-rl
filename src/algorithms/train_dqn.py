@@ -40,7 +40,7 @@ from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
 from dqn_update import EagerUpdate, GraphedUpdate, set_capturable
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, TRAINING_SPEEDS, NORMAL_SPEED
 import parallel_training
 
 
@@ -185,7 +185,7 @@ if __name__ == "__main__":
                 resume_iter = int(loaded.get("iter_num", 0))
                 resume_epsilon = loaded.get("epsilon", None)
                 resume_optimizer_state = loaded.get("optimizer_state_dict", None)
-                if "best_eval_games" in loaded:
+                if loaded.get("best_eval_kind") == "speeds":
                     # Older checkpoints kept the best single game, which isn't comparable
                     resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
                 if checkpoint_single_model(loaded) != args.single_model:
@@ -238,16 +238,18 @@ def eval_metrics(result: tuple) -> dict:
     )
 
 
-def candidate_metrics(results: list[tuple]) -> dict:
-    """Metrics to log for a candidate checkpoint's evaluation games."""
-    scores = [r[0] for r in results]
-    return dict(
+def candidate_metrics(results: dict[int, tuple]) -> dict:
+    """Metrics to log for a candidate checkpoint's games, {ticks_per_step: result}."""
+    scores = [r[0] for r in results.values()]
+    metrics = dict(
         candidate_mean_score=statistics.fmean(scores),
-        candidate_median_score=statistics.median(scores),
-        candidate_cleared_rate=statistics.fmean(int(r[2]) for r in results),
-        candidate_pellets_end=statistics.fmean(r[4] for r in results),
-        candidate_games=len(results),
+        candidate_min_score=min(scores),
+        candidate_cleared_rate=statistics.fmean(int(r[2]) for r in results.values()),
+        candidate_pellets_end=statistics.fmean(r[4] for r in results.values()),
     )
+    if NORMAL_SPEED in results:
+        metrics["candidate_normal_speed_score"] = results[NORMAL_SPEED][0]
+    return metrics
 
 
 def exploration_epsilon(iter_num: int) -> float:
@@ -386,7 +388,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "iter_num": iter_num,
             "epsilon": replay_buffer.policy.epsilon,
             "best_eval_score": best_eval_score,
-            "best_eval_games": wandb.config.best_eval_games,
+            "best_eval_kind": "speeds",
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
             "env_version": ENV_VERSION,
             "single_model": single_model(),
@@ -420,7 +422,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             iter_num % wandb.config.best_eval_steps == 0 or iter_num == wandb.config.num_iters - 1
         )
 
-    def consider_candidate(iter_num: int, results: list[tuple], snapshot: dict, metrics: dict) -> None:
+    def consider_candidate(iter_num: int, results: dict[int, tuple], snapshot: dict, metrics: dict) -> None:
         nonlocal best_eval_score
         summary = candidate_metrics(results)
         metrics.update(summary, candidate_iter=iter_num)
@@ -431,7 +433,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             checkpoint_dir.mkdir(exist_ok=True)
             atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
             print(f"New best checkpoint: iter {iter_num}, mean score {best_eval_score:.0f} "
-                  f"over {len(results)} games")
+                  f"over {len(results)} speeds")
         metrics["best_eval_mean_score"] = best_eval_score
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if _exit_requested:
@@ -475,14 +477,18 @@ def _train(replay_buffer, evaluator, actors: bool):
                     # Played in the background; if every worker is busy, skipped
                     evaluator.submit(iter_num, q_net, lambda: None)
             if is_candidate_iter(iter_num):
-                # Many games of this checkpoint; the best mean score is kept as q_net-best
+                # One (deterministic) game at each training speed; the best mean score is kept
+                # as q_net-best
                 if evaluator is None:
                     with time_block("Evaluate a candidate"):
-                        results = [evaluate_episode() for _ in range(wandb.config.best_eval_games)]
+                        results = {
+                            k: parallel_training.evaluate_episode(q_net, device, ENV_VERSION, ticks_per_step=k)
+                            for k in TRAINING_SPEEDS
+                        }
                     consider_candidate(iter_num, results, build_metadata(iter_num), metrics)
                 else:
                     evaluator.submit_candidate(
-                        iter_num, q_net, wandb.config.best_eval_games, cpu_copy(build_metadata(iter_num))
+                        iter_num, q_net, TRAINING_SPEEDS, cpu_copy(build_metadata(iter_num))
                     )
             if evaluator is not None:
                 for eval_iter, result, _ in evaluator.poll():

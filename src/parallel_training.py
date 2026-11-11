@@ -37,6 +37,7 @@ from utils import (
     make_gym,
     safetensors_qnet,
     step_env_until_done,
+    speed_configuration,
 )
 
 # Spawn (not fork): forking a process that has initialized CUDA is unsafe.
@@ -84,15 +85,18 @@ def state_dict_to_numpy(module: torch.nn.Module) -> dict[str, np.ndarray]:
 
 @torch.no_grad()
 def evaluate_episode(
-    q_net: torch.nn.Module, device: torch.device, env_version: int, max_steps: int = 1000
+    q_net: torch.nn.Module, device: torch.device, env_version: int, max_steps: int = 1000,
+    ticks_per_step: int | None = None,
 ) -> tuple[int, int, bool, int, int, int, float]:
     """
-    Plays one evaluation game with the greedy policy.
+    Plays one evaluation game with the greedy policy, from the normal start, at the normal
+    speed or every `ticks_per_step` game ticks. The game is deterministic.
 
     Returns (score, total_steps, is_board_cleared, pellets_start, pellets_end,
     purgatory_pellets, ghost_proximities).
     """
-    gym = make_gym(DETERMINISTIC_START_CONFIGURATION, env_version)
+    config = DETERMINISTIC_START_CONFIGURATION if ticks_per_step is None else speed_configuration(ticks_per_step)
+    gym = make_gym(config, env_version)
     pellets_start = gym.remaining_pellets()
     q_net.eval()
     done, step_num = step_env_until_done(gym, MaxQPolicy(q_net), device, max_steps=max_steps)
@@ -117,9 +121,10 @@ def _eval_worker(tasks, results, model_name: str, env_version: int, threads: int
         _init_worker(threads, seed)
         q_net = _cpu_model(model_name)
         while (task := tasks.get()) is not None:
-            key, weights = task
+            key, weights, ticks_per_step = task
             q_net.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            results.put((key, evaluate_episode(q_net, _CPU, env_version)))
+            result = evaluate_episode(q_net, _CPU, env_version, ticks_per_step=ticks_per_step)
+            results.put((key, (ticks_per_step, result)))
     except Exception:
         results.put(("error", traceback.format_exc()))
 
@@ -130,9 +135,9 @@ class BackgroundEvaluator:
 
     submit() hands over one game if a worker is free (otherwise that evaluation is skipped);
     poll() returns the games finished since the last call, each with the payload given to
-    submit(). submit_candidate() queues several games of one checkpoint, never skipped
-    (single games are skipped while they play); poll_candidates() returns each candidate
-    once all its games are done, with every game's result.
+    submit(). submit_candidate() queues one game of a checkpoint at each of several speeds,
+    never skipped (single games are skipped while they play); poll_candidates() returns each
+    candidate once all its games are done, with {ticks_per_step: result}.
     """
 
     def __init__(self, num_workers: int, model_name: str, env_version: int, threads: int = 1):
@@ -141,10 +146,10 @@ class BackgroundEvaluator:
         self._tasks = _CTX.Queue()
         self._results = _CTX.Queue()
         self._in_flight: dict[int, Any] = {}
-        # iter_num -> [payload, games still to finish, results so far]
+        # iter_num -> [payload, games still to finish, {ticks_per_step: result}]
         self._candidates: dict[int, list] = {}
         self._finished: list[tuple[int, tuple, Any]] = []
-        self._finished_candidates: list[tuple[int, list[tuple], Any]] = []
+        self._finished_candidates: list[tuple[int, dict[int, tuple], Any]] = []
         self._procs = [
             _CTX.Process(
                 target=_eval_worker,
@@ -167,18 +172,19 @@ class BackgroundEvaluator:
             self.skipped += 1
             return False
         self._in_flight[iter_num] = make_payload()
-        self._tasks.put((("game", iter_num), state_dict_to_numpy(q_net)))
+        self._tasks.put((("game", iter_num), state_dict_to_numpy(q_net), None))
         return True
 
-    def submit_candidate(self, iter_num: int, q_net: torch.nn.Module, games: int, payload: Any) -> None:
-        if games < 1:
-            raise ValueError("a candidate needs at least one game")
+    def submit_candidate(self, iter_num: int, q_net: torch.nn.Module, speeds, payload: Any) -> None:
+        speeds = list(speeds)
+        if not speeds or len(set(speeds)) != len(speeds):
+            raise ValueError(f"a candidate needs distinct speeds, got {speeds}")
         if iter_num in self._candidates:
             raise ValueError(f"candidate {iter_num} is already being evaluated")
         weights = state_dict_to_numpy(q_net)
-        self._candidates[iter_num] = [payload, games, []]
-        for _ in range(games):
-            self._tasks.put((("candidate", iter_num), weights))
+        self._candidates[iter_num] = [payload, len(speeds), {}]
+        for ticks_per_step in speeds:
+            self._tasks.put((("candidate", iter_num), weights, ticks_per_step))
 
     def candidates_pending(self) -> int:
         return len(self._candidates)
@@ -196,12 +202,13 @@ class BackgroundEvaluator:
             if key == "error":
                 raise RuntimeError(f"Evaluation worker failed:\n{result}")
             kind, iter_num = key
+            ticks_per_step, result = result
             if kind == "game":
                 self._finished.append((iter_num, result, self._in_flight.pop(iter_num)))
             else:
                 candidate = self._candidates[iter_num]
                 candidate[1] -= 1
-                candidate[2].append(result)
+                candidate[2][ticks_per_step] = result
                 if candidate[1] == 0:
                     del self._candidates[iter_num]
                     self._finished_candidates.append((iter_num, candidate[2], candidate[0]))
@@ -211,7 +218,7 @@ class BackgroundEvaluator:
         finished, self._finished = self._finished, []
         return finished
 
-    def poll_candidates(self, timeout: float | None = None) -> list[tuple[int, list[tuple], Any]]:
+    def poll_candidates(self, timeout: float | None = None) -> list[tuple[int, dict[int, tuple], Any]]:
         """Finished candidates; with a timeout, waits that long for the next game result."""
         self._drain(timeout)
         finished, self._finished_candidates = self._finished_candidates, []
