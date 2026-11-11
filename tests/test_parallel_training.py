@@ -135,6 +135,28 @@ class BackgroundEvaluatorTests(unittest.TestCase):
         finally:
             evaluator.close()
 
+    def test_candidate_plays_every_game_and_blocks_single_games(self):
+        evaluator = parallel_training.BackgroundEvaluator(2, "QNetV2", env_version=2)
+        try:
+            q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
+            evaluator.submit_candidate(100, q_net, 5, "snapshot-100")
+            self.assertEqual(evaluator.candidates_pending(), 1)
+            # Its games fill the workers, so single games are skipped meanwhile
+            self.assertFalse(evaluator.submit(101, q_net, lambda: None))
+            deadline = time.monotonic() + 300
+            finished = []
+            while not finished and time.monotonic() < deadline:
+                finished = evaluator.poll_candidates(timeout=0.1)
+            self.assertEqual(len(finished), 1)
+            iter_num, results, payload = finished[0]
+            self.assertEqual((iter_num, payload), (100, "snapshot-100"))
+            self.assertEqual(len(results), 5)
+            self.assertTrue(all(r[1] > 0 for r in results))
+            self.assertEqual(evaluator.candidates_pending(), 0)
+            self.assertTrue(evaluator.submit(102, q_net, lambda: None))
+        finally:
+            evaluator.close()
+
 
 if __name__ == "__main__":
     unittest.main()

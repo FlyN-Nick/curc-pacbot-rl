@@ -117,18 +117,22 @@ def _eval_worker(tasks, results, model_name: str, env_version: int, threads: int
         _init_worker(threads, seed)
         q_net = _cpu_model(model_name)
         while (task := tasks.get()) is not None:
-            iter_num, weights = task
+            key, weights = task
             q_net.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            results.put((iter_num, evaluate_episode(q_net, _CPU, env_version)))
+            results.put((key, evaluate_episode(q_net, _CPU, env_version)))
     except Exception:
         results.put(("error", traceback.format_exc()))
 
 
 class BackgroundEvaluator:
     """
-    Plays evaluation games in worker processes. submit() hands one over if a worker is free
-    (otherwise that evaluation is skipped); poll() returns the games finished since the last
-    call, each with the payload given to submit().
+    Plays evaluation games in worker processes.
+
+    submit() hands over one game if a worker is free (otherwise that evaluation is skipped);
+    poll() returns the games finished since the last call, each with the payload given to
+    submit(). submit_candidate() queues several games of one checkpoint, never skipped
+    (single games are skipped while they play); poll_candidates() returns each candidate
+    once all its games are done, with every game's result.
     """
 
     def __init__(self, num_workers: int, model_name: str, env_version: int, threads: int = 1):
@@ -137,6 +141,10 @@ class BackgroundEvaluator:
         self._tasks = _CTX.Queue()
         self._results = _CTX.Queue()
         self._in_flight: dict[int, Any] = {}
+        # iter_num -> [payload, games still to finish, results so far]
+        self._candidates: dict[int, list] = {}
+        self._finished: list[tuple[int, tuple, Any]] = []
+        self._finished_candidates: list[tuple[int, list[tuple], Any]] = []
         self._procs = [
             _CTX.Process(
                 target=_eval_worker,
@@ -148,27 +156,65 @@ class BackgroundEvaluator:
         for proc in self._procs:
             proc.start()
 
+    def _pending_games(self) -> int:
+        return len(self._in_flight) + sum(c[1] for c in self._candidates.values())
+
     def has_capacity(self) -> bool:
-        return len(self._in_flight) < self.num_workers
+        return self._pending_games() < self.num_workers
 
     def submit(self, iter_num: int, q_net: torch.nn.Module, make_payload: Callable[[], Any]) -> bool:
         if not self.has_capacity():
             self.skipped += 1
             return False
         self._in_flight[iter_num] = make_payload()
-        self._tasks.put((iter_num, state_dict_to_numpy(q_net)))
+        self._tasks.put((("game", iter_num), state_dict_to_numpy(q_net)))
         return True
 
-    def poll(self) -> list[tuple[int, tuple, Any]]:
-        finished = []
+    def submit_candidate(self, iter_num: int, q_net: torch.nn.Module, games: int, payload: Any) -> None:
+        if games < 1:
+            raise ValueError("a candidate needs at least one game")
+        if iter_num in self._candidates:
+            raise ValueError(f"candidate {iter_num} is already being evaluated")
+        weights = state_dict_to_numpy(q_net)
+        self._candidates[iter_num] = [payload, games, []]
+        for _ in range(games):
+            self._tasks.put((("candidate", iter_num), weights))
+
+    def candidates_pending(self) -> int:
+        return len(self._candidates)
+
+    def _drain(self, timeout: float | None = None) -> None:
         while True:
             try:
-                iter_num, result = self._results.get_nowait()
+                if timeout is None:
+                    key, result = self._results.get_nowait()
+                else:
+                    key, result = self._results.get(timeout=timeout)
+                    timeout = None
             except queue.Empty:
-                break
-            if iter_num == "error":
+                return
+            if key == "error":
                 raise RuntimeError(f"Evaluation worker failed:\n{result}")
-            finished.append((iter_num, result, self._in_flight.pop(iter_num)))
+            kind, iter_num = key
+            if kind == "game":
+                self._finished.append((iter_num, result, self._in_flight.pop(iter_num)))
+            else:
+                candidate = self._candidates[iter_num]
+                candidate[1] -= 1
+                candidate[2].append(result)
+                if candidate[1] == 0:
+                    del self._candidates[iter_num]
+                    self._finished_candidates.append((iter_num, candidate[2], candidate[0]))
+
+    def poll(self) -> list[tuple[int, tuple, Any]]:
+        self._drain()
+        finished, self._finished = self._finished, []
+        return finished
+
+    def poll_candidates(self, timeout: float | None = None) -> list[tuple[int, list[tuple], Any]]:
+        """Finished candidates; with a timeout, waits that long for the next game result."""
+        self._drain(timeout)
+        finished, self._finished_candidates = self._finished_candidates, []
         return finished
 
     def close(self) -> None:

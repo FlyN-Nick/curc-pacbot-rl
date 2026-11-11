@@ -60,7 +60,8 @@ Checkpoints record the version of the environment rules they were trained with a
 
 You can also change **hyperparameters** with command-line arguments. To see the full list, pass `--help` or take a look at the `hyperparam_defaults` dictionary near the top of `train_dqn.py`. In particular:
  - If you're running out of memory, consider reducing the `batch_size`.
- - `num_iters` controls the total runtime of the script execution, and also indirectly the value of $\epsilon$ (epsilon), which controls the amount of random exploration ($\epsilon$ starts at `initial_epsilon` and linearly decreases to `final_epsilon` after `num_iters`). Of course, you can always set `num_iters` to a large value (like the default) and just kill the script once it reaches a satisfactory level of performance.
+ - `num_iters` controls the total runtime of the script execution, and also indirectly the value of $\epsilon$ (epsilon), which controls the amount of random exploration ($\epsilon$ starts at `initial_epsilon` and decreases linearly to `final_epsilon` over the first `epsilon_decay_fraction` of `num_iters`, then stays there; the default 1.0 decays over the whole run). Of course, you can always set `num_iters` to a large value (like the default) and just kill the script once it reaches a satisfactory level of performance.
+ - Every `best_eval_steps` iterations (and at the last one), the current network plays `best_eval_games` evaluation games, and the one with the best mean score so far is saved as `q_net-best.ckpt.pt` (logged as `candidate_mean_score` and `best_eval_mean_score`). The single games every `evaluate_steps` iterations only draw the learning curve: one game's score is mostly luck.
 
 ### Weights & Biases setup
 

@@ -4,6 +4,7 @@ import copy
 import math
 import itertools
 import json
+import statistics
 from pathlib import Path
 import os
 import shutil
@@ -177,7 +178,9 @@ if __name__ == "__main__":
                 resume_iter = int(loaded.get("iter_num", 0))
                 resume_epsilon = loaded.get("epsilon", None)
                 resume_optimizer_state = loaded.get("optimizer_state_dict", None)
-                resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
+                if "best_eval_games" in loaded:
+                    # Older checkpoints kept the best single game, which isn't comparable
+                    resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
                 if checkpoint_env_version(loaded) != ENV_VERSION:
                     print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
                           f"finetuning continues with version {ENV_VERSION}")
@@ -221,6 +224,24 @@ def eval_metrics(result: tuple) -> dict:
         purgatory_pellets=purgatory_pellets,
         ghost_proximities=ghost_proximities,
     )
+
+
+def candidate_metrics(results: list[tuple]) -> dict:
+    """Metrics to log for a candidate checkpoint's evaluation games."""
+    scores = [r[0] for r in results]
+    return dict(
+        candidate_mean_score=statistics.fmean(scores),
+        candidate_median_score=statistics.median(scores),
+        candidate_cleared_rate=statistics.fmean(int(r[2]) for r in results),
+        candidate_pellets_end=statistics.fmean(r[4] for r in results),
+        candidate_games=len(results),
+    )
+
+
+def exploration_epsilon(iter_num: int) -> float:
+    """Epsilon falls linearly from initial to final over epsilon_decay_fraction of training, then holds."""
+    decay_iters = max(1.0, (wandb.config.num_iters - 1) * wandb.config.epsilon_decay_fraction)
+    return lerp(wandb.config.initial_epsilon, wandb.config.final_epsilon, min(1.0, iter_num / decay_iters))
 
 
 class DeferredMetrics:
@@ -353,6 +374,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "iter_num": iter_num,
             "epsilon": replay_buffer.policy.epsilon,
             "best_eval_score": best_eval_score,
+            "best_eval_games": wandb.config.best_eval_games,
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
             "env_version": ENV_VERSION,
         }
@@ -378,6 +400,25 @@ def _train(replay_buffer, evaluator, actors: bool):
     print(f"Updates: {'CUDA graph' if graphed else 'eager'}")
 
     deferred_metrics = DeferredMetrics(device, wandb.config.reward_scale)
+
+    def is_candidate_iter(iter_num: int) -> bool:
+        return iter_num > 0 and (
+            iter_num % wandb.config.best_eval_steps == 0 or iter_num == wandb.config.num_iters - 1
+        )
+
+    def consider_candidate(iter_num: int, results: list[tuple], snapshot: dict, metrics: dict) -> None:
+        nonlocal best_eval_score
+        summary = candidate_metrics(results)
+        metrics.update(summary, candidate_iter=iter_num)
+        if summary["candidate_mean_score"] > best_eval_score:
+            best_eval_score = summary["candidate_mean_score"]
+            snapshot["best_eval_score"] = best_eval_score
+            checkpoint_dir = Path(args.checkpoint_dir)
+            checkpoint_dir.mkdir(exist_ok=True)
+            atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
+            print(f"New best checkpoint: iter {iter_num}, mean score {best_eval_score:.0f} "
+                  f"over {len(results)} games")
+        metrics["best_eval_mean_score"] = best_eval_score
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if _exit_requested:
             deferred_metrics.flush()
@@ -398,11 +439,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             # network, with the weights from before the update.
             replay_buffer.start_collection(
                 wandb.config.experience_steps,
-                lerp(
-                    wandb.config.initial_epsilon,
-                    wandb.config.final_epsilon,
-                    iter_num / (wandb.config.num_iters - 1),
-                ),
+                exploration_epsilon(iter_num),
             )
 
         with time_block("Update the network"):
@@ -416,29 +453,28 @@ def _train(replay_buffer, evaluator, actors: bool):
                 "exploration_epsilon": replay_buffer.policy.epsilon,
             }
             if iter_num % wandb.config.evaluate_steps == 0:
+                # One game, for the learning curve
                 if evaluator is None:
                     with time_block("Evaluate the current agent"):
-                        # Evaluate the current agent.
-                        result = evaluate_episode()
-                        metrics.update(eval_metrics(result))
-                        if result[0] > best_eval_score:
-                            best_eval_score = result[0]
-                            checkpoint_dir = Path(args.checkpoint_dir)
-                            checkpoint_dir.mkdir(exist_ok=True)
-                            atomic_torch_save(build_metadata(iter_num), checkpoint_dir / "q_net-best.ckpt.pt")
+                        metrics.update(eval_metrics(evaluate_episode()))
                 else:
-                    # Play it in the background; if every worker is busy, skip this one.
-                    # The snapshot is what gets saved if this turns out to be the best agent.
-                    evaluator.submit(iter_num, q_net, lambda: cpu_copy(build_metadata(iter_num)))
+                    # Played in the background; if every worker is busy, skipped
+                    evaluator.submit(iter_num, q_net, lambda: None)
+            if is_candidate_iter(iter_num):
+                # Many games of this checkpoint; the best mean score is kept as q_net-best
+                if evaluator is None:
+                    with time_block("Evaluate a candidate"):
+                        results = [evaluate_episode() for _ in range(wandb.config.best_eval_games)]
+                    consider_candidate(iter_num, results, build_metadata(iter_num), metrics)
+                else:
+                    evaluator.submit_candidate(
+                        iter_num, q_net, wandb.config.best_eval_games, cpu_copy(build_metadata(iter_num))
+                    )
             if evaluator is not None:
-                for eval_iter, result, snapshot in evaluator.poll():
+                for eval_iter, result, _ in evaluator.poll():
                     metrics.update(eval_metrics(result), eval_iter=eval_iter)
-                    if result[0] > best_eval_score:
-                        best_eval_score = result[0]
-                        snapshot["best_eval_score"] = best_eval_score
-                        checkpoint_dir = Path(args.checkpoint_dir)
-                        checkpoint_dir.mkdir(exist_ok=True)
-                        atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
+                for candidate_iter, results, snapshot in evaluator.poll_candidates():
+                    consider_candidate(candidate_iter, results, snapshot, metrics)
                 metrics["skipped_evals"] = evaluator.skipped
             deferred_metrics.add(metrics, update_metrics)
 
@@ -470,11 +506,7 @@ def _train(replay_buffer, evaluator, actors: bool):
                         pass
 
         # Anneal the exploration policy's epsilon.
-        replay_buffer.policy.epsilon = lerp(
-            wandb.config.initial_epsilon,
-            wandb.config.final_epsilon,
-            iter_num / (wandb.config.num_iters - 1),
-        )
+        replay_buffer.policy.epsilon = exploration_epsilon(iter_num)
 
         # Collect experience.
         with time_block("Collect experience"):
@@ -485,6 +517,14 @@ def _train(replay_buffer, evaluator, actors: bool):
                     replay_buffer.generate_experience_step()
 
     deferred_metrics.flush()
+    if evaluator is not None and not _exit_requested:
+        # Finish the candidates still being played (the last checkpoint's, at least)
+        while evaluator.candidates_pending():
+            metrics = {}
+            for candidate_iter, results, snapshot in evaluator.poll_candidates(timeout=1.0):
+                consider_candidate(candidate_iter, results, snapshot, metrics)
+            if metrics:
+                wandb.log(metrics)
     signal.signal(signal.SIGINT, prev_sigint)
 
 
