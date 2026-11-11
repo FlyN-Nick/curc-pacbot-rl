@@ -75,15 +75,18 @@ if __name__ == "__main__":
         "~0.05%%). Weights, optimizer, loss and game play stay in float32. Default: %(default)s",
     )
     cpus = os.cpu_count() or 1
+    # On Apple Silicon, single-threaded actors were fastest: on an M2 Max, 4 actors plus 3
+    # evaluation workers and the training process fill the 8 performance cores
+    apple_gpu = torch.backends.mps.is_available()
     parser.add_argument(
         # Actors' inference is compute-bound, so hyperthreads add little: about one 2-thread
         # actor per 2 physical cores (4 on an 8-core/16-thread CPU) was fastest
-        "--num-actors", type=int, default=max(1, min(4, cpus // 4)),
+        "--num-actors", type=int, default=max(1, min(4, cpus // 3 if apple_gpu else cpus // 4)),
         help="Processes that collect experience on the CPU while this one trains "
         "(0: collect here, between updates, as before). Default for this machine: %(default)s",
     )
     parser.add_argument(
-        "--actor-threads", type=int, default=2,
+        "--actor-threads", type=int, default=1 if apple_gpu else 2,
         help="CPU threads per actor process. Default: %(default)s",
     )
     parser.add_argument(

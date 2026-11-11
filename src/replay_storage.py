@@ -10,7 +10,9 @@ ends with observation O(t) and starts from O(t - E), with E environments; O(-E..
 environments' starting observations. O(t) is kept in row (t + E) mod (capacity + E), which
 holds every observation the stored transitions need.
 
-Observations are stored compactly and restored exactly (see ObsCodec).
+Observations are stored compactly and restored exactly (see ObsCodec), except on MPS, where
+decoding a batch costs a large share of each update and unified memory has room for plain
+float32 (about 1.7 GB for 30,000 transitions).
 """
 
 from typing import NamedTuple
@@ -109,11 +111,17 @@ class ReplayStorage:
         self.codec = ObsCodec(device)
         self.total = 0  # transitions added so far
         self._rows = capacity + num_envs
-        self._obs_bytes = torch.zeros(
-            (self._rows, len(_BYTE_CHANNELS), _H, _W), dtype=torch.uint8, device=device
-        )
-        self._obs_reward = torch.zeros((self._rows, _H, _W), dtype=torch.float32, device=device)
-        self._obs_speed = torch.zeros(self._rows, dtype=torch.float32, device=device)
+        self._plain_obs = device.type == "mps"
+        if self._plain_obs:
+            self._obs = torch.zeros((self._rows, *OBS_SHAPE), dtype=torch.float32, device=device)
+            self._obs_stores = (self._obs,)
+        else:
+            self._obs_bytes = torch.zeros(
+                (self._rows, len(_BYTE_CHANNELS), _H, _W), dtype=torch.uint8, device=device
+            )
+            self._obs_reward = torch.zeros((self._rows, _H, _W), dtype=torch.float32, device=device)
+            self._obs_speed = torch.zeros(self._rows, dtype=torch.float32, device=device)
+            self._obs_stores = (self._obs_bytes, self._obs_reward, self._obs_speed)
         self._action = torch.zeros(capacity, dtype=torch.long, device=device)
         # Rewards are kept (and scaled) in float64 like the original Python code did, except on
         # MPS, which has no float64; rewards are integers, so float32 holds them exactly too.
@@ -127,8 +135,7 @@ class ReplayStorage:
         return min(self.total, self.capacity)
 
     def memory_bytes(self) -> int:
-        tensors = (self._obs_bytes, self._obs_reward, self._obs_speed, self._action,
-                   self._reward, self._done, self._next_mask)
+        tensors = (*self._obs_stores, self._action, self._reward, self._done, self._next_mask)
         return sum(t.numel() * t.element_size() for t in tensors)
 
     @staticmethod
@@ -143,12 +150,11 @@ class ReplayStorage:
         return ranges
 
     def _write_obs(self, first_row: int, obs: torch.Tensor) -> None:
-        byte_part, reward_part, speed_part = self.codec.encode(obs.to(self.device))
+        obs = obs.to(self.device)
+        parts = (obs,) if self._plain_obs else self.codec.encode(obs)
         for dst, end, src in self._ranges(first_row, obs.shape[0], self._rows):
-            n = end - dst
-            self._obs_bytes[dst:end] = byte_part[src:src + n]
-            self._obs_reward[dst:end] = reward_part[src:src + n]
-            self._obs_speed[dst:end] = speed_part[src:src + n]
+            for store, part in zip(self._obs_stores, parts):
+                store[dst:end] = part[src:src + end - dst]
 
     def set_initial_obs(self, obs: torch.Tensor) -> None:
         """The environments' observations before their first step, shape (num_envs, ...)."""
@@ -215,7 +221,9 @@ class ReplayStorage:
 
     def gather(self, idx: BatchIndices) -> Batch:
         def obs(rows):
-            return self.codec.decode(self._obs_bytes[rows], self._obs_reward[rows], self._obs_speed[rows])
+            if self._plain_obs:
+                return self._obs[rows]
+            return self.codec.decode(*(store[rows] for store in self._obs_stores))
 
         return Batch(
             obs=obs(idx.obs_row),
