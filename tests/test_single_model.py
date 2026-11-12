@@ -13,7 +13,7 @@ import torch
 
 import utils
 from pacbot_rs import PacmanGym
-from utils import DEFAULT_GYM_CONFIGURATION
+from utils import DEFAULT_GYM_CONFIGURATION, NUM_ACTIONS, OBS_SHAPE
 
 
 def _child_mode(queue) -> None:
@@ -72,6 +72,26 @@ class SingleModelTests(unittest.TestCase):
         utils.step_envs_while_not_policy([env], torch.device("cpu"))
         if before is not None:
             self.assertEqual(env.game_state_bytes(), before)
+
+    def test_random_starts_for_a_share_of_the_games(self):
+        from replay_buffer import ReplayBuffer
+        from policies import EpsilonGreedy, MaxQPolicy
+        import models
+        policy = EpsilonGreedy(MaxQPolicy(models.QNetV2(OBS_SHAPE, NUM_ACTIONS)), NUM_ACTIONS, 1.0)
+        utils.set_single_model(False)
+        with self.assertRaises(ValueError):
+            ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4, random_start_proportion=0.5)
+        utils.set_single_model(True)
+        buffer = ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4, random_start_proportion=0.5)
+        self.assertEqual([c.random_start for c in buffer._reset_configs], [True, True, False, False])
+        self.assertTrue(all(c.random_ticks for c in buffer._reset_configs))
+        full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
+        env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
+        pellets = []
+        for _ in range(40):
+            env.reset(utils.random_start_configuration())
+            pellets.append(env.remaining_pellets())
+        self.assertLess(min(pellets), full * 0.7, "random starts should often remove half the board")
 
     def test_spawned_processes_inherit_the_mode(self):
         ctx = mp.get_context("spawn")

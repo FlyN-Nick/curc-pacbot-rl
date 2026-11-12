@@ -90,7 +90,7 @@ def evaluate_episode(
 ) -> tuple[int, int, bool, int, int, int, float]:
     """
     Plays one evaluation game with the greedy policy, from the normal start, at the normal
-    speed or every `ticks_per_step` game ticks. The game is deterministic.
+    speed or every `ticks_per_step` game ticks. Games differ: frightened ghosts move randomly.
 
     Returns (score, total_steps, is_board_cleared, pellets_start, pellets_end,
     purgatory_pellets, ghost_proximities).
@@ -135,9 +135,9 @@ class BackgroundEvaluator:
 
     submit() hands over one game if a worker is free (otherwise that evaluation is skipped);
     poll() returns the games finished since the last call, each with the payload given to
-    submit(). submit_candidate() queues one game of a checkpoint at each of several speeds,
-    never skipped (single games are skipped while they play); poll_candidates() returns each
-    candidate once all its games are done, with {ticks_per_step: result}.
+    submit(). submit_candidate() queues `games_per_speed` games of a checkpoint at each of
+    several speeds, never skipped (single games are skipped while they play); poll_candidates()
+    returns each candidate once all its games are done, with {ticks_per_step: [results]}.
     """
 
     def __init__(self, num_workers: int, model_name: str, env_version: int, threads: int = 1):
@@ -146,10 +146,10 @@ class BackgroundEvaluator:
         self._tasks = _CTX.Queue()
         self._results = _CTX.Queue()
         self._in_flight: dict[int, Any] = {}
-        # iter_num -> [payload, games still to finish, {ticks_per_step: result}]
+        # iter_num -> [payload, games still to finish, {ticks_per_step: [results]}]
         self._candidates: dict[int, list] = {}
         self._finished: list[tuple[int, tuple, Any]] = []
-        self._finished_candidates: list[tuple[int, dict[int, tuple], Any]] = []
+        self._finished_candidates: list[tuple[int, dict[int, list[tuple]], Any]] = []
         self._procs = [
             _CTX.Process(
                 target=_eval_worker,
@@ -175,16 +175,21 @@ class BackgroundEvaluator:
         self._tasks.put((("game", iter_num), state_dict_to_numpy(q_net), None))
         return True
 
-    def submit_candidate(self, iter_num: int, q_net: torch.nn.Module, speeds, payload: Any) -> None:
+    def submit_candidate(
+        self, iter_num: int, q_net: torch.nn.Module, speeds, payload: Any, games_per_speed: int = 1,
+    ) -> None:
         speeds = list(speeds)
         if not speeds or len(set(speeds)) != len(speeds):
             raise ValueError(f"a candidate needs distinct speeds, got {speeds}")
+        if games_per_speed < 1:
+            raise ValueError(f"games_per_speed must be at least 1, got {games_per_speed}")
         if iter_num in self._candidates:
             raise ValueError(f"candidate {iter_num} is already being evaluated")
         weights = state_dict_to_numpy(q_net)
-        self._candidates[iter_num] = [payload, len(speeds), {}]
-        for ticks_per_step in speeds:
-            self._tasks.put((("candidate", iter_num), weights, ticks_per_step))
+        self._candidates[iter_num] = [payload, len(speeds) * games_per_speed, {k: [] for k in speeds}]
+        for _ in range(games_per_speed):
+            for ticks_per_step in speeds:
+                self._tasks.put((("candidate", iter_num), weights, ticks_per_step))
 
     def candidates_pending(self) -> int:
         return len(self._candidates)
@@ -208,7 +213,7 @@ class BackgroundEvaluator:
             else:
                 candidate = self._candidates[iter_num]
                 candidate[1] -= 1
-                candidate[2][ticks_per_step] = result
+                candidate[2][ticks_per_step].append(result)
                 if candidate[1] == 0:
                     del self._candidates[iter_num]
                     self._finished_candidates.append((iter_num, candidate[2], candidate[0]))
@@ -218,7 +223,7 @@ class BackgroundEvaluator:
         finished, self._finished = self._finished, []
         return finished
 
-    def poll_candidates(self, timeout: float | None = None) -> list[tuple[int, dict[int, tuple], Any]]:
+    def poll_candidates(self, timeout: float | None = None) -> list[tuple[int, dict[int, list[tuple]], Any]]:
         """Finished candidates; with a timeout, waits that long for the next game result."""
         self._drain(timeout)
         finished, self._finished_candidates = self._finished_candidates, []
@@ -250,6 +255,7 @@ def _actor(
     model_name: str,
     threads: int,
     seed: int,
+    random_start_proportion: float = 0.0,
 ) -> None:
     """
     Plays this actor's environments continuously. Each experience step goes into a free slot of
@@ -269,7 +275,7 @@ def _actor(
         # The same collection code as single-process training, on this actor's environments
         buffer = ReplayBuffer(
             maxlen=num_envs, policy=policy, num_parallel_envs=num_envs,
-            random_start_proportion=0.0, device=_CPU,
+            random_start_proportion=random_start_proportion, device=_CPU,
         )
         obs_out[0] = buffer._last_obs.numpy()
         conn.send(("ready",))
@@ -342,6 +348,7 @@ class ActorReplayBuffer:
         device: torch.device,
         threads_per_actor: int = 2,
         ahead_steps: int | None = None,
+        random_start_proportion: float = 0.0,
     ) -> None:
         if not 1 <= num_actors <= num_parallel_envs:
             raise ValueError(f"num_actors must be 1..{num_parallel_envs}, got {num_actors}")
@@ -391,7 +398,7 @@ class ActorReplayBuffer:
                     args=(
                         child, count, num_slots, obs_shm.name, weights_shm.name,
                         self._weights_lock, num_params, model_name, threads_per_actor,
-                        _fresh_seed(),
+                        _fresh_seed(), random_start_proportion,
                     ),
                     daemon=True,
                 )

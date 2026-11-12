@@ -7,7 +7,7 @@ import numpy as np
 
 import pacbot_rs
 
-from utils import reset_env, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
+from utils import random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -40,14 +40,19 @@ class ReplayBuffer(Generic[P]):
         self.policy = policy
         self.device = device
 
-        # Initialize the environments.
-        self._envs = [
-            pacbot_rs.PacmanGym(
-                # pacbot_rs.PacmanGymConfiguration({"random_start":i < num_parallel_envs * random_start_proportion, "random_ticks": True})
-                DEFAULT_GYM_CONFIGURATION
-            )
+        # Initialize the environments. The first `random_start_proportion` of them start each
+        # game after the first from a random Pacman position, on a board with half its pellets
+        # removed 4 times in 5 (PacmanGymConfiguration.random_start), for practice at clearing
+        # the board; the rest start normally.
+        if random_start_proportion > 0 and not single_model():
+            raise ValueError("random_start_proportion needs --single-model: the super pellet "
+                             "model resets the games it finishes with the normal start")
+        num_random = round(num_parallel_envs * random_start_proportion)
+        self._reset_configs = [
+            random_start_configuration() if i < num_random else replay_buffer_obs_config()
             for i in range(num_parallel_envs)
         ]
+        self._envs = [pacbot_rs.PacmanGym(DEFAULT_GYM_CONFIGURATION) for _ in range(num_parallel_envs)]
         self._last_obs = self._make_current_obs()
         if storage is not None:
             storage.set_initial_obs(self._last_obs)
@@ -84,11 +89,11 @@ class ReplayBuffer(Generic[P]):
         # the new observations to the device in one transfer instead of one per environment.
         transitions = []
         new_obs = []
-        for env, action in zip(self._envs, actions):
+        for env, action, reset_config in zip(self._envs, actions, self._reset_configs):
             reward, done = env.step(action)
             if done:
                 next_action_mask = [False] * NUM_ACTIONS
-                reset_env(env, replay_buffer_obs_config())
+                reset_env(env, reset_config)
             else:
                 next_action_mask = replay_buffer_action_mask(env)
             transitions.append((action, reward, done, next_action_mask))

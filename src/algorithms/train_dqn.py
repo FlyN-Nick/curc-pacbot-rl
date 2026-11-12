@@ -29,6 +29,12 @@ def _request_exit(signum, frame):
     print("\nExit requested — saving checkpoint before stopping...")
 
 
+def best_eval_kind() -> str:
+    """How the best checkpoint's score was measured, kept in checkpoints."""
+    games = args.candidate_games_per_speed
+    return "speeds" if games == 1 else f"speeds x{games}"
+
+
 def atomic_torch_save(obj, path: Path) -> None:
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
@@ -38,7 +44,7 @@ import models
 from policies import EpsilonGreedy, MaxQPolicy
 from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
-from dqn_update import EagerUpdate, GraphedUpdate, set_capturable
+from dqn_update import EagerUpdate, GraphedUpdate, set_capturable, set_learning_rate
 from timing import time_block
 from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, TRAINING_SPEEDS, NORMAL_SPEED
 import parallel_training
@@ -104,6 +110,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # Before any actor or evaluation process starts, so they inherit it (--eval uses the checkpoint's)
     set_single_model(args.single_model)
+    if args.random_start_proportion > 0 and not args.single_model:
+        parser.error("--random_start_proportion needs --single-model")
+    if not 0 < args.lr_final_fraction <= 1:
+        parser.error("--lr_final_fraction must be in (0, 1]")
     if not hasattr(models, args.model):
         parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
@@ -188,8 +198,9 @@ if __name__ == "__main__":
                 resume_iter = int(loaded.get("iter_num", 0))
                 resume_epsilon = loaded.get("epsilon", None)
                 resume_optimizer_state = loaded.get("optimizer_state_dict", None)
-                if loaded.get("best_eval_kind") == "speeds":
-                    # Older checkpoints kept the best single game, which isn't comparable
+                if loaded.get("best_eval_kind") == best_eval_kind():
+                    # Scores from other evaluations (a single game, or another number of
+                    # games per speed) aren't comparable
                     resume_best_eval_score = float(loaded.get("best_eval_score", -float("inf")))
                 if checkpoint_single_model(loaded) != args.single_model:
                     raise SystemExit(
@@ -241,18 +252,33 @@ def eval_metrics(result: tuple) -> dict:
     )
 
 
-def candidate_metrics(results: dict[int, tuple]) -> dict:
-    """Metrics to log for a candidate checkpoint's games, {ticks_per_step: result}."""
-    scores = [r[0] for r in results.values()]
+def candidate_metrics(results: dict[int, list[tuple]]) -> dict:
+    """
+    Metrics to log for a candidate checkpoint's games, {ticks_per_step: [results]}. The mean
+    score weights every speed equally.
+    """
+    games = [r for speed_results in results.values() for r in speed_results]
+    speed_means = [statistics.fmean(r[0] for r in rs) for rs in results.values()]
     metrics = dict(
-        candidate_mean_score=statistics.fmean(scores),
-        candidate_min_score=min(scores),
-        candidate_cleared_rate=statistics.fmean(int(r[2]) for r in results.values()),
-        candidate_pellets_end=statistics.fmean(r[4] for r in results.values()),
+        candidate_mean_score=statistics.fmean(speed_means),
+        candidate_min_speed_score=min(speed_means),
+        candidate_min_score=min(r[0] for r in games),
+        candidate_cleared_rate=statistics.fmean(int(r[2]) for r in games),
+        candidate_pellets_end=statistics.fmean(r[4] for r in games),
     )
     if NORMAL_SPEED in results:
-        metrics["candidate_normal_speed_score"] = results[NORMAL_SPEED][0]
+        metrics["candidate_normal_speed_score"] = speed_means[list(results).index(NORMAL_SPEED)]
     return metrics
+
+
+def learning_rate(iter_num: int) -> float:
+    """
+    The configured learning rate, decayed along a cosine to lr_final_fraction of it by the
+    end of training (1.0, the default: constant).
+    """
+    progress = min(1.0, iter_num / max(1, wandb.config.num_iters - 1))
+    final = wandb.config.lr_final_fraction
+    return wandb.config.learning_rate * (final + (1 - final) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
 def exploration_epsilon(iter_num: int) -> float:
@@ -350,6 +376,7 @@ def train():
                 max_steps=wandb.config.experience_steps,
                 device=device,
                 threads_per_actor=args.actor_threads,
+                random_start_proportion=wandb.config.random_start_proportion,
             )
         else:
             replay_buffer = ReplayBuffer(
@@ -381,6 +408,14 @@ def _train(replay_buffer, evaluator, actors: bool):
         optimizer.load_state_dict(resume_optimizer_state)
         set_capturable(optimizer, graphed)
         print("Restored optimizer state from checkpoint")
+    decay_lr = wandb.config.lr_final_fraction != 1.0
+    if decay_lr:
+        # A captured update reads a float learning rate once, so give it a tensor to follow
+        for group in optimizer.param_groups:
+            group["lr"] = torch.tensor(learning_rate(resume_iter), device=device) if graphed else learning_rate(resume_iter)
+        print(f"Learning rate: cosine from {wandb.config.learning_rate:g} to "
+              f"{wandb.config.learning_rate * wandb.config.lr_final_fraction:g}, "
+              f"now {learning_rate(resume_iter):g}")
 
     best_eval_score = resume_best_eval_score
 
@@ -391,7 +426,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "iter_num": iter_num,
             "epsilon": replay_buffer.policy.epsilon,
             "best_eval_score": best_eval_score,
-            "best_eval_kind": "speeds",
+            "best_eval_kind": best_eval_kind(),
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
             "env_version": ENV_VERSION,
             "single_model": single_model(),
@@ -436,7 +471,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             checkpoint_dir.mkdir(exist_ok=True)
             atomic_torch_save(snapshot, checkpoint_dir / "q_net-best.ckpt.pt")
             print(f"New best checkpoint: iter {iter_num}, mean score {best_eval_score:.0f} "
-                  f"over {len(results)} speeds")
+                  f"over {len(results)} speeds x {len(next(iter(results.values())))} games")
         metrics["best_eval_mean_score"] = best_eval_score
     for iter_num in tqdm(range(resume_iter, wandb.config.num_iters), smoothing=0.01):
         if _exit_requested:
@@ -461,6 +496,8 @@ def _train(replay_buffer, evaluator, actors: bool):
                 exploration_epsilon(iter_num),
             )
 
+        if decay_lr:
+            set_learning_rate(optimizer, learning_rate(iter_num))
         with time_block("Update the network"):
             # Sample a batch (indices drawn on the device; see replay_storage) and update the
             # network on it (see dqn_update)
@@ -471,6 +508,8 @@ def _train(replay_buffer, evaluator, actors: bool):
             metrics = {
                 "exploration_epsilon": replay_buffer.policy.epsilon,
             }
+            if decay_lr:
+                metrics["learning_rate"] = learning_rate(iter_num)
             if iter_num % wandb.config.evaluate_steps == 0:
                 # One game, for the learning curve
                 if evaluator is None:
@@ -480,18 +519,21 @@ def _train(replay_buffer, evaluator, actors: bool):
                     # Played in the background; if every worker is busy, skipped
                     evaluator.submit(iter_num, q_net, lambda: None)
             if is_candidate_iter(iter_num):
-                # One (deterministic) game at each training speed; the best mean score is kept
-                # as q_net-best
+                # candidate_games_per_speed games at each training speed (games differ, so one
+                # is mostly luck); the best mean score is kept as q_net-best
+                games = wandb.config.candidate_games_per_speed
                 if evaluator is None:
                     with time_block("Evaluate a candidate"):
                         results = {
-                            k: parallel_training.evaluate_episode(q_net, device, ENV_VERSION, ticks_per_step=k)
+                            k: [parallel_training.evaluate_episode(q_net, device, ENV_VERSION, ticks_per_step=k)
+                                for _ in range(games)]
                             for k in TRAINING_SPEEDS
                         }
                     consider_candidate(iter_num, results, build_metadata(iter_num), metrics)
                 else:
                     evaluator.submit_candidate(
-                        iter_num, q_net, TRAINING_SPEEDS, cpu_copy(build_metadata(iter_num))
+                        iter_num, q_net, TRAINING_SPEEDS, cpu_copy(build_metadata(iter_num)),
+                        games_per_speed=games,
                     )
             if evaluator is not None:
                 for eval_iter, result, _ in evaluator.poll():

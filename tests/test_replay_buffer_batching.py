@@ -171,7 +171,7 @@ class ReplayBufferBatchingTests(unittest.TestCase):
         ):
             policy = policy_class(MaxQPolicy(FakeQNet(offset=3)), NUM_ACTIONS, 0.5)
             buffer = buffer_class(
-                maxlen=10_000, policy=policy, num_parallel_envs=8, random_start_proportion=0.5
+                maxlen=10_000, policy=policy, num_parallel_envs=8, random_start_proportion=0.0
             )
             for _ in range(steps):
                 buffer.generate_experience_step()

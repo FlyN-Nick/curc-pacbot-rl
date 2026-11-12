@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent))
 import models  # noqa: E402
-from dqn_update import EagerUpdate, GraphedUpdate, dqn_update, set_capturable  # noqa: E402
+from dqn_update import EagerUpdate, GraphedUpdate, dqn_update, set_capturable, set_learning_rate  # noqa: E402
 from replay_storage import ReplayStorage  # noqa: E402
 from test_replay_storage import real_observations  # noqa: E402
 from utils import NUM_ACTIONS, OBS_SHAPE  # noqa: E402
@@ -160,6 +160,25 @@ class GraphedUpdateTests(unittest.TestCase):
             target.load_state_dict(q_net.state_dict())
         idx = storage.sample_indices(64)
         self.assertEqual(eager[3].run(idx).tolist(), graphed[3].run(idx).tolist())
+
+    def test_graph_follows_a_changing_learning_rate(self):
+        storage = filled_storage(self.device)
+        runs = []
+        for cls in (EagerUpdate, GraphedUpdate):
+            q_net, target = nets(self.device)
+            opt = torch.optim.Adam(q_net.parameters(), lr=torch.tensor(1e-3, device=self.device), capturable=True)
+            runs.append((q_net, cls(q_net, target, opt, storage, 64, **KW), opt))
+        for lr in (1e-3, 5e-4, 1e-4, 0.0):
+            idx = storage.sample_indices(64)
+            for q_net, update, opt in runs:
+                set_learning_rate(opt, lr)
+                before = params(q_net)
+                update.run(idx)
+            for pe, pg in zip(runs[0][0].parameters(), runs[1][0].parameters()):
+                self.assertTrue(torch.allclose(pe, pg, rtol=0, atol=1e-7), lr)
+        # A zero learning rate leaves the network as it was
+        for p, b in zip(runs[1][0].parameters(), before):
+            self.assertTrue(torch.equal(p, b))
 
     def test_capture_leaves_no_trace(self):
         storage = filled_storage(self.device)

@@ -98,6 +98,19 @@ def set_capturable(optimizer: torch.optim.Optimizer, capturable: bool) -> None:
                 state["step"] = step.to(param.device if capturable else "cpu", dtype=torch.float32)
 
 
+def set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    """
+    Sets an optimizer's learning rate. A CUDA graph of the update reads a float learning rate
+    only when it's captured, so for a schedule give the optimizer a tensor (on the device)
+    before capturing; this changes that tensor in place.
+    """
+    for group in optimizer.param_groups:
+        if torch.is_tensor(group["lr"]):
+            group["lr"].fill_(lr)
+        else:
+            group["lr"] = lr
+
+
 class EagerUpdate:
     """Runs dqn_update() directly, each iteration."""
 

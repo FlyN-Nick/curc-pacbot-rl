@@ -139,7 +139,7 @@ class BackgroundEvaluatorTests(unittest.TestCase):
         evaluator = parallel_training.BackgroundEvaluator(2, "QNetV2", env_version=2)
         try:
             q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
-            evaluator.submit_candidate(100, q_net, [4, 8, 14], "snapshot-100")
+            evaluator.submit_candidate(100, q_net, [4, 8, 14], "snapshot-100", games_per_speed=2)
             self.assertEqual(evaluator.candidates_pending(), 1)
             # Its games fill the workers, so single games are skipped meanwhile
             self.assertFalse(evaluator.submit(101, q_net, lambda: None))
@@ -151,15 +151,18 @@ class BackgroundEvaluatorTests(unittest.TestCase):
             iter_num, results, payload = finished[0]
             self.assertEqual((iter_num, payload), (100, "snapshot-100"))
             self.assertEqual(sorted(results), [4, 8, 14])
-            self.assertTrue(all(r[1] > 0 for r in results.values()))
-            # Each game is deterministic: the same as playing it here
-            for ticks, result in results.items():
-                here = parallel_training.evaluate_episode(
-                    q_net, torch.device("cpu"), 2, ticks_per_step=ticks
-                )
-                self.assertEqual(result[:5], here[:5])
+            self.assertTrue(all(len(games) == 2 for games in results.values()))
+            self.assertTrue(all(r[1] > 0 for games in results.values() for r in games))
             self.assertEqual(evaluator.candidates_pending(), 0)
             self.assertTrue(evaluator.submit(102, q_net, lambda: None))
+        finally:
+            evaluator.close()
+
+    def test_candidate_needs_a_game_per_speed(self):
+        evaluator = parallel_training.BackgroundEvaluator(1, "QNetV2", env_version=2)
+        try:
+            with self.assertRaises(ValueError):
+                evaluator.submit_candidate(1, models.QNetV2(OBS_SHAPE, NUM_ACTIONS), [8], None, games_per_speed=0)
         finally:
             evaluator.close()
 
