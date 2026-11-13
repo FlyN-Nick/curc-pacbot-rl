@@ -100,10 +100,18 @@ if __name__ == "__main__":
         help="Processes that play the evaluation games on the CPU in the background "
         "(0: play them here, blocking training, as before). Default for this machine: %(default)s",
     )
+    def parse_bool(text: str) -> bool:
+        # type=bool would make any non-empty string, "false" included, True
+        if text.lower() in ("true", "1", "yes"):
+            return True
+        if text.lower() in ("false", "0", "no"):
+            return False
+        raise ValueError(text)
+
     for name, default_value in hyperparam_defaults.items():
         parser.add_argument(
             f"--{name}",
-            type=type(default_value),
+            type=parse_bool if isinstance(default_value, bool) else type(default_value),
             default=default_value,
             help="Default: %(default)s",
         )
@@ -112,6 +120,8 @@ if __name__ == "__main__":
     set_single_model(args.single_model)
     if args.random_start_proportion > 0 and not args.single_model:
         parser.error("--random_start_proportion needs --single-model")
+    if args.random_pellet_removal and args.random_start_proportion == 0:
+        parser.error("--random_pellet_removal applies to random starts: set --random_start_proportion")
     if not 0 < args.lr_final_fraction <= 1:
         parser.error("--lr_final_fraction must be in (0, 1]")
     if not hasattr(models, args.model):
@@ -377,6 +387,7 @@ def train():
                 device=device,
                 threads_per_actor=args.actor_threads,
                 random_start_proportion=wandb.config.random_start_proportion,
+                random_pellet_removal=wandb.config.random_pellet_removal,
             )
         else:
             replay_buffer = ReplayBuffer(
@@ -384,6 +395,7 @@ def train():
                 policy=EpsilonGreedy(MaxQPolicy(q_net), NUM_ACTIONS, fill_epsilon),
                 num_parallel_envs=wandb.config.num_parallel_envs,
                 random_start_proportion=wandb.config.random_start_proportion,
+                random_pellet_removal=wandb.config.random_pellet_removal,
                 device=device,
                 storage=ReplayStorage(
                     wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device

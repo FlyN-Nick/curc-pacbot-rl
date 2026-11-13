@@ -27,6 +27,10 @@ pub struct PacmanGymConfiguration {
     /// If this && `random_start`, randomize the ghosts' starting positions
     #[pyo3(get, set)]
     pub randomize_ghosts: bool,
+    /// If this && `random_start`, instead of wiping half the board (4 times in 5), remove a
+    /// random share of the pellets, drawn uniformly from 0 to 98% per game, anywhere on the board
+    #[pyo3(get, set)]
+    pub random_pellet_removal: bool,
 
     /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
     #[pyo3(get, set)]
@@ -70,6 +74,9 @@ pub struct PacmanGymConfiguration {
     pub random_start: bool,
     /// If this && `random_start`, randomize the ghosts' starting positions
     pub randomize_ghosts: bool,
+    /// If this && `random_start`, instead of wiping half the board (4 times in 5), remove a
+    /// random share of the pellets, drawn uniformly from 0 to 98% per game, anywhere on the board
+    pub random_pellet_removal: bool,
 
     /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
     pub random_ticks: bool,
@@ -104,6 +111,7 @@ impl Default for PacmanGymConfiguration {
             random_start: false,
             random_ticks: false,
             randomize_ghosts: false,
+            random_pellet_removal: false,
 
             random_ticks_per_step_min: 4,
             random_ticks_per_step_max: 14,
@@ -334,26 +342,43 @@ impl PacmanGym {
                 }
             }
 
-            // Randomly remove pellets from half the board (left, right, top, bottom) or don't.
-            let wipe_type = rng.gen_range(0..=4);
-            if wipe_type != 0 {
+            if config.random_pellet_removal {
+                // Remove each pellet with the same probability, drawn per game
+                let removal: f64 = rng.gen_range(0.0..=0.98);
                 for row in 0..31 {
                     for col in 0..28 {
-                        if self.game_state.pellet_at((row, col))
-                            && match wipe_type {
-                                1 => col < 28 / 2,
-                                2 => col >= 28 / 2,
-                                3 => row < 31 / 2,
-                                4 => row >= 31 / 2,
-                                _ => unreachable!(),
-                            }
-                        {
+                        if self.game_state.pellet_at((row, col)) && rng.gen_bool(removal) {
                             modify_bit_u32(
                                 &mut self.game_state.pellets[row as usize],
                                 col as usize,
                                 false,
                             );
                             self.game_state.decrement_num_pellets();
+                        }
+                    }
+                }
+            } else {
+                // Randomly remove pellets from half the board (left, right, top, bottom) or don't.
+                let wipe_type = rng.gen_range(0..=4);
+                if wipe_type != 0 {
+                    for row in 0..31 {
+                        for col in 0..28 {
+                            if self.game_state.pellet_at((row, col))
+                                && match wipe_type {
+                                    1 => col < 28 / 2,
+                                    2 => col >= 28 / 2,
+                                    3 => row < 31 / 2,
+                                    4 => row >= 31 / 2,
+                                    _ => unreachable!(),
+                                }
+                            {
+                                modify_bit_u32(
+                                    &mut self.game_state.pellets[row as usize],
+                                    col as usize,
+                                    false,
+                                );
+                                self.game_state.decrement_num_pellets();
+                            }
                         }
                     }
                 }
@@ -476,7 +501,8 @@ impl PacmanGym {
             return total_distance < 30;
         }
         // Ghosts that aren't on the board (not yet spawned) are neither close nor far.
-        let mut on_board = self.game_state.ghosts.iter().filter(|g| loc_to_pos(g.loc).is_some()).peekable();
+        let mut on_board =
+            self.game_state.ghosts.iter().filter(|g| loc_to_pos(g.loc).is_some()).peekable();
         if on_board.peek().is_none() {
             return false;
         }

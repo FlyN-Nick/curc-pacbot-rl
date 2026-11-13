@@ -6,6 +6,7 @@
     "replay_buffer_size": 30000,
     "num_parallel_envs": 32,
     "random_start_proportion": 0.0,
+    "random_pellet_removal": false,
     "experience_steps": 4,
     "target_network_update_steps": 5000,
     "evaluate_steps": 10,

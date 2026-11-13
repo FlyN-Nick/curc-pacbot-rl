@@ -93,6 +93,27 @@ class SingleModelTests(unittest.TestCase):
             pellets.append(env.remaining_pellets())
         self.assertLess(min(pellets), full * 0.7, "random starts should often remove half the board")
 
+    def test_random_pellet_removal_spreads_over_the_whole_range(self):
+        from replay_buffer import ReplayBuffer
+        from policies import EpsilonGreedy, MaxQPolicy
+        import models
+        utils.set_single_model(True)
+        policy = EpsilonGreedy(MaxQPolicy(models.QNetV2(OBS_SHAPE, NUM_ACTIONS)), NUM_ACTIONS, 1.0)
+        buffer = ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4,
+                              random_start_proportion=0.5, random_pellet_removal=True)
+        self.assertEqual([c.random_pellet_removal for c in buffer._reset_configs], [True, True, False, False])
+        full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
+        env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
+        shares = []
+        for _ in range(300):
+            env.reset(utils.random_start_configuration(random_pellet_removal=True))
+            shares.append(env.remaining_pellets() / full)
+        # Uniform removal of 0-98%: boards from nearly full to nearly empty, not just halves
+        self.assertGreater(max(shares), 0.9)
+        self.assertLess(min(shares), 0.1)
+        self.assertGreater(sum(0.6 < x < 0.9 for x in shares), 30)
+        self.assertGreater(sum(0.1 < x < 0.4 for x in shares), 30)
+
     def test_spawned_processes_inherit_the_mode(self):
         ctx = mp.get_context("spawn")
         for enabled in (True, False):

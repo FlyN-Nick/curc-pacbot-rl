@@ -76,9 +76,14 @@ OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURA
 
 REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True, "obs_ignore_super_pellets": True})
 SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True})
-def random_start_configuration() -> PacmanGymConfiguration:
-    """Training games from a random Pacman position, often on a half-cleared board."""
-    return PacmanGymConfiguration({"random_start": True, "random_ticks": True})
+def random_start_configuration(random_pellet_removal: bool = False) -> PacmanGymConfiguration:
+    """
+    Training games from a random Pacman position: often on a half-cleared board, or with
+    `random_pellet_removal`, with a random share (0-98%) of the pellets removed.
+    """
+    return PacmanGymConfiguration({
+        "random_start": True, "random_ticks": True, "random_pellet_removal": random_pellet_removal,
+    })
 def replay_buffer_obs_config() -> PacmanGymConfiguration:
     return SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION if single_model() else REPLAY_BUFFER_OBS_GYM_CONFIGURATION
 def replay_buffer_action_mask(env: PacmanGym) -> list[bool]:

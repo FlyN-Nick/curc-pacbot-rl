@@ -30,6 +30,8 @@ class PacmanGym:
     env_version: int
     @property
     def random_start(self) -> bool: ...
+    @property
+    def random_pellet_removal(self) -> bool: ...
 
 EvaluatorFunc = Callable[
     [NDArray[np.float32], NDArray[np.bool_]],
