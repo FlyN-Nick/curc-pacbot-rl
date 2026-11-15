@@ -861,6 +861,18 @@ impl PacmanGym {
         Ok(())
     }
 
+    /// A copy of this environment, for searching ahead. With `reseed` (the default), the copy's
+    /// random choices (frightened ghosts' moves) are drawn afresh instead of repeating the
+    /// original's, so a search can't see how the real game's randomness will turn out.
+    #[pyo3(signature = (reseed = true))]
+    pub fn copy(&self, reseed: bool) -> Self {
+        let mut env = self.clone();
+        if reseed {
+            env.game_state.seed = rand::random();
+        }
+        env
+    }
+
     #[classattr]
     const LATEST_ENV_VERSION: u32 = LATEST_ENV_VERSION;
 
