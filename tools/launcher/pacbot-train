@@ -241,9 +241,17 @@ progress() {  # the latest "N/TOTAL [elapsed<left, speed]" from a training log
 }
 
 cmd_list() {
-  printf 'Training at most %s at once; teammate runs allowed now: %s\n\n' "$MAX" "$(capacity)"
+  local id n=0 t=0
+  for id in $(job_ids); do
+    if running "$id"; then
+      n=$((n + 1))
+      [ "$(get "$id" user)" = "$OWNER" ] || t=$((t + 1))
+    fi
+  done
+  local o; o=$(others)
+  printf 'Training now: %s of at most %s (teammate runs: %s of at most %s)\n\n' \
+    "$((n + o))" "$MAX" "$t" "$(capacity)"
   printf '%-4s %-8s %-24s %-9s %s\n' SEQ USER NAME STATE PROGRESS
-  local id
   for id in $(for j in $(job_ids); do echo "$(get "$j" seq) $j"; done | sort -n | cut -d' ' -f2); do
     local state; state=$(get "$id" state)
     case $state in
@@ -253,7 +261,6 @@ cmd_list() {
     printf '%-4s %-8s %-24s %-9s %s\n' "$(get "$id" seq)" "$(get "$id" user)" "$(get "$id" name)" \
       "$state" "$(progress "$(get "$id" dir)/checkpoints/$(get "$id" name)/train.log" 2>/dev/null)"
   done
-  local o; o=$(others)
   [ "$o" -gt 0 ] && printf '\n%s more training run(s) started outside the launcher\n' "$o"
   return 0
 }
