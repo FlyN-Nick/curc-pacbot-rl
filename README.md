@@ -83,6 +83,21 @@ Runs go to your default W&B entity (your username). To log to a shared team inst
 
 To train without an account or network connection, pass `--no-wandb`. Checkpoints are still saved locally to `--checkpoint-dir`.
 
+### On a shared machine (`pacbot-train`)
+
+On a machine several people train on, start runs with `pacbot-train` (in `tools/launcher/`; install it once with `sudo bash tools/launcher/install.sh`, which also creates the `pacbot` group's shared state in `/var/lib/pacbot-train`). It keeps at most three runs training at once, counting runs started any other way, and starts waiting runs in the order they were queued:
+
+```bash
+pacbot-train start my-run -- --single-model --random_start_proportion 0.25   # queue it and return
+pacbot-train list              # everyone's runs: queued, running, paused, done
+pacbot-train log my-run        # follow its training log (add a user name for someone else's)
+pacbot-train stop my-run       # stop it; starting my-run again resumes from its latest checkpoint
+```
+
+Run it from your own checkout: it trains with `../.venv/bin/python -m algorithms.train_dqn` in that checkout's `src/`, with `--checkpoint-dir checkpoints/NAME` and `WANDB_NAME=NAME`, logging to `src/checkpoints/NAME/train.log`. Runs keep going after you log out. `pacbot-train run NAME` does the same but waits until the run finishes (for scripts).
+
+The machine's owner limits how many teammates' runs may train at once with `pacbot-capacity N` (`wsl pacbot-capacity 0` from Windows, e.g. before using the GPU for something else). When it goes down, the newest teammate runs stop at their latest checkpoint and wait; they resume from it when there's room again, losing only the replay buffer, which refills in a few minutes.
+
 ## Visualizing a trained agent
 
 To show an animated visualization in the terminal of the agent being controlled by a particular checkpoint, use `--eval`:
