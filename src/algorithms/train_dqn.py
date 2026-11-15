@@ -407,6 +407,10 @@ def train():
                     wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device
                 ),
             )
+        if wandb.config.n_step > 1:
+            if replay_buffer.storage is None:
+                raise SystemExit("--n_step needs the replay storage")
+            replay_buffer.storage.set_n_step(wandb.config.n_step, wandb.config.discount_factor)
         _train(replay_buffer, evaluator, actors)
     finally:
         for resource in (replay_buffer, evaluator):
@@ -465,7 +469,8 @@ def _train(replay_buffer, evaluator, actors: bool):
     update = (GraphedUpdate if graphed else EagerUpdate)(
         q_net, target_q_net, optimizer, replay_buffer.storage, wandb.config.batch_size,
         reward_scale=wandb.config.reward_scale,
-        discount_factor=wandb.config.discount_factor,
+        # n-step targets bootstrap from n steps later (see ReplayStorage.set_n_step)
+        discount_factor=wandb.config.discount_factor ** wandb.config.n_step,
         grad_clip_norm=wandb.config.grad_clip_norm,
         huber_delta=wandb.config.huber_delta,
         bf16=args.bf16,

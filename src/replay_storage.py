@@ -94,7 +94,7 @@ class Batch(NamedTuple):
 class BatchIndices(NamedTuple):
     obs_row: torch.Tensor
     next_row: torch.Tensor
-    position: torch.Tensor
+    position: torch.Tensor  # (batch,), or (batch, n) with n-step returns
 
 
 class ReplayStorage:
@@ -130,6 +130,25 @@ class ReplayStorage:
         self._done = torch.zeros(capacity, dtype=torch.bool, device=device)
         self._next_mask = torch.zeros((capacity, NUM_ACTIONS), dtype=torch.bool, device=device)
         self._initialized = False
+        self.n_step = 1
+        self._step_discounts = None
+
+    def set_n_step(self, n: int, discount: float) -> None:
+        """
+        Sample n-step transitions: each starts from a stored transition and follows the same
+        environment for n steps, or until its game ends. The batch's reward is then the
+        discounted sum of those rewards (sum of discount**k * reward_k), done says whether the
+        game ended within them, and next_obs and next_action_mask are the state after the
+        n-th; with done False, bootstrap with discount**n.
+        """
+        if n < 1:
+            raise ValueError(f"n_step must be at least 1, got {n}")
+        if (n - 1) * self.num_envs >= self.capacity:
+            raise ValueError(f"n_step {n} needs a capacity above {(n - 1) * self.num_envs}")
+        self.n_step = n
+        self._step_discounts = torch.tensor(
+            [discount ** k for k in range(n)], dtype=self._float, device=self.device
+        )
 
     def __len__(self) -> int:
         return min(self.total, self.capacity)
@@ -211,13 +230,22 @@ class ReplayStorage:
     def sample_indices(self, batch_size: int) -> BatchIndices:
         """Indices of `batch_size` distinct stored transitions, chosen uniformly."""
         size = len(self)
-        if batch_size > size:
-            raise ValueError(f"can't sample {batch_size} of {size} transitions")
+        # With n-step returns, the last n - 1 steps' transitions can't start one yet
+        starts = size - (self.n_step - 1) * self.num_envs
+        if batch_size > starts:
+            raise ValueError(f"can't sample {batch_size} of {max(starts, 0)} transitions")
         # randperm on the device where it's supported well (CUDA), otherwise on the CPU
         where = self.device if self.device.type == "cuda" else "cpu"
-        perm = torch.randperm(size, device=where)[:batch_size].to(self.device)
+        perm = torch.randperm(starts, device=where)[:batch_size].to(self.device)
         t = (self.total - size) + perm
-        return BatchIndices(t % self._rows, (t + self.num_envs) % self._rows, t % self.capacity)
+        if self.n_step == 1:
+            return BatchIndices(t % self._rows, (t + self.num_envs) % self._rows, t % self.capacity)
+        steps = torch.arange(self.n_step, device=self.device) * self.num_envs
+        return BatchIndices(
+            t % self._rows,
+            (t + self.n_step * self.num_envs) % self._rows,
+            (t.unsqueeze(1) + steps) % self.capacity,
+        )
 
     def gather(self, idx: BatchIndices) -> Batch:
         def obs(rows):
@@ -225,13 +253,26 @@ class ReplayStorage:
                 return self._obs[rows]
             return self.codec.decode(*(store[rows] for store in self._obs_stores))
 
+        if idx.position.dim() == 1:
+            return Batch(
+                obs=obs(idx.obs_row),
+                next_obs=obs(idx.next_row),
+                done=self._done[idx.position],
+                next_action_mask=self._next_mask[idx.position],
+                action=self._action[idx.position],
+                reward=self._reward[idx.position],
+            )
+        # n-step: rewards count until the game ends (a later step belongs to the next game)
+        dones = self._done[idx.position]
+        playing = torch.cumprod((~dones).to(self._float), dim=1)
+        playing = torch.cat([torch.ones_like(playing[:, :1]), playing[:, :-1]], dim=1)
         return Batch(
             obs=obs(idx.obs_row),
             next_obs=obs(idx.next_row),
-            done=self._done[idx.position],
-            next_action_mask=self._next_mask[idx.position],
-            action=self._action[idx.position],
-            reward=self._reward[idx.position],
+            done=dones.any(dim=1),
+            next_action_mask=self._next_mask[idx.position[:, -1]],
+            action=self._action[idx.position[:, 0]],
+            reward=(self._reward[idx.position] * playing * self._step_discounts).sum(dim=1),
         )
 
     def sample(self, batch_size: int) -> Batch:
