@@ -28,6 +28,7 @@ class PacmanGym:
     def ticks_per_step(self) -> int: ...
     LATEST_ENV_VERSION: int
     env_version: int
+    ghost_next_obs: bool
     @property
     def random_start(self) -> bool: ...
     @property

@@ -46,7 +46,7 @@ from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
 from dqn_update import EagerUpdate, GraphedUpdate, set_capturable, set_learning_rate
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, TRAINING_SPEEDS, NORMAL_SPEED
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, TRAINING_SPEEDS, NORMAL_SPEED
 import parallel_training
 
 
@@ -118,6 +118,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # Before any actor or evaluation process starts, so they inherit it (--eval uses the checkpoint's)
     set_single_model(args.single_model)
+    set_ghost_next_obs(args.ghost_next_obs)
     if args.random_start_proportion > 0 and not args.single_model:
         parser.error("--random_start_proportion needs --single-model")
     if args.random_pellet_removal and args.random_start_proportion == 0:
@@ -216,6 +217,11 @@ if __name__ == "__main__":
                     raise SystemExit(
                         f"--finetune checkpoint was trained {'with' if checkpoint_single_model(loaded) else 'without'} "
                         "--single-model; pass the same setting"
+                    )
+                if checkpoint_ghost_next_obs(loaded) != args.ghost_next_obs:
+                    raise SystemExit(
+                        f"--finetune checkpoint was trained with --ghost_next_obs {checkpoint_ghost_next_obs(loaded)}; "
+                        "pass the same setting"
                     )
                 if checkpoint_env_version(loaded) != ENV_VERSION:
                     print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
@@ -442,6 +448,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "config": dict(wandb.config) if hasattr(wandb, "config") else {},
             "env_version": ENV_VERSION,
             "single_model": single_model(),
+            "ghost_next_obs": ghost_next_obs(),
         }
         try:
             if wandb.run is not None and getattr(wandb.run, "id", None):
@@ -647,6 +654,7 @@ if __name__ == "__main__":
             loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
             visualize_env_version = checkpoint_env_version(loaded)
             set_single_model(checkpoint_single_model(loaded))
+            set_ghost_next_obs(checkpoint_ghost_next_obs(loaded))
             print(f"Using environment version {visualize_env_version}")
             if isinstance(loaded, dict) and "state_dict" in loaded:
                 q_net.load_state_dict(loaded["state_dict"])

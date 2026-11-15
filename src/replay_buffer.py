@@ -7,7 +7,7 @@ import numpy as np
 
 import pacbot_rs
 
-from utils import random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
+from utils import ghost_next_obs, random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -55,6 +55,8 @@ class ReplayBuffer(Generic[P]):
             for i in range(num_parallel_envs)
         ]
         self._envs = [pacbot_rs.PacmanGym(DEFAULT_GYM_CONFIGURATION) for _ in range(num_parallel_envs)]
+        for env in self._envs:
+            env.ghost_next_obs = ghost_next_obs()
         self._last_obs = self._make_current_obs()
         if storage is not None:
             storage.set_initial_obs(self._last_obs)

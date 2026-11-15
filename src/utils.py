@@ -32,6 +32,24 @@ def single_model() -> bool:
     return os.environ.get(_SINGLE_MODEL_ENV) == "1"
 
 
+# Ghost-next observations: channels 8-11 hold each ghost's next square instead of a copy of
+# its current square (PacmanGym.ghost_next_obs). Kept in the environment like single-model mode.
+_GHOST_NEXT_OBS_ENV = "PACBOT_GHOST_NEXT_OBS"
+
+
+def set_ghost_next_obs(enabled: bool) -> None:
+    os.environ[_GHOST_NEXT_OBS_ENV] = "1" if enabled else "0"
+
+
+def ghost_next_obs() -> bool:
+    return os.environ.get(_GHOST_NEXT_OBS_ENV) == "1"
+
+
+def checkpoint_ghost_next_obs(loaded) -> bool:
+    """Whether a loaded checkpoint was trained with ghost-next observations."""
+    return isinstance(loaded, dict) and bool(loaded.get("ghost_next_obs", False))
+
+
 def checkpoint_single_model(loaded) -> bool:
     """Whether a loaded checkpoint was trained in single-model mode."""
     return isinstance(loaded, dict) and bool(loaded.get("single_model", False))
@@ -48,6 +66,7 @@ def make_gym(config: "PacmanGymConfiguration", env_version: int) -> PacmanGym:
     """A PacmanGym following the rules of the given environment version."""
     env = PacmanGym(config)
     env.env_version = env_version
+    env.ghost_next_obs = ghost_next_obs()
     return env
 
 

@@ -242,6 +242,11 @@ pub struct PacmanGym {
     /// Kept across resets.
     #[pyo3(get)]
     pub env_version: u32,
+
+    /// Observation channels 8-11 hold each ghost's next square (its square plus the
+    /// direction it is moving in) instead of a copy of its current square. Kept across resets.
+    #[pyo3(get, set)]
+    pub ghost_next_obs: bool,
 }
 
 #[cfg(not(feature = "python"))]
@@ -258,6 +263,9 @@ pub struct PacmanGym {
     /// Version of the environment rules; see [`LATEST_ENV_VERSION`].
     /// Kept across resets.
     pub env_version: u32,
+
+    /// See the Python build's field of the same name.
+    pub ghost_next_obs: bool,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -278,6 +286,18 @@ fn loc_to_pos(loc: LocationState) -> Option<(usize, usize)> {
     }
 }
 
+/// The square a ghost moves to at the next update, in our coords: one square ahead in the
+/// direction it is facing. None if the ghost is off the board or the square is outside it.
+fn ghost_next_pos(loc: LocationState) -> Option<(usize, usize)> {
+    loc_to_pos(loc)?;
+    let (row, col) = loc.get_ahead_coords(1);
+    if (0..31).contains(&row) && (0..28).contains(&col) {
+        loc_to_pos(LocationState { row, col, dir: loc.dir })
+    } else {
+        None
+    }
+}
+
 // Common Rust Implementation
 impl PacmanGym {
     pub fn new(config: &PacmanGymConfiguration) -> Self {
@@ -289,6 +309,7 @@ impl PacmanGym {
             game_state: GameState::new(),
             ticks_per_step: NORMAL_TICKS_PER_STEP,
             env_version: LATEST_ENV_VERSION,
+            ghost_next_obs: false,
         };
         s.reset(config);
         s
@@ -688,10 +709,16 @@ impl PacmanGym {
             }
         }
 
-        // last ghost pos is not useful information because between most updates in real competition,
-        // the ghosts don't move. In the future, the ai should be given the ghost's next position
-        // based on the direction it is facing
-        for (i, pos) in /* self.last_ghost_pos */ new_ghost_pos.iter().enumerate() {
+        // The last ghost positions are not useful: between most updates in the real competition
+        // the ghosts don't move. These channels hold either a copy of the current positions or,
+        // with ghost_next_obs, each ghost's next square: the game moves a ghost one square in the
+        // direction it is facing at the next update, and the server broadcasts that direction.
+        for (i, g) in game_state.ghosts.iter().enumerate() {
+            let pos = if self.ghost_next_obs {
+                ghost_next_pos(g.loc).or(new_ghost_pos[i])
+            } else {
+                new_ghost_pos[i]
+            };
             if let Some(pos) = pos {
                 last_ghost[(i, pos.0, pos.1)] = 1.0;
             }
