@@ -45,6 +45,11 @@ def dqn_update(
     """
     device = batch.obs.device
     reward = (batch.reward * reward_scale).float()
+    if hasattr(q_net, "quantiles"):
+        loss, all_predicted_q_values, target_q_values = _quantile_loss(
+            q_net, target_q_net, batch, reward, discount_factor, bf16, huber_delta, device)
+        return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
+                       reward_scale, grad_clip_norm, zero_grad)
 
     # Double DQN target: the online network picks the next action, the target network rates it.
     # masked_fill and gather instead of boolean-mask assignment and range indexing: the same
@@ -69,6 +74,44 @@ def dqn_update(
             loss = F.huber_loss(predicted_q_values.float(), target_q_values.float(), delta=huber_delta)
         else:
             loss = F.mse_loss(predicted_q_values.float(), target_q_values.float())
+    return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
+                   reward_scale, grad_clip_norm, zero_grad=False)
+
+
+def _quantile_loss(q_net, target_q_net, batch: Batch, reward, discount_factor, bf16, huber_delta, device):
+    """
+    QR-DQN's quantile Huber loss (Dabney et al. 2017) for a network with quantiles(), with a
+    double DQN target: the online network's Q values (the quantiles' means) pick the next
+    action, and the target network's quantiles for it, discounted, plus the reward, are the
+    target distribution. kappa is huber_delta, or 1.0 when it's 0.
+    """
+    with torch.no_grad(), _autocast(device, bf16 == "all"):
+        online_next_q_values = q_net(batch.next_obs).masked_fill(~batch.next_action_mask, -torch.inf)
+        next_actions = online_next_q_values.argmax(dim=1)
+        next_quantiles = target_q_net.quantiles(batch.next_obs).float()
+        n = next_quantiles.shape[2]
+        next_quantiles = next_quantiles.gather(1, next_actions.view(-1, 1, 1).expand(-1, 1, n)).squeeze(1)
+        target = reward.unsqueeze(1) + (discount_factor * next_quantiles).masked_fill(batch.done.unsqueeze(1), 0.0)
+
+    with _autocast(device, bf16 in ("update", "all")):
+        all_quantiles = q_net.quantiles(batch.obs)
+    all_quantiles = all_quantiles.float()
+    predicted = all_quantiles.gather(1, batch.action.view(-1, 1, 1).expand(-1, 1, n)).squeeze(1)
+    kappa = huber_delta if huber_delta > 0 else 1.0
+    # errors[b, i, j]: target sample j minus predicted quantile i
+    errors = target.unsqueeze(1) - predicted.unsqueeze(2)
+    huber = F.huber_loss(predicted.unsqueeze(2).expand_as(errors), target.unsqueeze(1).expand_as(errors),
+                         reduction="none", delta=kappa)
+    tau = (torch.arange(n, device=device, dtype=torch.float32) + 0.5) / n
+    weights = (tau.view(1, n, 1) - (errors.detach() < 0).float()).abs()
+    loss = (weights * huber / kappa).sum(dim=1).mean()
+    return loss, all_quantiles.mean(dim=2), target.mean(dim=1)
+
+
+def _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values, reward_scale,
+            grad_clip_norm, zero_grad: bool) -> torch.Tensor:
+    if zero_grad:
+        optimizer.zero_grad()
     loss.backward()
     # A non-finite norm is caught later (error_if_nonfinite would make the CPU wait for the GPU)
     grad_norm = torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=grad_clip_norm)
