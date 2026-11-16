@@ -257,6 +257,7 @@ def _actor(
     seed: int,
     random_start_proportion: float = 0.0,
     random_pellet_removal: bool = False,
+    near_ghost_epsilon: "tuple[float, int] | None" = None,
 ) -> None:
     """
     Plays this actor's environments continuously. Each experience step goes into a free slot of
@@ -277,7 +278,7 @@ def _actor(
         buffer = ReplayBuffer(
             maxlen=num_envs, policy=policy, num_parallel_envs=num_envs,
             random_start_proportion=random_start_proportion, device=_CPU,
-            random_pellet_removal=random_pellet_removal,
+            random_pellet_removal=random_pellet_removal, near_ghost_epsilon=near_ghost_epsilon,
         )
         obs_out[0] = buffer._last_obs.numpy()
         conn.send(("ready",))
@@ -352,6 +353,7 @@ class ActorReplayBuffer:
         ahead_steps: int | None = None,
         random_start_proportion: float = 0.0,
         random_pellet_removal: bool = False,
+        near_ghost_epsilon: "tuple[float, int] | None" = None,
     ) -> None:
         if not 1 <= num_actors <= num_parallel_envs:
             raise ValueError(f"num_actors must be 1..{num_parallel_envs}, got {num_actors}")
@@ -402,6 +404,7 @@ class ActorReplayBuffer:
                         child, count, num_slots, obs_shm.name, weights_shm.name,
                         self._weights_lock, num_params, model_name, threads_per_actor,
                         _fresh_seed(), random_start_proportion, random_pellet_removal,
+                        near_ghost_epsilon,
                     ),
                     daemon=True,
                 )

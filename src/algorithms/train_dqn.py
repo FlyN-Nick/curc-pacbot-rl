@@ -125,6 +125,10 @@ if __name__ == "__main__":
         parser.error("--random_pellet_removal applies to random starts: set --random_start_proportion")
     if not 0 < args.lr_final_fraction <= 1:
         parser.error("--lr_final_fraction must be in (0, 1]")
+    if args.epsilon_near_ghost > 1:
+        parser.error("--epsilon_near_ghost must be at most 1 (or negative: off)")
+    if args.near_ghost_radius < 1:
+        parser.error("--near_ghost_radius must be at least 1")
     if not hasattr(models, args.model):
         parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
@@ -297,6 +301,13 @@ def learning_rate(iter_num: int) -> float:
     return wandb.config.learning_rate * (final + (1 - final) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
+def near_ghost_epsilon() -> "tuple[float, int] | None":
+    """(exploration rate, radius) near dangerous ghosts, or None to explore the same everywhere."""
+    if wandb.config.epsilon_near_ghost < 0:
+        return None
+    return (wandb.config.epsilon_near_ghost, wandb.config.near_ghost_radius)
+
+
 def exploration_epsilon(iter_num: int) -> float:
     """Epsilon falls linearly from initial to final over epsilon_decay_fraction of training, then holds."""
     decay_iters = max(1.0, (wandb.config.num_iters - 1) * wandb.config.epsilon_decay_fraction)
@@ -394,6 +405,7 @@ def train():
                 threads_per_actor=args.actor_threads,
                 random_start_proportion=wandb.config.random_start_proportion,
                 random_pellet_removal=wandb.config.random_pellet_removal,
+                near_ghost_epsilon=near_ghost_epsilon(),
             )
         else:
             replay_buffer = ReplayBuffer(
@@ -402,6 +414,7 @@ def train():
                 num_parallel_envs=wandb.config.num_parallel_envs,
                 random_start_proportion=wandb.config.random_start_proportion,
                 random_pellet_removal=wandb.config.random_pellet_removal,
+                near_ghost_epsilon=near_ghost_epsilon(),
                 device=device,
                 storage=ReplayStorage(
                     wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device

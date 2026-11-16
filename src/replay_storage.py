@@ -23,54 +23,110 @@ import torch
 from utils import NUM_ACTIONS, OBS_SHAPE
 
 _CHANNELS, _H, _W = OBS_SHAPE
-# Channel 1 (rewards) stays float32 and channel 15 (Pacman's speed) is one value per
-# observation. The others are 0/1, except 12-14, which are mode or fright steps over a
-# fixed duration (see PacmanGym::obs in pacbot_rs/src/env.rs).
-_REWARD_CHANNEL, _SPEED_CHANNEL = 1, 15
-_BYTE_CHANNELS = [c for c in range(_CHANNELS) if c not in (_REWARD_CHANNEL, _SPEED_CHANNEL)]
-_SCALES = {12: 180.0, 13: 180.0, 14: 40.0}
+_CELLS = _H * _W
+# Observation channels (see PacmanGym::obs in pacbot_rs/src/env.rs):
+#   1      pellet / fruit / frightened-ghost values: a small set of float32 values
+#   12-14  scatter, chase and fright timers: at the ghosts' squares, a step count over a fixed
+#          duration, the same for every ghost (the game frightens all ghosts at once and counts
+#          their fright steps down together; the mode timer is the game's)
+#   15     Pacman's speed: one value for the whole board
+#   others 0/1
+_VALUE_CHANNEL, _SPEED_CHANNEL = 1, 15
+_TIMER_CHANNELS = [12, 13, 14]
+_TIMER_SCALES = [180.0, 180.0, 40.0]  # GameMode::CHASE.duration(), GHOST_FRIGHT_STEPS
+_BIT_CHANNELS = [c for c in range(_CHANNELS) if c not in (_VALUE_CHANNEL, _SPEED_CHANNEL, *_TIMER_CHANNELS)]
+# Stored as bit planes: the 0/1 channels, then where each timer channel is nonzero
+_PLANES = len(_BIT_CHANNELS) + len(_TIMER_CHANNELS)
+_PACKED_BYTES = (_PLANES * _CELLS + 7) // 8
+
+# Game values (pacbot-rs variables.rs) and env.rs's LAST_REWARD
+_PELLET, _SUPER_PELLET, _FRUIT, _COMBO, _LAST = 10, 50, 100, 200, 3000
+
+
+def square_values() -> np.ndarray:
+    """
+    Every float32 value channel 1 can hold, sorted: a square's points (a pellet, super pellet
+    or fruit, plus the last-pellet bonus), over 200, plus 2**ghost_combo for each frightened
+    ghost on it, added one at a time in float32 as env.rs adds them.
+    """
+    bases = [0, _PELLET, _SUPER_PELLET, _FRUIT, _PELLET + _LAST, _SUPER_PELLET + _LAST]
+    values = set()
+    for base in bases:
+        start = np.float32(base) / np.float32(_COMBO)
+        for combo in range(8):
+            v = start
+            values.add(float(v))
+            for _ in range(4):
+                v = np.float32(v + np.float32(2 ** combo))
+                values.add(float(v))
+    out = np.array(sorted(values), dtype=np.float32)
+    assert len(out) <= 256
+    return out
 
 
 class ObsCodec:
     """
-    Encodes observations into about 30% of their float32 size and decodes them exactly: the
-    0/1 channels and the step counts (as integers) are stored in bytes, and decoded with the
-    same float32 division the environment uses. CUDA divides with exact IEEE rounding, so it
-    divides directly; other devices (e.g. MPS) may divide less exactly, so they look each byte
-    up in a table computed on the CPU, which is a little slower. Decoding is checked on
-    everything encoded, and mismatches are counted (read with mismatches(); the check makes
-    the CPU wait for nothing).
+    Encodes observations into about 15% of their float32 size and decodes them exactly: the 0/1
+    channels as bits, channel 1 as an index into square_values(), each timer channel as where it
+    is nonzero (bits) and its value (a byte of steps, decoded with the same float32 division the
+    environment uses), and the speed as one float. Decoding is checked on everything encoded,
+    and mismatches are counted (read with mismatches(); the check makes the CPU wait for
+    nothing). CUDA divides with exact IEEE rounding, so it divides directly; other devices may
+    divide less exactly, so they look the timer bytes up in a table computed on the CPU.
     """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self._byte_channels = torch.tensor(_BYTE_CHANNELS, device=device)
-        scales = [_SCALES.get(c, 1.0) for c in _BYTE_CHANNELS]
-        self._scales = torch.tensor(scales, dtype=torch.float32, device=device).view(1, -1, 1, 1)
-        # Decoded value of each byte for each channel: n / scale in float32, as env.rs computes it
-        tables = np.arange(256, dtype=np.float32)[None, :] / np.array(scales, dtype=np.float32)[:, None]
-        self._tables = torch.from_numpy(tables).to(device)
-        self._table_rows = torch.arange(len(scales), device=device).view(1, -1, 1, 1)
+        self._bit_channels = torch.tensor(_BIT_CHANNELS, device=device)
+        self._timer_channels = torch.tensor(_TIMER_CHANNELS, device=device)
+        self._timer_scales = torch.tensor(_TIMER_SCALES, dtype=torch.float32, device=device).view(1, -1)
+        tables = np.arange(256, dtype=np.float32)[None, :] / np.array(_TIMER_SCALES, dtype=np.float32)[:, None]
+        self._timer_tables = torch.from_numpy(tables).to(device)
+        self._timer_rows = torch.arange(len(_TIMER_SCALES), device=device).view(1, -1)
         self._divide = device.type == "cuda"
+        self._values = torch.from_numpy(square_values()).to(device)
+        self._shifts = torch.arange(8, dtype=torch.uint8, device=device)
         self._mismatches = torch.zeros((), dtype=torch.long, device=device)
 
-    def encode(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        byte_part = torch.round(obs.index_select(1, self._byte_channels) * self._scales).to(torch.uint8)
-        encoded = (byte_part, obs[:, _REWARD_CHANNEL].clone(), obs[:, _SPEED_CHANNEL, 0, 0].clone())
+    def _pack(self, bits: torch.Tensor) -> torch.Tensor:
+        """(n, k) 0/1 uint8 -> (n, ceil(k / 8)) bytes, least significant bit first."""
+        n, k = bits.shape
+        pad = _PACKED_BYTES * 8 - k
+        if pad:
+            bits = torch.cat([bits, bits.new_zeros(n, pad)], dim=1)
+        return (bits.view(n, -1, 8) << self._shifts).sum(dim=2, dtype=torch.uint8)
+
+    def _unpack(self, packed: torch.Tensor) -> torch.Tensor:
+        n = packed.shape[0]
+        bits = (packed.unsqueeze(2) >> self._shifts) & 1
+        return bits.view(n, -1)[:, :_PLANES * _CELLS].view(n, _PLANES, _H, _W)
+
+    def encode(self, obs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        n = obs.shape[0]
+        timers = obs.index_select(1, self._timer_channels)
+        planes = torch.cat([obs.index_select(1, self._bit_channels), timers != 0], dim=1)
+        packed = self._pack(planes.to(torch.uint8).view(n, -1))
+        steps = torch.round(timers.amax(dim=(2, 3)) * self._timer_scales).clamp(0, 255).to(torch.uint8)
+        values = obs[:, _VALUE_CHANNEL]
+        index = torch.searchsorted(self._values, values.contiguous()).clamp(max=len(self._values) - 1)
+        encoded = (packed, steps, index.to(torch.uint8), obs[:, _SPEED_CHANNEL, 0, 0].clone())
         self._mismatches += (self.decode(*encoded) != obs).sum()
         return encoded
 
-    def decode(self, byte_part, reward_part, speed_part) -> torch.Tensor:
-        n = byte_part.shape[0]
-        obs = torch.empty((n, *OBS_SHAPE), dtype=torch.float32, device=byte_part.device)
+    def decode(self, packed, steps, index, speed) -> torch.Tensor:
+        n = packed.shape[0]
+        planes = self._unpack(packed).to(torch.float32)
         if self._divide:
-            values = byte_part.to(torch.float32) / self._scales
+            timer_values = steps.to(torch.float32) / self._timer_scales
         else:
-            values = self._tables[self._table_rows, byte_part.long()]
+            timer_values = self._timer_tables[self._timer_rows, steps.long()]
+        bits = len(_BIT_CHANNELS)
+        obs = torch.empty((n, *OBS_SHAPE), dtype=torch.float32, device=packed.device)
         # index_copy_ with a device index (not a Python list), so this can run in a CUDA graph
-        obs.index_copy_(1, self._byte_channels, values)
-        obs[:, _REWARD_CHANNEL] = reward_part
-        obs[:, _SPEED_CHANNEL] = speed_part.view(n, 1, 1)
+        obs.index_copy_(1, self._bit_channels, planes[:, :bits])
+        obs.index_copy_(1, self._timer_channels, planes[:, bits:] * timer_values.view(n, -1, 1, 1))
+        obs[:, _VALUE_CHANNEL] = self._values[index.long()]
+        obs[:, _SPEED_CHANNEL] = speed.view(n, 1, 1)
         return obs
 
     def mismatches(self) -> int:
@@ -78,8 +134,18 @@ class ObsCodec:
         return int(self._mismatches.item())
 
     @staticmethod
+    def stores(rows: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """Empty storage for `rows` encoded observations (the parts encode() returns)."""
+        return (
+            torch.zeros((rows, _PACKED_BYTES), dtype=torch.uint8, device=device),
+            torch.zeros((rows, len(_TIMER_CHANNELS)), dtype=torch.uint8, device=device),
+            torch.zeros((rows, _H, _W), dtype=torch.uint8, device=device),
+            torch.zeros(rows, dtype=torch.float32, device=device),
+        )
+
+    @staticmethod
     def bytes_per_obs() -> int:
-        return len(_BYTE_CHANNELS) * _H * _W + _H * _W * 4 + 4
+        return _PACKED_BYTES + len(_TIMER_CHANNELS) + _CELLS + 4
 
 
 class Batch(NamedTuple):
@@ -116,12 +182,7 @@ class ReplayStorage:
             self._obs = torch.zeros((self._rows, *OBS_SHAPE), dtype=torch.float32, device=device)
             self._obs_stores = (self._obs,)
         else:
-            self._obs_bytes = torch.zeros(
-                (self._rows, len(_BYTE_CHANNELS), _H, _W), dtype=torch.uint8, device=device
-            )
-            self._obs_reward = torch.zeros((self._rows, _H, _W), dtype=torch.float32, device=device)
-            self._obs_speed = torch.zeros(self._rows, dtype=torch.float32, device=device)
-            self._obs_stores = (self._obs_bytes, self._obs_reward, self._obs_speed)
+            self._obs_stores = ObsCodec.stores(self._rows, device)
         self._action = torch.zeros(capacity, dtype=torch.long, device=device)
         # Rewards are kept (and scaled) in float64 like the original Python code did, except on
         # MPS, which has no float64; rewards are integers, so float32 holds them exactly too.

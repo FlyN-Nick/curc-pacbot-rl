@@ -19,9 +19,9 @@ GAMMA = 0.9
 
 
 def marked_obs(markers: list[int]) -> torch.Tensor:
-    """Observations told apart by channel 1 (stored exactly), the rest valid 0/1 values."""
+    """Observations told apart by channel 15 (one float32 per observation, stored exactly)."""
     obs = torch.zeros((len(markers), *OBS_SHAPE))
-    obs[:, 1, 0, 0] = torch.tensor(markers, dtype=torch.float32)
+    obs[:, 15] = torch.tensor(markers, dtype=torch.float32).view(-1, 1, 1)
     return obs
 
 
@@ -47,7 +47,7 @@ class NStepTests(unittest.TestCase):
             storage, log = fill(device, n)
             total = len(log)
             batch = storage.sample(storage.capacity - (n - 1) * ENVS)
-            starts = (batch.obs[:, 1, 0, 0].round().long() - 1).tolist()  # O(t - E) is marked t + 1
+            starts = (batch.obs[:, 15, 0, 0].round().long() - 1).tolist()  # O(t - E) is marked t + 1
             # Every transition that has n steps after it stored, once each
             self.assertEqual(sorted(starts), list(range(total - CAPACITY, total - (n - 1) * ENVS)))
             for i, t in enumerate(starts):
@@ -63,7 +63,7 @@ class NStepTests(unittest.TestCase):
                 self.assertEqual(batch.action[i].item(), log[t][0], (device, t))
                 if not done:
                     self.assertEqual(batch.next_action_mask[i].tolist(), log[last][3], (device, t))
-                    self.assertEqual(batch.next_obs[i, 1, 0, 0].item(), last + ENVS + 1, (device, t))
+                    self.assertEqual(batch.next_obs[i, 15, 0, 0].item(), last + ENVS + 1, (device, t))
 
     def test_one_step_is_unchanged(self):
         self.check(1)

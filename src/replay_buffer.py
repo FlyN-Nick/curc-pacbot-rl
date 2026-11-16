@@ -7,6 +7,8 @@ import numpy as np
 
 import pacbot_rs
 
+from policies import ghost_aware_epsilons
+
 from utils import ghost_next_obs, random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
@@ -30,8 +32,11 @@ class ReplayBuffer(Generic[P]):
         device: torch.device = torch.device("cpu"),
         storage: "ReplayStorage | None" = None,
         random_pellet_removal: bool = False,
+        near_ghost_epsilon: "tuple[float, int] | None" = None,
     ) -> None:
         """
+        With `near_ghost_epsilon` (exploration rate, radius), the policy (an EpsilonGreedy)
+        explores at that rate near dangerous ghosts (see policies.ghost_aware_epsilons).
         With `storage` (a replay_storage.ReplayStorage), transitions go there, and are sampled
         with sample(); otherwise they're kept as ReplayItems, sampled with sample_batch().
         """
@@ -40,6 +45,7 @@ class ReplayBuffer(Generic[P]):
         self.storage = storage
         self.policy = policy
         self.device = device
+        self.near_ghost_epsilon = near_ghost_epsilon
 
         # Initialize the environments. The first `random_start_proportion` of them start each
         # game after the first from a random Pacman position, on a board with half its pellets
@@ -87,7 +93,14 @@ class ReplayBuffer(Generic[P]):
         # Choose an action using the provided policy.
         action_masks = [replay_buffer_action_mask(env) for env in self._envs]
         action_masks = torch.from_numpy(np.stack(action_masks)).to(self.device)
-        actions = self.policy(self._last_obs, action_masks).tolist()
+        if self.near_ghost_epsilon is None:
+            actions = self.policy(self._last_obs, action_masks).tolist()
+        else:
+            epsilons = ghost_aware_epsilons(
+                self.policy.epsilon, [env.nearest_danger_distance() for env in self._envs],
+                *self.near_ghost_epsilon,
+            )
+            actions = self.policy(self._last_obs, action_masks, epsilons).tolist()
 
         # Step every environment (resetting finished ones, in order, as before), then move all
         # the new observations to the device in one transfer instead of one per environment.

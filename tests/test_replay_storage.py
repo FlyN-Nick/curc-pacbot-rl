@@ -34,11 +34,12 @@ def real_observations(games: int = 40, steps: int = 300) -> torch.Tensor:
 
     C = PacmanGymConfiguration
     starts = [C({}), C({"random_start": True}), C({"random_start": True, "randomize_ghosts": True}),
-              C({"random_ticks": True})]
+              C({"random_ticks": True}), C({"random_start": True, "random_pellet_removal": True})]
     rng = random.Random(0)
     out = []
     for game in range(games):
         env = PacmanGym(starts[game % len(starts)])
+        env.ghost_next_obs = game % 3 == 2
         for step in range(steps):
             for config in (C({}), C({"obs_ignore_super_pellets": True})):
                 out.append(env.obs_numpy(config))
@@ -70,8 +71,16 @@ class ObsCodecTests(unittest.TestCase):
         obs = self.obs[:4].to(DEVICES[-1]).clone()
         obs[0, 5, 3, 3] = 0.5  # a 0/1 channel
         obs[1, 12, 2, 2] = 0.123  # not a whole number of steps
+        obs[2, 1, 4, 4] = 0.3  # not a square's value
         codec.encode(obs)
-        self.assertEqual(codec.mismatches(), 2)
+        self.assertEqual(codec.mismatches(), 3)
+
+    def test_observations_exercise_every_part(self):
+        """The real observations include frightened ghosts, timers and ghosts' values."""
+        obs = self.obs
+        for c in (12, 13, 14):
+            self.assertTrue((obs[:, c] > 0).any(), c)
+        self.assertTrue((obs[:, 1] >= 1).any())  # a frightened ghost's value (2**combo)
 
 
 class ReplayStorageTests(unittest.TestCase):
@@ -130,10 +139,11 @@ class ReplayStorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 storage.sample_indices(51)
 
-    def test_memory_is_about_a_third(self):
+    def test_memory_is_a_small_fraction(self):
         storage = ReplayStorage(1000, 32, torch.device("cpu"))
         float32_bytes = 1000 * int(np.prod(OBS_SHAPE)) * 4
-        self.assertLess(storage.memory_bytes(), 0.32 * float32_bytes)
+        # 2.5 KB per observation, 5% of float32; the transitions' other columns are ~0.1 KB
+        self.assertLess(storage.memory_bytes(), 0.06 * float32_bytes)
 
 
 if __name__ == "__main__":

@@ -530,6 +530,20 @@ impl PacmanGym {
         on_board.map(|g| distance(g.loc) as i32).sum::<i32>() < 30
     }
 
+    /// Maze distance, in squares, from Pacman to the nearest ghost that can catch him: one on
+    /// the maze that isn't frightened. None if there is none (e.g. all frightened or in the pen).
+    pub fn nearest_danger_distance(&self) -> Option<u8> {
+        let p = self.game_state.pacman_loc;
+        let pacman = coords_to_node((p.row, p.col))?;
+        self.game_state
+            .ghosts
+            .iter()
+            .filter(|g| !g.is_frightened())
+            .filter_map(|g| coords_to_node((g.loc.row, g.loc.col)))
+            .map(|ghost| DISTANCE_MATRIX[pacman][ghost])
+            .min()
+    }
+
     pub fn remaining_pellets(&self) -> u16 {
         self.game_state.get_num_pellets()
     }
@@ -820,6 +834,11 @@ impl PacmanGym {
     #[pyo3(name = "are_ghosts_close")]
     pub fn py_are_ghosts_close(&self) -> bool {
         self.are_ghosts_close()
+    }
+
+    #[pyo3(name = "nearest_danger_distance")]
+    pub fn py_nearest_danger_distance(&self) -> Option<u8> {
+        self.nearest_danger_distance()
     }
 
     #[pyo3(name = "remaining_pellets")]

@@ -19,7 +19,11 @@ import policies
 import replay_buffer
 import utils
 from policies import MaxQPolicy
+from replay_storage import square_values
 from utils import NUM_ACTIONS, OBS_SHAPE, PacmanGymConfiguration
+
+
+_SQUARE_VALUES = square_values()[::3]
 
 
 class FakeEnv:
@@ -62,7 +66,8 @@ class FakeEnv:
         obs = np.zeros(OBS_SHAPE, dtype=np.float32)
         s = self.state
         obs[0, s % 28, s % 31] = 1.0
-        obs[1, (s // 3) % 28, (s // 5) % 31] = (s % 13) / 13
+        # A value a real square can hold (replay storage stores only those)
+        obs[1, (s // 3) % 28, (s // 5) % 31] = _SQUARE_VALUES[s % 13]
         obs[15] = (s % 9) / 12
         if not config.obs_ignore_super_pellets:
             obs[16, s % 2, s % 3] = 1.0
