@@ -139,6 +139,56 @@ class ReplayStorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 storage.sample_indices(51)
 
+    def test_saved_memory_restores_with_new_games(self):
+        """state_dict() / load_state_dict(), through torch.save: the stored transitions come
+        back, each saved game's last transition ends it, and the new games follow on."""
+        import io
+
+        new_starts = real_observations(games=2, steps=10)[:8]
+        for device in DEVICES:
+            saved = self.collect(device, 50, 40).storage
+            file = io.BytesIO()
+            torch.save(saved.state_dict(), file)
+            file.seek(0)
+            restored = ReplayStorage(50, 8, device)
+            restored.set_initial_obs(new_starts)
+            restored.load_state_dict(torch.load(file, weights_only=False))
+            self.assertEqual((restored.total, len(restored)), (saved.total, len(saved)))
+            last_step = range(saved.total - 8, saved.total)
+            for t in range(saved.total - len(saved), saved.total):
+                want, got = saved.transition(t), restored.transition(t)
+                self.assertTrue(torch.equal(got["obs"], want["obs"]), (device, t))
+                for key in ("action", "reward", "next_action_mask"):
+                    self.assertEqual(got[key], want[key], (device, t, key))
+                if t in last_step:
+                    self.assertTrue(got["done"], (device, t))
+                    self.assertIsNone(got["next_obs"], (device, t))
+                else:
+                    self.assertEqual(got["done"], want["done"], (device, t))
+                    if not want["done"]:
+                        self.assertTrue(torch.equal(got["next_obs"], want["next_obs"]), (device, t))
+            # The new games' first transitions start from their starting observations
+            next_obs = real_observations(games=2, steps=10)[8:16]
+            restored.add_step(next_obs, [0] * 8, [10] * 8, [False] * 8, [[True] * NUM_ACTIONS] * 8)
+            for i in range(8):
+                got = restored.transition(saved.total + i)
+                self.assertTrue(torch.equal(got["obs"].cpu(), new_starts[i]), (device, i))
+                self.assertTrue(torch.equal(got["next_obs"].cpu(), next_obs[i]), (device, i))
+            restored.set_n_step(3, 0.9)
+            self.assertEqual(restored.sample(16).obs.shape[0], 16)
+            self.assertEqual(restored.codec.mismatches(), 0)
+
+    def test_restore_checks_it_fits(self):
+        state = self.collect(torch.device("cpu"), 50, 10).storage.state_dict()
+        starts = real_observations(games=2, steps=10)[:8]
+        other = ReplayStorage(60, 8, torch.device("cpu"))
+        other.set_initial_obs(starts)
+        with self.assertRaises(ValueError):
+            other.load_state_dict(state)
+        used = self.collect(torch.device("cpu"), 50, 3).storage
+        with self.assertRaises(RuntimeError):
+            used.load_state_dict(state)
+
     def test_memory_is_a_small_fraction(self):
         storage = ReplayStorage(1000, 32, torch.device("cpu"))
         float32_bytes = 1000 * int(np.prod(OBS_SHAPE)) * 4

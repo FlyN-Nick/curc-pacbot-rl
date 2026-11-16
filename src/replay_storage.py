@@ -231,8 +231,11 @@ class ReplayStorage:
 
     def _write_obs(self, first_row: int, obs: torch.Tensor) -> None:
         obs = obs.to(self.device)
-        parts = (obs,) if self._plain_obs else self.codec.encode(obs)
-        for dst, end, src in self._ranges(first_row, obs.shape[0], self._rows):
+        self._write_parts(first_row, (obs,) if self._plain_obs else self.codec.encode(obs))
+
+    def _write_parts(self, first_row: int, parts) -> None:
+        """Writes stored observations (one tensor per store) from row `first_row` on."""
+        for dst, end, src in self._ranges(first_row, parts[0].shape[0], self._rows):
             for store, part in zip(self._obs_stores, parts):
                 store[dst:end] = part[src:src + end - dst]
 
@@ -287,6 +290,49 @@ class ReplayStorage:
             for column, values in columns:
                 column[dst:end] = values[src:src + end - dst]
         self.total += n
+
+    def state_dict(self) -> dict:
+        """
+        Everything stored, as CPU tensors, for saving a paused run's replay memory to disk
+        (see load_state_dict).
+        """
+        return {
+            "capacity": self.capacity,
+            "num_envs": self.num_envs,
+            "plain_obs": self._plain_obs,
+            "total": self.total,
+            "obs": [t.cpu() for t in self._obs_stores],
+            "action": self._action.cpu(),
+            "reward": self._reward.cpu(),
+            "done": self._done.cpu(),
+            "next_mask": self._next_mask.cpu(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """
+        Restores the transitions of state_dict() into storage that has only its environments'
+        starting observations so far (set_initial_obs(), then nothing added). Those games
+        continue from here; the saved games were cut off, so each one's last stored
+        transition is marked as the end of its game, as nothing will follow it.
+        """
+        for key, mine in (("capacity", self.capacity), ("num_envs", self.num_envs),
+                          ("plain_obs", self._plain_obs)):
+            if state[key] != mine:
+                raise ValueError(f"saved replay memory has {key} {state[key]}, this run {mine}")
+        if not self._initialized or self.total:
+            raise RuntimeError("load_state_dict() needs fresh storage with its starting observations")
+        start = [store[:self.num_envs].clone() for store in self._obs_stores]
+        for store, saved in zip(self._obs_stores, state["obs"]):
+            store.copy_(saved)
+        for column, key in ((self._action, "action"), (self._reward, "reward"),
+                            (self._done, "done"), (self._next_mask, "next_mask")):
+            column.copy_(state[key].to(column.dtype))
+        self.total = state["total"]
+        if self.total:
+            last = (torch.arange(self.total - self.num_envs, self.total) % self.capacity).to(self.device)
+            self._done[last] = True
+        # The current games' observations follow the last stored step
+        self._write_parts(self.total, start)
 
     def sample_indices(self, batch_size: int) -> BatchIndices:
         """Indices of `batch_size` distinct stored transitions, chosen uniformly."""

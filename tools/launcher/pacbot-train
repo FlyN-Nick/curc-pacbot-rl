@@ -12,12 +12,13 @@
 #   ../.venv/bin/python -m algorithms.train_dqn --checkpoint-dir checkpoints/NAME ARGS...
 # from that checkout's src/, logging to src/checkpoints/NAME/train.log. Starting a NAME again
 # resumes it from its latest checkpoint; a run that finished leaves a `done` file and isn't
-# started again.
+# started again. A run that's stopped or paused saves a checkpoint and its replay memory first,
+# so it resumes exactly where it stopped.
 #
 # At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way.
 # Waiting runs start in the order they were queued. The machine's owner sets how many of
 # those may be teammates' runs with pacbot-capacity; when it goes down, the newest teammate
-# runs stop at their latest checkpoint and wait, and resume from it once there's room.
+# runs stop (saving as above) and wait, and resume once there's room.
 set -euo pipefail
 
 STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
@@ -117,10 +118,13 @@ must_pause() {
   return 1
 }
 
-stop_training() {  # kill the training process group and wait for it
+stop_training() {  # stop a training run and wait for it
   local pid=$1 i
-  kill -TERM -- "-$pid" 2>/dev/null || true
-  for i in $(seq 60); do alive "$pid" || return 0; sleep 1; done
+  # SIGTERM to the training process alone: it saves a checkpoint and its replay memory, then
+  # shuts its worker processes down itself (a signal to them would cut it off mid-step).
+  # Saving a large replay memory takes a while; after 10 minutes, the whole group is killed.
+  kill -TERM -- "$pid" 2>/dev/null || true
+  for i in $(seq 600); do alive "$pid" || return 0; sleep 1; done
   kill -KILL -- "-$pid" 2>/dev/null || true
 }
 

@@ -22,11 +22,44 @@ from pacbot_rs import PacmanGym
 
 
 _exit_requested = False
+_exit_signal = 0
 
+# A run stopped by Ctrl-C (SIGINT) or SIGTERM (kill PID, the launcher's stop and pause) saves
+# a checkpoint and its replay memory at the start of the next iteration, then exits with
+# 128 + the signal number. Resumed with --finetune from that checkpoint, it continues where it
+# stopped, with the same replay memory and target network (see save_replay / load_replay).
 def _request_exit(signum, frame):
-    global _exit_requested
+    global _exit_requested, _exit_signal
     _exit_requested = True
-    print("\nExit requested — saving checkpoint before stopping...")
+    _exit_signal = signum
+    print("\nExit requested — saving checkpoint and replay memory before stopping...")
+
+
+def replay_path() -> Path:
+    return Path(args.checkpoint_dir) / "replay.pt"
+
+
+def save_replay(storage: "ReplayStorage", iter_num: int) -> None:
+    start = time.perf_counter()
+    atomic_torch_save({"iter_num": iter_num, "storage": storage.state_dict()}, replay_path())
+    print(f"Replay memory saved ({len(storage)} transitions, "
+          f"{replay_path().stat().st_size / 2**20:.0f} MiB, {time.perf_counter() - start:.0f}s)")
+
+
+def load_replay(storage: "ReplayStorage") -> None:
+    """Restores the replay memory a stopped run saved, if it was saved with the checkpoint
+    this run resumes from; then deletes it, as it's out of date once training continues."""
+    path = replay_path()
+    if not (args.finetune and path.exists()):
+        return
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    if saved["iter_num"] != resume_iter:
+        print(f"Not restoring {path}: saved at iter {saved['iter_num']}, resuming at {resume_iter}")
+        return
+    storage.load_state_dict(saved["storage"])
+    del saved
+    path.unlink()
+    print(f"Restored the replay memory ({len(storage)} transitions) from {path}")
 
 
 def best_eval_kind() -> str:
@@ -195,6 +228,7 @@ if __name__ == "__main__":
     resume_iter = 0
     resume_epsilon = 0
     resume_optimizer_state = None
+    resume_target_state = None
     resume_best_eval_score = -float("inf")
     if args.finetune:
         # Load checkpoint. Support two formats:
@@ -213,6 +247,8 @@ if __name__ == "__main__":
                 resume_iter = int(loaded.get("iter_num", 0))
                 resume_epsilon = loaded.get("epsilon", None)
                 resume_optimizer_state = loaded.get("optimizer_state_dict", None)
+                # Saved when a run is stopped (see _request_exit)
+                resume_target_state = loaded.get("target_state_dict", None)
                 if loaded.get("best_eval_kind") == best_eval_kind():
                     # Scores from other evaluations (a single game, or another number of
                     # games per speed) aren't comparable
@@ -424,6 +460,8 @@ def train():
             if replay_buffer.storage is None:
                 raise SystemExit("--n_step needs the replay storage")
             replay_buffer.storage.set_n_step(wandb.config.n_step, wandb.config.discount_factor)
+        if replay_buffer.storage is not None:
+            load_replay(replay_buffer.storage)
         _train(replay_buffer, evaluator, actors)
     finally:
         for resource in (replay_buffer, evaluator):
@@ -475,8 +513,12 @@ def _train(replay_buffer, evaluator, actors: bool):
         return metadata
 
     prev_sigint = signal.signal(signal.SIGINT, _request_exit)
+    prev_sigterm = signal.signal(signal.SIGTERM, _request_exit)
 
     target_q_net = copy.deepcopy(q_net)
+    if resume_target_state is not None:
+        target_q_net.load_state_dict(resume_target_state)
+        print("Restored the target network from checkpoint")
     target_q_net.eval()
     q_net.train()
     update = (GraphedUpdate if graphed else EagerUpdate)(
@@ -515,8 +557,13 @@ def _train(replay_buffer, evaluator, actors: bool):
             deferred_metrics.flush()
             checkpoint_dir = Path(args.checkpoint_dir)
             checkpoint_dir.mkdir(exist_ok=True)
+            if replay_buffer.storage is not None:
+                save_replay(replay_buffer.storage, iter_num)
+            metadata = build_metadata(iter_num)
+            metadata["target_state_dict"] = target_q_net.state_dict()
+            # The checkpoint last, so a resume never finds it without its replay memory
             metadata_path = checkpoint_dir / "q_net-latest.ckpt.pt"
-            atomic_torch_save(build_metadata(iter_num), metadata_path)
+            atomic_torch_save(metadata, metadata_path)
             shutil.copyfile(metadata_path, checkpoint_dir / f"q_net-iter{iter_num:07}.ckpt.pt")
             print(f"Checkpoint saved at iter {iter_num}.")
             break
@@ -627,7 +674,11 @@ def _train(replay_buffer, evaluator, actors: bool):
                 consider_candidate(candidate_iter, results, snapshot, metrics)
             if metrics:
                 wandb.log(metrics)
+    if not _exit_requested:
+        # Finished: a replay memory saved by an earlier stop is out of date
+        replay_path().unlink(missing_ok=True)
     signal.signal(signal.SIGINT, prev_sigint)
+    signal.signal(signal.SIGTERM, prev_sigterm)
 
 
 @torch.no_grad()
@@ -686,6 +737,9 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             pass
         wandb.finish()
+        if _exit_requested:
+            # Not finished: the queue scripts and the launcher only mark a run done on exit 0
+            raise SystemExit(128 + _exit_signal)
 
     if not args.no_eval:
         while True:
