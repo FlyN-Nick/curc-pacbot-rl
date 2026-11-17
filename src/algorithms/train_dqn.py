@@ -81,6 +81,7 @@ from dqn_update import EagerUpdate, GraphedUpdate, set_capturable, set_learning_
 from timing import time_block
 from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, TRAINING_SPEEDS, NORMAL_SPEED
 import parallel_training
+from search_distill import SearchTargets
 
 
 # Everything that runs the script is under this guard: worker processes (see
@@ -162,6 +163,10 @@ if __name__ == "__main__":
         parser.error("--epsilon_near_ghost must be at most 1 (or negative: off)")
     if args.near_ghost_radius < 1:
         parser.error("--near_ghost_radius must be at least 1")
+    if args.search_workers > 0 and (args.num_actors < 1 or not args.single_model):
+        parser.error("--search_workers needs --single-model and actor processes (--num-actors)")
+    if args.search_workers > 0 and args.search_depth < 1:
+        parser.error("--search_depth must be at least 1")
     if not hasattr(models, args.model):
         parser.error(f"Invalid --model: {args.model!r} (must be a class in models.py)")
 
@@ -357,7 +362,7 @@ class DeferredMetrics:
     clip_grad_norm_(error_if_nonfinite=True) would otherwise do with a wait of its own.
     """
 
-    names = ("loss", "grad_norm", "avg_predicted_value", "avg_target_q_value")
+    names = ("loss", "grad_norm", "avg_predicted_value", "avg_target_q_value", "search_loss")
 
     def __init__(self, device: torch.device, reward_scale: float):
         self.device = device
@@ -423,6 +428,7 @@ def train():
     actors = args.num_actors > 0
     evaluator = None
     replay_buffer = None
+    search_targets = None
     # Until training starts (e.g. while the replay memory fills), a stop exits right away, through
     # the `finally` below, so the worker processes are shut down too; _train then saves first.
     prev_sigterm = signal.signal(signal.SIGTERM, _stop_now)
@@ -469,16 +475,35 @@ def train():
             replay_buffer.storage.set_n_step(wandb.config.n_step, wandb.config.discount_factor)
         if replay_buffer.storage is not None:
             load_replay(replay_buffer.storage)
-        _train(replay_buffer, evaluator, actors)
+        if wandb.config.search_workers > 0:
+            # Searchers play with the weights published to the actors (see search_distill)
+            search_targets = SearchTargets(
+                replay_buffer.weights_source(),
+                num_workers=wandb.config.search_workers,
+                capacity=wandb.config.search_capacity,
+                device=device,
+                model_name=wandb.config.model,
+                depth=wandb.config.search_depth,
+                reward_scale=wandb.config.reward_scale,
+                discount=wandb.config.discount_factor,
+                epsilon=wandb.config.search_epsilon,
+                random_start_proportion=wandb.config.random_start_proportion,
+                random_pellet_removal=wandb.config.random_pellet_removal,
+            )
+            print(f"Search distillation: {wandb.config.search_workers} searchers, depth "
+                  f"{wandb.config.search_depth}, weight {wandb.config.search_weight}")
+        _train(replay_buffer, evaluator, actors, search_targets)
     finally:
         signal.signal(signal.SIGTERM, prev_sigterm)
-        for resource in (replay_buffer, evaluator):
+        for resource in (search_targets, replay_buffer, evaluator):
             if hasattr(resource, "close"):
                 resource.close()
 
 
-def _train(replay_buffer, evaluator, actors: bool):
+def _train(replay_buffer, evaluator, actors: bool, search_targets: "SearchTargets | None" = None):
     replay_buffer.fill()
+    if search_targets is not None:
+        search_targets.drain(at_least=wandb.config.search_batch_size)
     replay_buffer.policy.epsilon = float(resume_epsilon) if resume_epsilon is not None else wandb.config.initial_epsilon
 
     # Initialize the optimizer. Replaying the update as a CUDA graph needs Adam's capturable
@@ -537,6 +562,9 @@ def _train(replay_buffer, evaluator, actors: bool):
         grad_clip_norm=wandb.config.grad_clip_norm,
         huber_delta=wandb.config.huber_delta,
         bf16=args.bf16,
+        search_targets=search_targets,
+        search_batch_size=wandb.config.search_batch_size,
+        search_weight=wandb.config.search_weight,
     )
     print(f"Updates: {'CUDA graph' if graphed else 'eager'}")
 
@@ -593,7 +621,12 @@ def _train(replay_buffer, evaluator, actors: bool):
         with time_block("Update the network"):
             # Sample a batch (indices drawn on the device; see replay_storage) and update the
             # network on it (see dqn_update)
-            update_metrics = update.run(replay_buffer.storage.sample_indices(wandb.config.batch_size))
+            search_indices = None
+            if search_targets is not None:
+                search_targets.drain()
+                search_indices = search_targets.sample_indices(wandb.config.search_batch_size)
+            update_metrics = update.run(
+                replay_buffer.storage.sample_indices(wandb.config.batch_size), search_indices)
 
         with torch.no_grad():
             # Log metrics. The GPU values are logged by DeferredMetrics a step later.
@@ -602,6 +635,8 @@ def _train(replay_buffer, evaluator, actors: bool):
             }
             if decay_lr:
                 metrics["learning_rate"] = learning_rate(iter_num)
+            if search_targets is not None:
+                metrics["searched_states"] = search_targets.total
             if iter_num % wandb.config.evaluate_steps == 0:
                 # One game, for the learning curve
                 if evaluator is None:

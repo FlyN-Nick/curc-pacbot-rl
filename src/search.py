@@ -32,7 +32,8 @@ class _Node:
 
 class LookaheadPolicy:
     def __init__(self, q_net: torch.nn.Module, depth: int, reward_scale: float, discount: float,
-                 device: torch.device = torch.device("cpu")) -> None:
+                 device: torch.device = torch.device("cpu"),
+                 obs_config: PacmanGymConfiguration = FULL_OBS) -> None:
         if depth < 0:
             raise ValueError(f"depth must be at least 0, got {depth}")
         self.q_net = q_net.eval()
@@ -40,6 +41,7 @@ class LookaheadPolicy:
         self.reward_scale = reward_scale
         self.discount = discount
         self.device = device
+        self.obs_config = obs_config  # the observations the network was trained on
         self.states_searched = 0  # end states scored so far, for measuring cost
 
     @staticmethod
@@ -49,7 +51,7 @@ class LookaheadPolicy:
     @torch.no_grad()
     def _best_q(self, envs: list[PacmanGym]) -> np.ndarray:
         """The best legal action's Q value in each state."""
-        obs = torch.from_numpy(np.stack([e.obs_numpy(FULL_OBS) for e in envs])).to(self.device)
+        obs = torch.from_numpy(np.stack([e.obs_numpy(self.obs_config) for e in envs])).to(self.device)
         masks = torch.tensor([e.action_mask() for e in envs], device=self.device)
         q = self.q_net(obs).masked_fill(~masks, -torch.inf)
         return q.amax(dim=1).float().cpu().numpy()
@@ -58,7 +60,7 @@ class LookaheadPolicy:
         """The searched value of each legal first move, in the network's units."""
         if self.depth == 0:
             with torch.no_grad():
-                obs = torch.from_numpy(env.obs_numpy(FULL_OBS)).to(self.device).unsqueeze(0)
+                obs = torch.from_numpy(env.obs_numpy(self.obs_config)).to(self.device).unsqueeze(0)
                 q = self.q_net(obs)[0].float().cpu().numpy()
             return {a: float(q[a]) for a in self.legal_actions(env)}
 

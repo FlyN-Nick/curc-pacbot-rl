@@ -34,10 +34,17 @@ def dqn_update(
     bf16: str = "none",
     huber_delta: float = 0.0,
     zero_grad: bool = True,
+    search=None,
+    search_weight: float = 0.0,
 ) -> torch.Tensor:
     """
     One update on `batch`. Returns, as one float32 tensor: loss, gradient norm (before
-    clipping), mean of the max predicted Q values and mean target Q value (both unscaled).
+    clipping), mean of the max predicted Q values and mean target Q value (both unscaled),
+    and with `search`, the search loss.
+
+    With `search` (a search_distill.SearchBatch), the loss also has search_weight times the
+    mean squared error between the network's Q values and the searched values, over each
+    searched state's legal moves.
 
     The loss is MSE, or with huber_delta > 0 the Huber loss: quadratic for errors up to
     huber_delta (in scaled reward units, so 1.0 is 1 / reward_scale game points), linear
@@ -46,10 +53,13 @@ def dqn_update(
     device = batch.obs.device
     reward = (batch.reward * reward_scale).float()
     if hasattr(q_net, "quantiles"):
+        if zero_grad:
+            optimizer.zero_grad()
         loss, all_predicted_q_values, target_q_values = _quantile_loss(
             q_net, target_q_net, batch, reward, discount_factor, bf16, huber_delta, device)
+        search_loss = _search_loss(q_net, search, device, bf16)
         return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
-                       reward_scale, grad_clip_norm, zero_grad)
+                       reward_scale, grad_clip_norm, False, search_loss, search_weight)
 
     # Double DQN target: the online network picks the next action, the target network rates it.
     # masked_fill and gather instead of boolean-mask assignment and range indexing: the same
@@ -74,8 +84,19 @@ def dqn_update(
             loss = F.huber_loss(predicted_q_values.float(), target_q_values.float(), delta=huber_delta)
         else:
             loss = F.mse_loss(predicted_q_values.float(), target_q_values.float())
+    search_loss = _search_loss(q_net, search, device, bf16)
     return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
-                   reward_scale, grad_clip_norm, zero_grad=False)
+                   reward_scale, grad_clip_norm, False, search_loss, search_weight)
+
+
+def _search_loss(q_net, search, device, bf16: str):
+    """Mean squared error between Q values and searched values over legal moves, or None."""
+    if search is None:
+        return None
+    with _autocast(device, bf16 in ("update", "all")):
+        q = q_net(search.obs).float()
+    errors = (q - search.values).square() * search.legal
+    return errors.sum() / search.legal.sum().clamp(min=1)
 
 
 def _quantile_loss(q_net, target_q_net, batch: Batch, reward, discount_factor, bf16, huber_delta, device):
@@ -109,21 +130,25 @@ def _quantile_loss(q_net, target_q_net, batch: Batch, reward, discount_factor, b
 
 
 def _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values, reward_scale,
-            grad_clip_norm, zero_grad: bool) -> torch.Tensor:
+            grad_clip_norm, zero_grad: bool, search_loss=None, search_weight: float = 0.0) -> torch.Tensor:
     if zero_grad:
         optimizer.zero_grad()
-    loss.backward()
+    total = loss if search_loss is None else loss + search_weight * search_loss
+    total.backward()
     # A non-finite norm is caught later (error_if_nonfinite would make the CPU wait for the GPU)
     grad_norm = torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=grad_clip_norm)
     optimizer.step()
 
     with torch.no_grad():
-        return torch.stack([
+        metrics = [
             loss.detach().float(),
             grad_norm.detach().float(),
             all_predicted_q_values.detach().float().amax(dim=1).mean() / reward_scale,
             target_q_values.float().mean() / reward_scale,
-        ])
+        ]
+        if search_loss is not None:
+            metrics.append(search_loss.detach().float())
+        return torch.stack(metrics)
 
 
 def set_capturable(optimizer: torch.optim.Optimizer, capturable: bool) -> None:
@@ -157,14 +182,17 @@ def set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
 class EagerUpdate:
     """Runs dqn_update() directly, each iteration."""
 
-    def __init__(self, q_net, target_q_net, optimizer, storage: ReplayStorage, batch_size: int, **kwargs):
+    def __init__(self, q_net, target_q_net, optimizer, storage: ReplayStorage, batch_size: int,
+                 search_targets=None, search_batch_size: int = 0, **kwargs):
         self.args = (q_net, target_q_net, optimizer)
         self.storage = storage
         self.batch_size = batch_size
+        self.search_targets = search_targets
         self.kwargs = kwargs
 
-    def run(self, indices: BatchIndices) -> torch.Tensor:
-        return dqn_update(*self.args, self.storage.gather(indices), **self.kwargs)
+    def run(self, indices: BatchIndices, search_indices: torch.Tensor | None = None) -> torch.Tensor:
+        search = None if search_indices is None else self.search_targets.gather(search_indices)
+        return dqn_update(*self.args, self.storage.gather(indices), search=search, **self.kwargs)
 
 
 class GraphedUpdate:
@@ -179,14 +207,19 @@ class GraphedUpdate:
     """
 
     def __init__(self, q_net, target_q_net, optimizer, storage: ReplayStorage, batch_size: int,
-                 warmup: int = 3, **kwargs):
+                 warmup: int = 3, search_targets=None, search_batch_size: int = 0, **kwargs):
         self.storage = storage
         device = storage.device
         self.indices = storage.sample_indices(batch_size)  # placeholder indices, overwritten
+        # With search distillation, the searched states' indices too (search_targets must
+        # already hold some); the graph gathers from search_targets' fixed tensors
+        self.search_indices = (None if search_targets is None
+                               else search_targets.sample_indices(search_batch_size))
 
         def update(zero_grad: bool):
+            search = None if search_targets is None else search_targets.gather(self.search_indices)
             return dqn_update(q_net, target_q_net, optimizer, storage.gather(self.indices),
-                              zero_grad=zero_grad, **kwargs)
+                              zero_grad=zero_grad, search=search, **kwargs)
 
         params = [p.detach().clone() for p in q_net.parameters()]
         saved_state = {
@@ -219,8 +252,10 @@ class GraphedUpdate:
         with torch.cuda.graph(self.graph):
             self.metrics = update(zero_grad=False)
 
-    def run(self, indices: BatchIndices) -> torch.Tensor:
+    def run(self, indices: BatchIndices, search_indices: torch.Tensor | None = None) -> torch.Tensor:
         for dst, src in zip(self.indices, indices):
             dst.copy_(src)
+        if search_indices is not None:
+            self.search_indices.copy_(search_indices)
         self.graph.replay()
         return self.metrics

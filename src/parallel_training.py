@@ -424,6 +424,11 @@ class ActorReplayBuffer:
             self.close()
             raise
 
+    def weights_source(self) -> tuple[str, Any, int]:
+        """(shared memory name, lock, parameter count) of the weights published to the actors,
+        for other processes that play with them (search_distill)."""
+        return self._shms[0].name, self._weights_lock, sum(p.numel() for p in self._q_net.parameters())
+
     def _new_shm(self, size: int) -> shared_memory.SharedMemory:
         shm = shared_memory.SharedMemory(create=True, size=size)
         self._shms.append(shm)

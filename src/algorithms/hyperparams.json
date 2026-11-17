@@ -23,5 +23,11 @@
     "reward_scale": 0.02,
     "grad_clip_norm": 10000,
     "huber_delta": 0.0,
+    "search_workers": 0,
+    "search_depth": 3,
+    "search_weight": 1.0,
+    "search_batch_size": 64,
+    "search_capacity": 20000,
+    "search_epsilon": 0.05,
     "model": "QNetV2"
 }
