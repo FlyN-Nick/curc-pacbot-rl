@@ -415,10 +415,17 @@ def cpu_copy(obj):
     return copy.deepcopy(obj)
 
 
+def _stop_now(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def train():
     actors = args.num_actors > 0
     evaluator = None
     replay_buffer = None
+    # Until training starts (e.g. while the replay memory fills), a stop exits right away, through
+    # the `finally` below, so the worker processes are shut down too; _train then saves first.
+    prev_sigterm = signal.signal(signal.SIGTERM, _stop_now)
     try:
         if args.eval_workers > 0:
             evaluator = parallel_training.BackgroundEvaluator(
@@ -464,6 +471,7 @@ def train():
             load_replay(replay_buffer.storage)
         _train(replay_buffer, evaluator, actors)
     finally:
+        signal.signal(signal.SIGTERM, prev_sigterm)
         for resource in (replay_buffer, evaluator):
             if hasattr(resource, "close"):
                 resource.close()
