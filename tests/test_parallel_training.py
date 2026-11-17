@@ -3,6 +3,8 @@ Tests for parallel_training's actor processes and background evaluation workers,
 real environment. Run from the repository root with PYTHONPATH=src.
 """
 
+import subprocess
+import sys
 import time
 import unittest
 
@@ -165,6 +167,24 @@ class BackgroundEvaluatorTests(unittest.TestCase):
                 evaluator.submit_candidate(1, models.QNetV2(OBS_SHAPE, NUM_ACTIONS), [8], None, games_per_speed=0)
         finally:
             evaluator.close()
+
+    def test_process_exits_after_closing_with_games_still_queued(self):
+        # The worker is gone and candidate games are still queued (as when a run stops while
+        # a candidate is being evaluated): the process must still be able to exit
+        script = (
+            "import models, parallel_training\n"
+            "from utils import NUM_ACTIONS, OBS_SHAPE\n"
+            "if __name__ == '__main__':\n"
+            "    q = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)\n"
+            "    ev = parallel_training.BackgroundEvaluator(1, 'QNetV2', env_version=2)\n"
+            "    ev._procs[0].terminate(); ev._procs[0].join()\n"
+            "    for i in range(10):\n"
+            "        ev.submit_candidate(i, q, [8, 10, 12], None, games_per_speed=2)\n"
+            "    ev.close()\n"
+        )
+        result = subprocess.run([sys.executable, "-c", script], timeout=120, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
 
 if __name__ == "__main__":
     unittest.main()
