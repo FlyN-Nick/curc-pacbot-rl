@@ -236,6 +236,10 @@ class BackgroundEvaluator:
             proc.join(timeout=10)
             if proc.is_alive():
                 proc.terminate()
+        # Drop the tasks no worker took (games of candidates still queued when a run stops):
+        # otherwise the queue's feeder thread blocks the process's exit, writing them into a
+        # pipe no one reads any more
+        self._tasks.cancel_join_thread()
 
 
 # ── Actors ───────────────────────────────────────────────────────────────────────
