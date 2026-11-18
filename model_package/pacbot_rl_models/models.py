@@ -268,3 +268,29 @@ class QRNetV2(nn.Module):
 
     def forward(self, input_batch: torch.Tensor) -> torch.Tensor:
         return self.quantiles(input_batch).mean(dim=2)
+
+
+class PVNetV2(nn.Module):
+    """
+    A policy and value network for AlphaZero-style training (src/algorithms/train_alphazero.py),
+    with QNetV2's backbone: forward returns (policy logits (B, action_count), value (B,)).
+    Both heads output zeros at the start (a uniform policy, value 0).
+    """
+
+    WIDTHS = (16, 32, 64, 128)
+    FC_WIDTH = 256
+
+    def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
+        super().__init__()
+        self.backbone = _v2_backbone(obs_shape[0], self.WIDTHS, self.FC_WIDTH)
+        self.policy_head = nn.Linear(self.FC_WIDTH, action_count)
+        self.value_head = nn.Linear(self.FC_WIDTH, 1)
+        init_orthogonal(self)
+        with torch.no_grad():
+            for linear_layer in (self.policy_head, self.value_head):
+                linear_layer.weight.fill_(0)
+                linear_layer.bias.fill_(0)
+
+    def forward(self, input_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.backbone(input_batch)
+        return self.policy_head(features), self.value_head(features).squeeze(1)

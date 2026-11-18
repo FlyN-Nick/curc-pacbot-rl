@@ -67,6 +67,25 @@ You can also change **hyperparameters** with command-line arguments. To see the 
  - `--single-model` trains one network that plays the whole game, super pellets included, instead of handing control to the fixed super pellet model (`checkpoints_known/superpelletmode.safetensors`) whenever ghosts are close or frightened. Checkpoints record it, and the evaluation scripts play them the same way. The robot client (`bot_client/dqn_module.py`) doesn't support single-model checkpoints yet.
  - A game from the normal start is deterministic: the ghosts have no randomness, and the only thing that varies between training games is Pacman's speed (4 to 14 game ticks per action, 8 being normal). So repeating an evaluation game gives the same game. Every `best_eval_steps` iterations (and at the last one), the current network plays one game at each of those 11 speeds, and the one with the best mean score so far is saved as `q_net-best.ckpt.pt` (logged as `candidate_mean_score`, with `candidate_min_score`, `candidate_normal_speed_score` and `best_eval_mean_score`). The single games every `evaluate_steps` iterations, at the normal speed, draw the learning curve; from one checkpoint to the next their score jumps around a lot.
 
+### AlphaZero-style training (Gumbel search)
+
+`src/algorithms/train_alphazero.py` trains a policy and value network (`--model PVNetV2`) with
+Gumbel AlphaZero search through the real game (`pacbot_rs.gumbel_search`, in
+`pacbot_rs/src/gumbel.rs`): many games are searched at once, one network call per simulation
+wave, and the network learns the search's improved policy and 10-step returns bootstrapped from
+the search's value. Games start as in DQN training (random speed, some random starts) and end
+at the first lost life. Rebuild `pacbot_rs` first (`maturin develop --release` in `pacbot_rs/`).
+
+```sh
+cd src
+RAYON_NUM_THREADS=4 PYTHONPATH=.:../model_package python -m algorithms.train_alphazero --checkpoint-dir checkpoints/az1
+```
+
+It evaluates on fixed-seed games at every speed, with the network alone and with search, and
+keeps `model-best.ckpt.pt` and `model-best-search.ckpt.pt`. SIGTERM or Ctrl-C saves
+`model-latest.ckpt.pt`; `--resume` continues from it. `RAYON_NUM_THREADS` sets the search's
+CPU threads (on a busy machine, fewer is faster).
+
 ### Weights & Biases setup
 
 Training logs metrics to the `pacbot-ind-study` project and uploads a checkpoint as a model artifact every 1,000 iterations. `wandb` is already installed by `uv sync`. To set it up once per machine:
