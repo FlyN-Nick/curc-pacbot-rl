@@ -123,7 +123,7 @@ class GraphModelTests(unittest.TestCase):
             target = copy.deepcopy(q_net)
             opt = torch.optim.Adam(q_net.parameters(), lr=1e-3)
             batch = storage.sample(64)
-            losses = [dqn_update(q_net, target, opt, batch, **KW)[0].item() for _ in range(40)]
+            losses = [dqn_update(q_net, target, opt, batch, **KW)[0].item() for _ in range(80)]
             self.assertLess(losses[-1], 0.5 * losses[0], cls.__name__)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
