@@ -33,6 +33,7 @@ def random_states(n, seed=0, max_moves=300):
     states = []
     while len(states) < n:
         env = utils.make_gym(utils.speed_configuration(rng.randint(4, 14)), utils.ENV_VERSION)
+        env.seed = rng.randrange(2**63)  # the same states every run
         for _ in range(rng.randint(0, max_moves)):
             mask = env.action_mask()
             _, done = env.step(rng.choice([a for a in range(NUM_ACTIONS) if mask[a]]))
@@ -124,13 +125,14 @@ class GumbelSearchTests(unittest.TestCase):
         self.assertTrue(all(n <= 10 for n in calls))
 
     def test_finds_the_best_move_when_one_loses_a_life(self):
-        # Against exhaustive 3-move lookahead through the real game (value 0 after): the
-        # search's move is (nearly) the best, and a move that loses a life at once is avoided
-        # whenever another is clearly better
+        # Against exhaustive 3-move lookahead through the real game (value 0 after), with the
+        # search also stopping 3 moves deep (deeper, it can rightly see a death the lookahead
+        # misses): the search's move is (nearly) the best, and a move that loses a life at once
+        # is avoided whenever another is clearly better
         cases = deadly_states(8, seed=5)
         self.assertGreaterEqual(len(cases), 4, "not enough deadly states found")
         envs = [env for env, _ in cases]
-        config = GumbelConfig(num_simulations=32, gumbel_scale=0.0)
+        config = GumbelConfig(num_simulations=32, gumbel_scale=0.0, max_depth=3)
         actions, policy, _, _, _ = gumbel_search(envs, uniform, config, OBS_CONFIG, 1)
         avoided = 0
         for i, (env, deadly) in enumerate(cases):
@@ -202,13 +204,13 @@ class StoreAndLossTests(unittest.TestCase):
         opt = torch.optim.Adam(net.parameters(), lr=1e-3)
         batch = store.sample(64)
         first = None
-        for _ in range(60):
+        for _ in range(300):
             policy_loss, value_loss, _ = losses(net, batch)
             first = first or (policy_loss.item(), value_loss.item())
             opt.zero_grad()
             (policy_loss + value_loss).backward()
             opt.step()
-        self.assertLess(policy_loss.item(), first[0])
+        self.assertLess(policy_loss.item(), first[0] - 0.05)
         self.assertLess(value_loss.item(), 0.5 * first[1])
 
 
