@@ -148,5 +148,83 @@ class GraphModelTests(unittest.TestCase):
                     self.assertAlmostEqual(a, b, places=4, msg=cls.__name__)
 
 
+def dense_reference(q_net: "mg.MazeGraphQNet", obs: torch.Tensor) -> torch.Tensor:
+    """MazeGraphQNet's output computed the plain way: batched dense products with `within`."""
+    nodes, whole, pacman = q_net.reader(obs)
+    whole = q_net.whole(whole)
+    h = q_net.node_in(nodes) + q_net.position + whole[:, None]
+    for within, layer in zip(q_net.within, q_net.layers):
+        h = h + layer(torch.cat([h, torch.matmul(within, h)], dim=2))
+    return q_net.head(h, whole, pacman)
+
+
+class FastPathTests(unittest.TestCase):
+    """MazeGraphQNet's fast paths (sparse on the CPU, compiled on CUDA) compute the same thing."""
+
+    def setUp(self):
+        self.obs = torch.from_numpy(np.stack([e.obs_numpy(CONFIG) for e in random_states(16, seed=11)]))
+        torch.manual_seed(0)
+        self.q_net = models.MazeGraphQNet(OBS_SHAPE, NUM_ACTIONS).eval()
+        with torch.no_grad():
+            self.q_net.head.mlp[-1].weight.normal_()
+
+    def test_cpu_sparse_path_matches_dense(self):
+        self.assertEqual(self.q_net.whole_maze, [False] * 5 + [True])
+        with torch.no_grad():
+            ref = dense_reference(self.q_net, self.obs)
+            out = self.q_net(self.obs)
+            channels_last = models.MazeGraphQNet(OBS_SHAPE, NUM_ACTIONS).eval()
+            channels_last.load_state_dict(self.q_net.state_dict())
+            channels_last = channels_last.to(memory_format=torch.channels_last)
+            out_cl = channels_last(self.obs.contiguous(memory_format=torch.channels_last))
+        self.assertGreater(ref.abs().max().item(), 1.0)
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-4)
+        torch.testing.assert_close(out_cl, ref, rtol=1e-5, atol=1e-4)
+        # Gradients flow through the sparse products too
+        q_net = copy.deepcopy(self.q_net).train()
+        q_net(self.obs).square().sum().backward()
+        self.assertTrue(all(p.grad is not None for p in q_net.parameters()))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_and_compiled_match_dense(self):
+        device = torch.device("cuda")
+        with torch.no_grad():
+            ref = dense_reference(self.q_net, self.obs)
+            q_net = copy.deepcopy(self.q_net).to(device)
+            out = q_net(self.obs.to(device)).cpu()
+            q_net.compile()
+            compiled = q_net(self.obs.to(device)).cpu()
+            back = q_net.cpu()(self.obs)  # moved back, the sparse matrices are rebuilt on the CPU
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
+        torch.testing.assert_close(compiled, ref, rtol=1e-4, atol=1e-3)
+        torch.testing.assert_close(back, ref, rtol=1e-5, atol=1e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_compiled_updates_replay_as_a_cuda_graph(self):
+        device = torch.device("cuda")
+        storage = filled_storage(device)
+        runs = []
+        for compiled in (False, True):
+            torch.manual_seed(0)
+            q_net = models.MazeGraphQNet(OBS_SHAPE, NUM_ACTIONS).to(device)
+            with torch.no_grad():
+                q_net.head.mlp[-1].weight.normal_(std=0.01)
+            target = copy.deepcopy(q_net)
+            if compiled:
+                q_net.compile()
+                target.compile()
+            opt = torch.optim.Adam(q_net.parameters(), lr=1e-3, capturable=True)
+            update_cls = GraphedUpdate if compiled else EagerUpdate
+            runs.append((q_net, update_cls(q_net, target, opt, storage, 64, **KW)))
+        for _ in range(4):
+            idx = storage.sample_indices(64)
+            m_eager = runs[0][1].run(idx).tolist()
+            m_graph = runs[1][1].run(idx).tolist()
+            for a, b in zip(m_eager, m_graph):
+                self.assertAlmostEqual(a, b, places=3)
+        for (name, a), b in zip(runs[0][0].state_dict().items(), runs[1][0].state_dict().values()):
+            torch.testing.assert_close(a, b, rtol=1e-3, atol=1e-5, msg=name)
+
+
 if __name__ == "__main__":
     unittest.main()

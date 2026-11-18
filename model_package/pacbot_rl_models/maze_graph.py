@@ -179,6 +179,8 @@ class MazeGraphQNet(nn.Module):
 
     DIM = 48
     RADII = (1, 2, 4, 8, 16, 64)
+    # Train with TF32 matrix products and torch.compile on CUDA (see train_dqn)
+    FAST_CUDA = True
 
     def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
         super().__init__()
@@ -187,21 +189,50 @@ class MazeGraphQNet(nn.Module):
         self.node_in = nn.Linear(NUM_NODE_FEATURES, dim)
         self.position = nn.Parameter(torch.randn(NUM_NODES, dim) * 0.1)
         self.whole = WholeBoard(dim)
-        dist = distances().float()
-        # Row-normalized "within radius" matrices, one per layer
+        dist = distances()
+        # Row-normalized "within radius" matrices, one per layer. A radius at least the maze's
+        # diameter takes in every node: that layer's mean is the plain mean over the nodes.
+        self.whole_maze = [r >= int(dist.max()) for r in self.RADII]
         within = torch.stack([(dist <= r).float() for r in self.RADII])
         self.register_buffer("within", within / within.sum(dim=2, keepdim=True), persistent=False)
+        # On the CPU (actors, evaluation) they multiply as sparse matrices: radii 1-16 keep only
+        # ~1-34% of the entries, and the dense products were ~45% of the arithmetic. Kept as
+        # their CSR parts (plain tensors, so they move and copy like the other buffers).
+        for i, w in enumerate(self.within):
+            csr = w.to_sparse_csr()
+            self.register_buffer(f"_csr{i}_rows", csr.crow_indices(), persistent=False)
+            self.register_buffer(f"_csr{i}_cols", csr.col_indices(), persistent=False)
+            self.register_buffer(f"_csr{i}_values", csr.values(), persistent=False)
         self.layers = nn.ModuleList(
             nn.Sequential(nn.LayerNorm(2 * dim), nn.Linear(2 * dim, 2 * dim), nn.SiLU(), nn.Linear(2 * dim, dim))
             for _ in self.RADII
         )
         self.head = MoveHead(dim, 2 * dim, action_count)
 
+    def _mean_within(self, layer: int, h: torch.Tensor) -> torch.Tensor:
+        """The mean of h (NUM_NODES, B, dim) over the nodes within the layer's radius of each node."""
+        if self.whole_maze[layer]:
+            return h.mean(dim=0, keepdim=True).expand_as(h)
+        flat = h.reshape(NUM_NODES, -1)  # the whole batch as one (N, N) @ (N, B * dim) product
+        if h.device.type == "cpu":
+            return self._sparse_mm(layer, flat).view_as(h)
+        return torch.mm(self.within[layer], flat).view_as(h)
+
+    @torch.compiler.disable  # sparse tensors can't be compiled; only the CPU takes this path
+    def _sparse_mm(self, layer: int, flat: torch.Tensor) -> torch.Tensor:
+        within = torch.sparse_csr_tensor(
+            getattr(self, f"_csr{layer}_rows"), getattr(self, f"_csr{layer}_cols"),
+            getattr(self, f"_csr{layer}_values"), (NUM_NODES, NUM_NODES),
+        )
+        return torch.sparse.mm(within, flat)
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         nodes, whole, pacman = self.reader(obs)
         whole = self.whole(whole)
-        h = self.node_in(nodes) + self.position + whole[:, None]
-        for within, layer in zip(self.within, self.layers):
-            gathered = torch.matmul(within, h)  # (B, NUM_NODES, dim): mean over nodes within the radius
-            h = h + layer(torch.cat([h, gathered], dim=2))
-        return self.head(h, whole, pacman)
+        h = self.node_in(nodes) + self.position + whole[:, None]  # (B, NUM_NODES, dim)
+        # Node-major (NUM_NODES, B, dim) through the layers, so each mean is one 2-D product
+        # (a batched product would copy the (N, N) matrix for every observation)
+        h = h.transpose(0, 1).contiguous()
+        for i, layer in enumerate(self.layers):
+            h = h + layer(torch.cat([h, self._mean_within(i, h)], dim=2))
+        return self.head(h.transpose(0, 1), whole, pacman)
