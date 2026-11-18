@@ -114,6 +114,18 @@ class MpsActorReplayBufferTests(ActorReplayBufferTests):
     device = torch.device("mps")
 
 
+class SeededEvaluationTests(unittest.TestCase):
+    def test_a_seed_gives_the_same_game(self):
+        torch.manual_seed(0)
+        q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
+        # Long enough for power pellets, so frightened ghosts' random moves come into it
+        favor(q_net, stay_bias=-1.0)
+        play = lambda seed: parallel_training.evaluate_episode(
+            q_net, CPU, env_version=2, max_steps=3000, ticks_per_step=8, seed=seed)
+        self.assertEqual(play(5), play(5))
+        self.assertEqual(play(6), play(6))
+
+
 class BackgroundEvaluatorTests(unittest.TestCase):
     def test_evaluates_and_reports_payload(self):
         evaluator = parallel_training.BackgroundEvaluator(1, "QNetV2", env_version=2)

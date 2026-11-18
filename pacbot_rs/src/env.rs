@@ -892,6 +892,19 @@ impl PacmanGym {
         env
     }
 
+    /// The seed of the game's random choices (frightened ghosts' moves; the start is chosen at
+    /// reset, from a fresh random source). Setting it after a reset makes the rest of the game
+    /// repeatable: the same seed and the same moves give the same game.
+    #[getter]
+    pub fn get_seed(&self) -> u64 {
+        self.game_state.seed
+    }
+
+    #[setter]
+    pub fn set_seed(&mut self, seed: u64) {
+        self.game_state.seed = seed;
+    }
+
     #[classattr]
     const LATEST_ENV_VERSION: u32 = LATEST_ENV_VERSION;
 

@@ -86,17 +86,21 @@ def state_dict_to_numpy(module: torch.nn.Module) -> dict[str, np.ndarray]:
 @torch.no_grad()
 def evaluate_episode(
     q_net: torch.nn.Module, device: torch.device, env_version: int, max_steps: int = 1000,
-    ticks_per_step: int | None = None,
+    ticks_per_step: int | None = None, seed: int | None = None,
 ) -> tuple[int, int, bool, int, int, int, float]:
     """
     Plays one evaluation game with the greedy policy, from the normal start, at the normal
-    speed or every `ticks_per_step` game ticks. Games differ: frightened ghosts move randomly.
+    speed or every `ticks_per_step` game ticks. Games differ: frightened ghosts move randomly,
+    unless a `seed` is given; then the same seed and the same moves give the same game, so
+    checkpoints can be compared on the same games.
 
     Returns (score, total_steps, is_board_cleared, pellets_start, pellets_end,
     purgatory_pellets, ghost_proximities).
     """
     config = DETERMINISTIC_START_CONFIGURATION if ticks_per_step is None else speed_configuration(ticks_per_step)
     gym = make_gym(config, env_version)
+    if seed is not None:
+        gym.seed = seed
     pellets_start = gym.remaining_pellets()
     q_net.eval()
     done, step_num = step_env_until_done(gym, MaxQPolicy(q_net), device, max_steps=max_steps)
