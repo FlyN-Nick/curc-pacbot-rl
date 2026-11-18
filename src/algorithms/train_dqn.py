@@ -107,6 +107,10 @@ if __name__ == "__main__":
         help="On CUDA, run each update eagerly instead of replaying it as a CUDA graph",
     )
     parser.add_argument(
+        "--no-compile", action="store_true",
+        help="Don't torch.compile models that ask for it (FAST_CUDA, e.g. MazeGraphQNet) on CUDA",
+    )
+    parser.add_argument(
         "--bf16", choices=["none", "update", "all"], default="none",
         help="Run the network's convolutions and matrix products in bfloat16 on a CUDA GPU: "
         "'update' for the gradient pass only, 'all' for the target passes too. Faster, but "
@@ -223,6 +227,10 @@ if __name__ == "__main__":
         # (fixed) batch shape and keeps the fastest, and channels-last suits its kernels.
         torch.backends.cudnn.benchmark = True
         q_net = q_net.to(memory_format=torch.channels_last)
+        if getattr(model_class, "FAST_CUDA", False):
+            # Models made of matrix products (no convolutions) get them in TF32, the precision
+            # cuDNN already gives QNetV2's convolutions (~0.05%), instead of full float32
+            torch.backends.cuda.matmul.allow_tf32 = True
 
     # variables used when resuming from a checkpoint (finetuning)
     resume_iter = 0
@@ -529,6 +537,13 @@ def _train(replay_buffer, evaluator, actors: bool):
         print("Restored the target network from checkpoint")
     target_q_net.eval()
     q_net.train()
+    if device.type == "cuda" and getattr(type(q_net), "FAST_CUDA", False) and not args.no_compile:
+        # Fuses the many small elementwise steps (layer norms, activations, concatenations):
+        # ~30-50% less GPU time per update for the graph models. Compiles during the CUDA
+        # graph's warm-up updates (~1 min); parameter names and checkpoints are unchanged.
+        q_net.compile()
+        target_q_net.compile()
+        print("torch.compile: on")
     update = (GraphedUpdate if graphed else EagerUpdate)(
         q_net, target_q_net, optimizer, replay_buffer.storage, wandb.config.batch_size,
         reward_scale=wandb.config.reward_scale,
