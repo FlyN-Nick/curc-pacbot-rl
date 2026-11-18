@@ -28,19 +28,51 @@ from utils import NUM_ACTIONS, OBS_SHAPE, make_gym, speed_configuration
 
 
 class NetworkEvaluator:
-    """(obs float32 (B, 17, 28, 31), legal bool (B, 5)) -> (values (B,), logits (B, 5)) as NumPy."""
+    """
+    (obs float32 (B, 17, 28, 31), legal bool (B, 5)) -> (values (B,), logits (B, 5)) as NumPy.
 
-    def __init__(self, net: torch.nn.Module, device: torch.device) -> None:
+    With `max_batch` on CUDA, every call runs one CUDA graph of the network on max_batch
+    observations (the rest of the batch padding): a search makes dozens of small calls per move,
+    and replaying a graph skips launching each kernel (~2.5 ms per call instead of ~4-6 ms for
+    256 states on a busy GPU). The graph reads the network's parameters where they are, so it
+    follows the training updates made in place (optimizer steps, load_state_dict); the network
+    must not have batch statistics (batch norm) or other state that differs in training mode.
+    """
+
+    def __init__(self, net: torch.nn.Module, device: torch.device, max_batch: int | None = None) -> None:
         self.net = net
         self.device = device
         self.calls = 0
         self.states = 0
+        self._graph = None
+        if max_batch is not None and device.type == "cuda":
+            self._capture(max_batch)
+
+    @torch.inference_mode()
+    def _capture(self, max_batch: int) -> None:
+        self._input = torch.zeros((max_batch, *OBS_SHAPE), device=self.device).contiguous(
+            memory_format=torch.channels_last)
+        side = torch.cuda.Stream(self.device)
+        side.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(side):
+            for _ in range(3):  # warm-up (and cuDNN's choice of algorithms) before capturing
+                self.net(self._input)
+        torch.cuda.current_stream(self.device).wait_stream(side)
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            self._logits, self._value = self.net(self._input)
 
     @torch.inference_mode()
     def __call__(self, obs: np.ndarray, legal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         self.calls += 1
-        self.states += obs.shape[0]
-        logits, value = self.net(torch.from_numpy(obs).to(self.device, non_blocking=True))
+        n = obs.shape[0]
+        self.states += n
+        if self._graph is not None and n <= self._input.shape[0]:
+            self._input[:n].copy_(torch.from_numpy(obs))
+            self._graph.replay()
+            logits, value = self._logits[:n], self._value[:n]
+        else:
+            logits, value = self.net(torch.from_numpy(obs).to(self.device, non_blocking=True))
         return value.float().cpu().numpy(), logits.float().cpu().numpy()
 
 
@@ -181,7 +213,7 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
             env = make_gym(speed_configuration(speed), env_version)
             env.seed = seed
             games.append({"speed": speed, "seed": seed, "env": env, "steps": 0, "done": False})
-    evaluator = NetworkEvaluator(net, device)
+    evaluator = NetworkEvaluator(net, device, max_batch=len(games)) if search is not None else None
     step = 0
     while True:
         live = [g for g in games if not g["done"]]

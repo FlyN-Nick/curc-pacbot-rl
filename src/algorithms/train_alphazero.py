@@ -62,6 +62,7 @@ HYPERPARAMS = {
     "random_start_proportion": 0.25,
     "c_visit": 50.0,
     "c_scale": 0.1,
+    "search_threads": 1,  # 1 was fastest (see GumbelConfig.threads)
     "eval_every": 200_000,  # moves
     "eval_seeds": 2,  # games per speed
     "search_eval_every": 1_000_000,
@@ -100,7 +101,10 @@ def main() -> None:
     resumed = torch.load(args.resume, map_location=device, weights_only=False) if args.resume else None
     config = {name: getattr(args, name) for name in HYPERPARAMS}
     if resumed is not None:
-        config = {**resumed["config"], **{k: v for k, v in config.items() if k in ("num_moves",)}}
+        # The run's own settings, except those that only say how long or how fast to run
+        # (and defaults for settings added since)
+        config = {**config, **resumed["config"],
+                  **{k: v for k, v in config.items() if k in ("num_moves", "search_threads")}}
     run = wandb.init(
         project="pacbot-ind-study", group="alphazero", config={**config, "device": str(device), "seed": seed},
         mode="disabled" if args.no_wandb else "online",
@@ -111,6 +115,11 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     net = getattr(models, cfg.model)(OBS_SHAPE, NUM_ACTIONS).to(device)
+    if device.type == "cuda":
+        # As in DQN training: cuDNN picks the fastest convolutions for each (fixed) batch
+        # shape, and channels-last suits its kernels
+        torch.backends.cudnn.benchmark = True
+        net = net.to(memory_format=torch.channels_last)
     print(f"{cfg.model} has {sum(p.numel() for p in net.parameters())} parameters")
     optimizer = torch.optim.AdamW(net.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     step, best, best_search = 0, -math.inf, -math.inf
@@ -123,13 +132,13 @@ def main() -> None:
     num_steps = cfg.num_moves // cfg.num_games
     search = GumbelConfig(num_simulations=cfg.num_simulations, discount=cfg.discount,
                           reward_scale=cfg.reward_scale, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
-                          gumbel_scale=1.0)
+                          gumbel_scale=1.0, threads=cfg.search_threads)
     eval_search = GumbelConfig(num_simulations=cfg.num_simulations, discount=cfg.discount,
                                reward_scale=cfg.reward_scale, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
-                               gumbel_scale=0.0)
+                               gumbel_scale=0.0, threads=cfg.search_threads)
     store = TrainingStore(cfg.buffer_capacity, device)
     targets = Targets(cfg.num_games, cfg.td_steps, cfg.discount)
-    evaluator = NetworkEvaluator(net, device)
+    evaluator = NetworkEvaluator(net, device, max_batch=cfg.num_games)  # one CUDA graph
 
     def reset_config():
         if rng.random() < cfg.random_start_proportion:

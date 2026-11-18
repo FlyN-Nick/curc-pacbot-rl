@@ -110,6 +110,14 @@ class GumbelSearchTests(unittest.TestCase):
         for x, y in zip(a, b):
             self.assertTrue(np.array_equal(x, y))
 
+    def test_thread_counts_search_alike(self):
+        envs = random_states(9, seed=12)
+        results = [gumbel_search(envs, uniform, GumbelConfig(num_simulations=8, threads=t), OBS_CONFIG, 5)
+                   for t in (1, 0, 3)]
+        for other in results[1:]:
+            for x, y in zip(results[0], other):
+                self.assertTrue(np.array_equal(x, y))
+
     def test_batches_leaves_into_one_call_per_simulation(self):
         calls = []
 
@@ -227,6 +235,32 @@ class EvaluationTests(unittest.TestCase):
                                   search=GumbelConfig(num_simulations=4, gumbel_scale=0.0))
         self.assertEqual(len(searched), 1)
         self.assertGreater(searched[0]["steps"], 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_graphed_evaluator_matches_and_follows_updates(self):
+        device = torch.device("cuda")
+        torch.manual_seed(0)
+        net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS).to(device).to(memory_format=torch.channels_last)
+        with torch.no_grad():
+            for p in net.parameters():
+                p.add_(torch.randn_like(p) * 0.05)  # nonzero heads
+        graphed = NetworkEvaluator(net, device, max_batch=8)
+        plain = NetworkEvaluator(net, device)
+        obs = np.stack([e.obs_numpy(OBS_CONFIG) for e in random_states(5, seed=13)])
+        legal = np.ones((5, 5), bool)
+        for _ in range(2):
+            (gv, gl), (pv, pl) = graphed(obs, legal), plain(obs, legal)
+            self.assertEqual((gv.shape, gl.shape), ((5,), (5, 5)))
+            np.testing.assert_allclose(gv, pv, rtol=1e-3, atol=1e-4)
+            np.testing.assert_allclose(gl, pl, rtol=1e-3, atol=1e-4)
+            self.assertGreater(np.abs(pl).max(), 1e-3)
+            with torch.no_grad():  # an in-place update, like an optimizer step
+                for p in net.parameters():
+                    p.mul_(1.5)
+        # More states than the graph holds: computed without it
+        big = np.concatenate([obs, obs])
+        np.testing.assert_allclose(graphed(big, np.ones((10, 5), bool))[1], plain(big, np.ones((10, 5), bool))[1],
+                                   rtol=1e-3, atol=1e-4)
 
     def test_network_evaluator_shapes(self):
         net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)

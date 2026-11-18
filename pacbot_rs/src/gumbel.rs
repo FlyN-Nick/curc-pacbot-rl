@@ -47,12 +47,17 @@ pub struct GumbelConfig {
     pub gumbel_scale: f32,
     /// Simulations stop descending (and bootstrap from the network) this many moves deep
     pub max_depth: usize,
+    /// Threads for the search's game work: 1 (the default) runs it on the calling thread, 0
+    /// on rayon's global pool. Each simulation's work is small (~10 us per game), so handing it
+    /// to other threads mostly adds waiting: 1 thread was fastest on a busy 16-thread machine
+    /// (726 moves/s against 318 with 4 and 194 with 8, 152 games, 32 simulations).
+    pub threads: usize,
 }
 
 #[pymethods]
 impl GumbelConfig {
     #[new]
-    #[pyo3(signature = (num_simulations = 32, discount = 0.99, reward_scale = 0.02, c_visit = 50.0, c_scale = 0.1, gumbel_scale = 1.0, max_depth = 64))]
+    #[pyo3(signature = (num_simulations = 32, discount = 0.99, reward_scale = 0.02, c_visit = 50.0, c_scale = 0.1, gumbel_scale = 1.0, max_depth = 64, threads = 1))]
     pub fn new(
         num_simulations: usize,
         discount: f32,
@@ -61,6 +66,7 @@ impl GumbelConfig {
         c_scale: f32,
         gumbel_scale: f32,
         max_depth: usize,
+        threads: usize,
     ) -> PyResult<Self> {
         if num_simulations < 1 {
             return Err(PyValueError::new_err("num_simulations must be at least 1"));
@@ -68,7 +74,7 @@ impl GumbelConfig {
         if max_depth < 1 {
             return Err(PyValueError::new_err("max_depth must be at least 1"));
         }
-        Ok(Self { num_simulations, discount, reward_scale, c_visit, c_scale, gumbel_scale, max_depth })
+        Ok(Self { num_simulations, discount, reward_scale, c_visit, c_scale, gumbel_scale, max_depth, threads })
     }
 
     pub fn __repr__(&self) -> String {
@@ -228,6 +234,36 @@ fn considered_visit_sequence(num_considered: usize, num_simulations: usize) -> V
     sequence
 }
 
+/// Where the search's per-game work runs (GumbelConfig::threads).
+enum Exec {
+    Here,
+    Global,
+    Pool(rayon::ThreadPool),
+}
+
+impl Exec {
+    fn new(threads: usize) -> PyResult<Self> {
+        Ok(match threads {
+            1 => Exec::Here,
+            0 => Exec::Global,
+            n => Exec::Pool(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| PyValueError::new_err(format!("couldn't start {n} search threads: {e}")))?,
+            ),
+        })
+    }
+
+    fn each<T: Send>(&self, items: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+        match self {
+            Exec::Here => items.iter_mut().for_each(f),
+            Exec::Global => items.par_iter_mut().for_each(f),
+            Exec::Pool(pool) => pool.install(|| items.par_iter_mut().for_each(f)),
+        }
+    }
+}
+
 /// One game's search: its tree, root noise and pending simulation.
 struct Search {
     root_env: PacmanGym,
@@ -238,6 +274,8 @@ struct Search {
     /// The pending simulation: (node, action, scaled reward) per move, and the state reached
     path: Vec<(u32, usize, f32)>,
     leaf: Leaf,
+    /// The network's (value, logits) for an expanded leaf, once evaluated
+    evaluation: Option<(f32, [f32; A])>,
 }
 
 enum Leaf {
@@ -320,8 +358,8 @@ impl Search {
     }
 
     /// Backs the pending simulation up, adding a node for an expanded leaf.
-    fn backprop(&mut self, evaluation: Option<(f32, [f32; A])>, config: &GumbelConfig) {
-        let mut ret = match (&self.leaf, evaluation) {
+    fn backprop(&mut self, config: &GumbelConfig) {
+        let mut ret = match (&self.leaf, self.evaluation.take()) {
             (Leaf::Terminal, _) => 0.0,
             (Leaf::Bootstrap(node), _) => self.nodes[*node as usize].value,
             (Leaf::Expand(env), Some((value, logits))) => {
@@ -350,6 +388,7 @@ fn evaluate(
     evaluator: &Py<PyAny>,
     envs: &[&PacmanGym],
     obs_config: &PacmanGymConfiguration,
+    exec: &Exec,
 ) -> PyResult<Evaluation> {
     let n = envs.len();
     let (c, h, w) = OBS_SHAPE;
@@ -357,7 +396,8 @@ fn evaluate(
     let mut legal = Array2::<bool>::from_elem((n, A), false);
     py.detach(|| {
         let flat = obs.as_slice_mut().expect("a new array is contiguous");
-        flat.par_chunks_mut(c * h * w).zip(envs.par_iter()).for_each(|(out, env)| {
+        let mut jobs: Vec<(&mut [f32], &PacmanGym)> = flat.chunks_mut(c * h * w).zip(envs.iter().copied()).collect();
+        exec.each(&mut jobs, |(out, env)| {
             let one = env.obs(obs_config);
             out.copy_from_slice(one.as_slice().expect("obs() is contiguous"));
         });
@@ -407,8 +447,9 @@ pub fn gumbel_search<'py>(
         return Err(PyValueError::new_err("gumbel_search was given a game that has ended"));
     }
     let n = envs.len();
+    let exec = Exec::new(config.threads)?;
     // Evaluate the roots
-    let roots = evaluate(py, &evaluator, &envs.iter().collect::<Vec<_>>(), &obs_config)?;
+    let roots = evaluate(py, &evaluator, &envs.iter().collect::<Vec<_>>(), &obs_config, &exec)?;
     let mut searches: Vec<Search> = envs
         .into_iter()
         .zip(roots)
@@ -431,12 +472,13 @@ pub fn gumbel_search<'py>(
                 rng,
                 path: Vec::new(),
                 leaf: Leaf::Terminal,
+                evaluation: None,
             }
         })
         .collect();
 
     for k in 0..config.num_simulations {
-        py.detach(|| searches.par_iter_mut().for_each(|s| s.select(k, &config)));
+        py.detach(|| exec.each(&mut searches, |s| s.select(k, &config)));
         let to_expand: Vec<usize> =
             (0..n).filter(|&i| matches!(searches[i].leaf, Leaf::Expand(_))).collect();
         let leaf_envs: Vec<&PacmanGym> = to_expand
@@ -446,15 +488,13 @@ pub fn gumbel_search<'py>(
                 _ => unreachable!(),
             })
             .collect();
-        let mut evaluations: Vec<Option<(f32, [f32; A])>> = vec![None; n];
         if !leaf_envs.is_empty() {
-            for (i, e) in to_expand.iter().zip(evaluate(py, &evaluator, &leaf_envs, &obs_config)?) {
-                evaluations[*i] = Some(e);
+            let evaluations = evaluate(py, &evaluator, &leaf_envs, &obs_config, &exec)?;
+            for (&i, e) in to_expand.iter().zip(evaluations) {
+                searches[i].evaluation = Some(e);
             }
         }
-        py.detach(|| {
-            searches.par_iter_mut().zip(evaluations.into_par_iter()).for_each(|(s, e)| s.backprop(e, &config))
-        });
+        py.detach(|| exec.each(&mut searches, |s| s.backprop(&config)));
     }
 
     let mut actions = Array1::<u8>::zeros(n);
