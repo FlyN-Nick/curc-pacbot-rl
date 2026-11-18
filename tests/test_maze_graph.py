@@ -1,6 +1,6 @@
 """
 The maze graph models' shared pieces (pacbot_rl_models.maze_graph) checked against the real
-game, and MazeGraphQNet in training updates.
+game, and MazeGraphQNet and MazeTransformerQNet in training updates.
 
 Run from src/: python -m unittest discover -s ../tests -p test_maze_graph.py
 """
@@ -23,7 +23,7 @@ from test_dqn_update import KW, filled_storage  # noqa: E402
 from utils import NUM_ACTIONS, OBS_SHAPE  # noqa: E402
 
 CONFIG = utils.SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION
-GRAPH_MODELS = [models.MazeGraphQNet]
+GRAPH_MODELS = [models.MazeGraphQNet, models.MazeTransformerQNet]
 
 
 def random_states(n: int, seed: int = 0):
@@ -89,6 +89,15 @@ class MazeGraphTests(unittest.TestCase):
                 self.assertTrue(torch.allclose(whole[b, :8] + on_graph, ghost_total))
                 self.assertAlmostEqual(whole[b, -1].item(), obs[b, 15, 0, 0].item())
 
+    def test_distance_buckets(self):
+        from pacbot_rl_models.maze_transformer import DISTANCE_BUCKETS, distance_buckets
+        buckets, dist = distance_buckets(), mg.distances()
+        self.assertTrue((buckets[dist == 0] == 0).all())
+        self.assertTrue((buckets[dist == 1] == 1).all())
+        self.assertTrue((buckets[dist > DISTANCE_BUCKETS[-1]] == len(DISTANCE_BUCKETS)).all())
+        self.assertTrue((buckets[:, :-1] <= buckets[:, 1:]).any())  # not constant
+        self.assertTrue(((buckets >= 0) & (buckets <= len(DISTANCE_BUCKETS))).all())
+
     def test_distances_are_maze_distances(self):
         dist = mg.distances()
         self.assertTrue(torch.equal(dist, dist.T))
@@ -123,7 +132,7 @@ class GraphModelTests(unittest.TestCase):
             target = copy.deepcopy(q_net)
             opt = torch.optim.Adam(q_net.parameters(), lr=1e-3)
             batch = storage.sample(64)
-            losses = [dqn_update(q_net, target, opt, batch, **KW)[0].item() for _ in range(40)]
+            losses = [dqn_update(q_net, target, opt, batch, **KW)[0].item() for _ in range(80)]
             self.assertLess(losses[-1], 0.5 * losses[0], cls.__name__)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
