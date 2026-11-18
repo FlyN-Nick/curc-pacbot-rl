@@ -70,6 +70,9 @@ class MazeTransformerQNet(nn.Module):
     LATENTS = 32
     LAYERS = 3
     FFN = 96
+    # Train with TF32 matrix products and torch.compile on CUDA (see train_dqn): ~half the
+    # GPU time per update
+    FAST_CUDA = True
 
     def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
         super().__init__()

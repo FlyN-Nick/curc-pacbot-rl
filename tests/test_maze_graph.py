@@ -210,12 +210,18 @@ class FastPathTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_compiled_updates_replay_as_a_cuda_graph(self):
+        for cls in GRAPH_MODELS:
+            with self.subTest(cls.__name__):
+                self._compiled_updates_replay(cls)
+
+    def _compiled_updates_replay(self, cls):
+        self.assertTrue(cls.FAST_CUDA)
         device = torch.device("cuda")
         storage = filled_storage(device)
         runs = []
         for compiled in (False, True):
             torch.manual_seed(0)
-            q_net = models.MazeGraphQNet(OBS_SHAPE, NUM_ACTIONS).to(device)
+            q_net = cls(OBS_SHAPE, NUM_ACTIONS).to(device)
             with torch.no_grad():
                 q_net.head.mlp[-1].weight.normal_(std=0.01)
             target = copy.deepcopy(q_net)
