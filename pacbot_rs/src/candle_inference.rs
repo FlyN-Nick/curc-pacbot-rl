@@ -67,12 +67,8 @@ impl CandleInference {
             + ((1. - &action_mask_arr).unwrap() * -999.).unwrap())
         .unwrap();
         let argmax_idx = q_vals.argmax(D::Minus1).unwrap().to_scalar::<u32>().unwrap() as usize;
-        let mut argmax = [0.; 5];
-        argmax[argmax_idx] = 1.;
-
         let actions = [Action::Stay, Action::Down, Action::Up, Action::Left, Action::Right];
-        let chosen_action =
-            actions[q_vals.argmax(D::Minus1).unwrap().to_scalar::<u32>().unwrap() as usize];
+        let chosen_action = actions[argmax_idx];
         let f32_q_vals = q_vals.to_vec1().unwrap();
         let direction_q_vals = [0, 1, 2, 3, 4].map(|direction_idx| {
             let direction = Direction::try_from(direction_idx).unwrap();
