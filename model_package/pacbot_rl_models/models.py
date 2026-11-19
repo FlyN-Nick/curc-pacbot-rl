@@ -294,3 +294,10 @@ class PVNetV2(nn.Module):
     def forward(self, input_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(input_batch)
         return self.policy_head(features), self.value_head(features).squeeze(1)
+
+
+class PVNetV2Wide(PVNetV2):
+    """PVNetV2 with QNetV2Wide's backbone: twice the channels and a twice as wide fully connected layer."""
+
+    WIDTHS = (32, 64, 128, 256)
+    FC_WIDTH = 512
