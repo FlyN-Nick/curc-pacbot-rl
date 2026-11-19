@@ -25,7 +25,7 @@ dev = ["ipykernel>=6.25.2,<7"]
 package = false
 
 [tool.uv.sources]
-pacbot-rl-models = { path = "model_package" }
+pacbot-rl-models = { path = "model_package", editable = true }
 torch = [{ index = "torch-cuda", marker = "sys_platform != 'darwin'" }]
 
 [[tool.uv.index]]
