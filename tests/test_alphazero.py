@@ -180,12 +180,15 @@ class TargetTests(unittest.TestCase):
 
 class StoreAndLossTests(unittest.TestCase):
     def examples(self, n):
+        """Random states with random policy targets, each peaked on one move or two (so a
+        network starting near uniform has a long way to go: from a loss of ~1.15 down to their
+        entropy, ~0.35), and random value targets."""
         envs = random_states(n, seed=8)
         rng = np.random.default_rng(0)
         out = []
         for env in envs:
             legal = np.array(env.action_mask())
-            p = rng.random(5).astype(np.float32) * legal
+            p = rng.random(5).astype(np.float32) ** 8 * legal
             out.append(Example(env.obs_numpy(OBS_CONFIG), legal, p / p.sum(), float(rng.normal())))
         return out
 
@@ -211,6 +214,8 @@ class StoreAndLossTests(unittest.TestCase):
         net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)
         opt = torch.optim.Adam(net.parameters(), lr=1e-3)
         batch = store.sample(64)
+        # The lowest policy loss possible: the targets' own entropy
+        floor = -(batch.policy * torch.log(batch.policy.clamp_min(1e-12))).sum(dim=1).mean().item()
         first = None
         for _ in range(300):
             policy_loss, value_loss, _ = losses(net, batch)
@@ -218,7 +223,10 @@ class StoreAndLossTests(unittest.TestCase):
             opt.zero_grad()
             (policy_loss + value_loss).backward()
             opt.step()
-        self.assertLess(policy_loss.item(), first[0] - 0.05)
+        # Measured against the room there is (98-100% of it closed on Linux, any seed or thread
+        # count), so platform rounding can't decide it as a fixed margin of 0.05 could
+        self.assertGreater(first[0] - floor, 0.5)
+        self.assertLess(policy_loss.item() - floor, 0.5 * (first[0] - floor))
         self.assertLess(value_loss.item(), 0.5 * first[1])
 
 
