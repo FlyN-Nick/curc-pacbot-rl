@@ -89,8 +89,9 @@ class QrDqnTests(unittest.TestCase):
             opt = torch.optim.SGD(net.parameters(), lr=0.0)
             metrics = dqn_update(net, target, opt, batch, **KW, huber_delta=kappa if kappa != 1.0 else 0.0)
             expected = reference_loss(net, target, batch, KW["reward_scale"], KW["discount_factor"], kappa)
-            # float32 sums against a float64 reference
-            self.assertLess(abs(metrics[0].item() - expected.item()) / expected.item(), 1e-5)
+            # float32 sums against a float64 reference: the order of the sums differs by platform
+            # (1.06e-5 on a Windows CI runner), so allow 1e-4
+            self.assertLess(abs(metrics[0].item() - expected.item()) / expected.item(), 1e-4)
 
     def test_learns_the_quantiles_of_the_reward(self):
         """
