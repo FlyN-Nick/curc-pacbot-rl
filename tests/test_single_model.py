@@ -83,8 +83,9 @@ class SingleModelTests(unittest.TestCase):
             ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4, random_start_proportion=0.5)
         utils.set_single_model(True)
         buffer = ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4, random_start_proportion=0.5)
-        self.assertEqual([c.random_start for c in buffer._reset_configs], [True, True, False, False])
-        self.assertTrue(all(c.random_ticks for c in buffer._reset_configs))
+        configs = [buffer._reset_configuration(i) for i in range(4)]
+        self.assertEqual([c.random_start for c in configs], [True, True, False, False])
+        self.assertTrue(all(c.random_ticks for c in configs))
         full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
         env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
         pellets = []
@@ -101,7 +102,8 @@ class SingleModelTests(unittest.TestCase):
         policy = EpsilonGreedy(MaxQPolicy(models.QNetV2(OBS_SHAPE, NUM_ACTIONS)), NUM_ACTIONS, 1.0)
         buffer = ReplayBuffer(maxlen=8, policy=policy, num_parallel_envs=4,
                               random_start_proportion=0.5, random_pellet_removal=True)
-        self.assertEqual([c.random_pellet_removal for c in buffer._reset_configs], [True, True, False, False])
+        self.assertEqual([buffer._reset_configuration(i).random_pellet_removal for i in range(4)],
+                         [True, True, False, False])
         full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
         env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
         shares = []

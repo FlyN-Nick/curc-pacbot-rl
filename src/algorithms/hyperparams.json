@@ -23,5 +23,7 @@
     "reward_scale": 0.02,
     "grad_clip_norm": 10000,
     "huber_delta": 0.0,
-    "model": "QNetV2"
+    "model": "QNetV2",
+    "speed_sampling": "uniform",
+    "max_speed": 14
 }

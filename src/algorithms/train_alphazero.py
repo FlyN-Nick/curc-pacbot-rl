@@ -40,7 +40,8 @@ import models
 import utils
 from alphazero import NetworkEvaluator, Targets, TrainingStore, evaluate_games, losses
 from pacbot_rs import GumbelConfig, gumbel_search
-from utils import ENV_VERSION, NUM_ACTIONS, OBS_SHAPE, TRAINING_SPEEDS, make_gym, random_start_configuration, reset_env
+from speed_sampling import SpeedSampler
+from utils import ENV_VERSION, NUM_ACTIONS, OBS_SHAPE, make_gym, reset_env, training_configuration, training_speeds
 
 HYPERPARAMS = {
     "model": "PVNetV2",
@@ -60,6 +61,8 @@ HYPERPARAMS = {
     "value_loss_weight": 0.25,
     "grad_clip_norm": 10.0,
     "random_start_proportion": 0.25,
+    "speed_sampling": "uniform",  # or "equal_moves": each speed in about as many moves (speed_sampling.py)
+    "max_speed": 14,  # games at 4..max_speed game ticks per move
     "c_visit": 50.0,
     "c_scale": 0.1,
     "search_threads": 1,  # 1 was fastest (see GumbelConfig.threads)
@@ -90,6 +93,10 @@ def main() -> None:
     args = parser.parse_args()
     if not hasattr(models, args.model):
         parser.error(f"unknown --model {args.model!r}")
+    if args.speed_sampling not in utils.SPEED_SAMPLING_MODES:
+        parser.error(f"--speed_sampling must be one of {utils.SPEED_SAMPLING_MODES}")
+    if args.max_speed < utils.MIN_SPEED:
+        parser.error(f"--max_speed must be at least {utils.MIN_SPEED}")
 
     utils.set_single_model(True)
     obs_config = utils.replay_buffer_obs_config()
@@ -111,6 +118,8 @@ def main() -> None:
         id=resumed.get("wandb_id") if resumed else None, resume="allow" if resumed else None,
     )
     cfg = wandb.config
+    utils.set_speed_sampling(cfg.speed_sampling)
+    utils.set_max_speed(cfg.max_speed)
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,12 +149,14 @@ def main() -> None:
     targets = Targets(cfg.num_games, cfg.td_steps, cfg.discount)
     evaluator = NetworkEvaluator(net, device, max_batch=cfg.num_games)  # one CUDA graph
 
-    def reset_config():
-        if rng.random() < cfg.random_start_proportion:
-            return random_start_configuration()
-        return obs_config  # the normal start at a random speed
+    speed_sampler = SpeedSampler(rng=rng)  # each game's speed (cfg.speed_sampling, up to cfg.max_speed)
 
-    games = [make_gym(reset_config(), ENV_VERSION) for _ in range(cfg.num_games)]
+    def reset_config(speed: int):
+        # The normal start, or (random_start_proportion of games) a random one
+        return training_configuration(speed, random_start=rng.random() < cfg.random_start_proportion)
+
+    game_speeds = [speed_sampler.draw() for _ in range(cfg.num_games)]
+    games = [make_gym(reset_config(speed), ENV_VERSION) for speed in game_speeds]
     game_moves = [0] * cfg.num_games
 
     def learning_rate(at_step: int) -> float:
@@ -163,10 +174,10 @@ def main() -> None:
     def evaluate(with_search: bool) -> dict:
         seeds = range(1, (cfg.search_eval_seeds if with_search else cfg.eval_seeds) + 1)
         start = time.perf_counter()
-        results = evaluate_games(net, device, ENV_VERSION, obs_config, TRAINING_SPEEDS, seeds,
+        results = evaluate_games(net, device, ENV_VERSION, obs_config, training_speeds(), seeds,
                                  search=eval_search if with_search else None)
         prefix = "search_eval" if with_search else "eval"
-        by_speed = {s: [r["score"] for r in results if r["speed"] == s] for s in TRAINING_SPEEDS}
+        by_speed = {s: [r["score"] for r in results if r["speed"] == s] for s in training_speeds()}
         metrics = {
             f"{prefix}_mean_score": float(np.mean([r["score"] for r in results])),
             f"{prefix}_cleared": float(np.mean([r["cleared"] for r in results])),
@@ -206,8 +217,9 @@ def main() -> None:
                 examples += targets.end(i)
                 episode_scores.append(env.score())
                 episode_moves.append(game_moves[i])
-                game_moves[i] = 0
-                reset_env(env, reset_config())
+                speed_sampler.record(game_speeds[i], game_moves[i])
+                game_speeds[i], game_moves[i] = speed_sampler.draw(), 0
+                reset_env(env, reset_config(game_speeds[i]))
         store.add(examples)
         t2 = time.perf_counter()
 
@@ -234,7 +246,8 @@ def main() -> None:
         if (step + 1) % 20 == 0:
             metrics = {"moves": moves, "learning_rate": learning_rate(step), "stored": len(store),
                        "network_value": float(np.mean(network_value)), "search_value": float(np.mean(value)),
-                       **{f"seconds_{k}": v for k, v in timer.items()}}
+                       **{f"seconds_{k}": v for k, v in timer.items()},
+                       **{f"speed_weight_{s}": w for s, w in speed_sampler.weights().items()}}
             for k, v in stats.items():
                 if v:
                     metrics[k] = torch.stack(v).float().mean().item()

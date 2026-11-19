@@ -45,6 +45,42 @@ def ghost_next_obs() -> bool:
     return os.environ.get(_GHOST_NEXT_OBS_ENV) == "1"
 
 
+# Training speeds: Pacman moves every 4..max_speed game ticks (the ghosts every 12), each
+# game's speed drawn by speed_sampling.SpeedSampler: "uniform" (every speed in as many games)
+# or "equal_moves" (every speed in about as many training moves: slow games last several
+# times longer, so uniform games give the slow speeds most of the data). Kept in the
+# environment like single-model mode, so actor processes inherit them.
+_MAX_SPEED_ENV = "PACBOT_MAX_SPEED"
+_SPEED_SAMPLING_ENV = "PACBOT_SPEED_SAMPLING"
+MIN_SPEED = 4
+SPEED_SAMPLING_MODES = ("uniform", "equal_moves")
+
+
+def set_max_speed(ticks_per_step: int) -> None:
+    if ticks_per_step < MIN_SPEED:
+        raise ValueError(f"max_speed must be at least {MIN_SPEED}, got {ticks_per_step}")
+    os.environ[_MAX_SPEED_ENV] = str(ticks_per_step)
+
+
+def max_speed() -> int:
+    return int(os.environ.get(_MAX_SPEED_ENV, "14"))
+
+
+def training_speeds() -> tuple[int, ...]:
+    """The speeds (game ticks per Pacman move) games are trained and evaluated at."""
+    return tuple(range(MIN_SPEED, max_speed() + 1))
+
+
+def set_speed_sampling(mode: str) -> None:
+    if mode not in SPEED_SAMPLING_MODES:
+        raise ValueError(f"speed_sampling must be one of {SPEED_SAMPLING_MODES}, got {mode!r}")
+    os.environ[_SPEED_SAMPLING_ENV] = mode
+
+
+def speed_sampling() -> str:
+    return os.environ.get(_SPEED_SAMPLING_ENV, "uniform")
+
+
 def checkpoint_ghost_next_obs(loaded) -> bool:
     """Whether a loaded checkpoint was trained with ghost-next observations."""
     return isinstance(loaded, dict) and bool(loaded.get("ghost_next_obs", False))
@@ -78,9 +114,10 @@ DEFAULT_GYM_CONFIGURATION = PacmanGymConfiguration({})
 DETERMINISTIC_START_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": False})
 
 # A game from the normal start is deterministic (the ghosts have no randomness): the only
-# thing that varies between training games is Pacman's speed, in game ticks per action,
-# drawn per game from these (PacmanGymConfiguration's random_ticks_per_step_min..max).
-# 8 is the normal speed (DETERMINISTIC_START_CONFIGURATION).
+# thing that varies between training games is Pacman's speed, in game ticks per action. These
+# are the default speeds (training_speeds() with the default max_speed, 14), which reports
+# keep using so their results stay comparable. 8 is the normal speed
+# (DETERMINISTIC_START_CONFIGURATION).
 TRAINING_SPEEDS = tuple(range(4, 15))
 NORMAL_SPEED = 8
 
@@ -95,6 +132,16 @@ OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURA
 
 REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True, "obs_ignore_super_pellets": True})
 SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True})
+def training_configuration(ticks_per_step: int, random_start: bool = False,
+                           random_pellet_removal: bool = False) -> PacmanGymConfiguration:
+    """A training game at the given speed: from the normal start, or from a random one (see
+    random_start_configuration)."""
+    return PacmanGymConfiguration({
+        "random_start": random_start, "random_ticks": True, "random_pellet_removal": random_pellet_removal,
+        "random_ticks_per_step_min": ticks_per_step, "random_ticks_per_step_max": ticks_per_step,
+    })
+
+
 def random_start_configuration(random_pellet_removal: bool = False) -> PacmanGymConfiguration:
     """
     Training games from a random Pacman position: often on a half-cleared board, or with
