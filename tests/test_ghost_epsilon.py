@@ -58,8 +58,11 @@ class DistanceTests(unittest.TestCase):
         C = PacmanGymConfiguration
         configs = [C({}), C({"random_start": True, "randomize_ghosts": True})]
         checked = frightened_seen = 0
-        for game in range(30):
+        # 60 random games, each seeded: frightened ghosts must show up often enough to check
+        # (with 30 unseeded games, ~1 run in 5 saw too few)
+        for game in range(60):
             env = PacmanGym(configs[game % 2])
+            env.seed = rng.randrange(2**63)
             for _ in range(400):
                 obs = torch.from_numpy(env.obs_numpy(C({})))
                 if not shares_a_square(obs):
@@ -69,7 +72,7 @@ class DistanceTests(unittest.TestCase):
                 _, done = env.step(rng.choice([a for a, ok in enumerate(env.action_mask()) if ok]))
                 if done:
                     break
-        self.assertGreater(checked, 2000)
+        self.assertGreater(checked, 4000)
         self.assertGreater(frightened_seen, 20)
 
 
