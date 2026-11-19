@@ -43,8 +43,11 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --python ${{ matrix.python-version }}
       - name: Build Rust extension
-        run: uv run --project .. maturin develop --release
-        working-directory: pacbot_rs
+        # The README's command, exactly, so the two can't drift apart; warnings fail the build
+        # (they apply to this crate only, not to its dependencies)
+        run: uv run --project .. --directory pacbot_rs maturin develop --release
+        env:
+          RUSTFLAGS: -D warnings
       - name: Test model package compatibility
         run: uv run --locked python -m unittest discover -s tests -v
         env:
