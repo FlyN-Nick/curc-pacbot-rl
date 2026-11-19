@@ -1,6 +1,6 @@
 """
 Fixed-seed evaluation with search: seeds 1..N (or A-B) at each speed, as game_report, all games
-at once. AlphaZero checkpoints play with their network; DQN checkpoints (any other model) play
+at once (speeds 4-14, or up to PACBOT_MAX_SPEED). AlphaZero checkpoints play with their network; DQN checkpoints (any other model) play
 with the same search, their Q values as the evaluator (alphazero.QNetworkEvaluator, policy
 temperature TEMP, default 0.1).
 Usage: eval_az_seeds.py SEEDS OUT.csv CKPT:SIMS[:TEMP] ...
@@ -36,7 +36,7 @@ with open(sys.argv[2], "w", newline="") as f:
                                   reward_scale=cfg["reward_scale"], gumbel_scale=0.0)
             evaluator = QNetworkEvaluator(net, device, temperature)
         t = time.perf_counter()
-        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.TRAINING_SPEEDS, seeds, search=search,
+        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.training_speeds(), seeds, search=search,
                              evaluator=evaluator)
         name = path.split("/checkpoints/")[-1]
         for r in res:
@@ -44,5 +44,6 @@ with open(sys.argv[2], "w", newline="") as f:
         f.flush()
         sc = np.array([r["score"] for r in res])
         by = lambda lo, hi: np.mean([r["score"] for r in res if lo <= r["speed"] <= hi])
+        slow = f" 15-18 {by(15, 18):.0f}" if utils.max_speed() > 14 else ""
         print(f"{name} sims {sims}{f' temp {temperature}' if temperature != '' else ''}: mean {sc.mean():.0f} (se {sc.std()/np.sqrt(len(sc)):.0f}) | 4-8 {by(4,8):.0f} 9-11 {by(9,11):.0f} "
-              f"12-14 {by(12,14):.0f} | cleared {np.mean([r['cleared'] for r in res]):.0%} | {time.perf_counter()-t:.0f}s", flush=True)
+              f"12-14 {by(12,14):.0f}{slow} | cleared {np.mean([r['cleared'] for r in res]):.0%} | {time.perf_counter()-t:.0f}s", flush=True)

@@ -9,7 +9,8 @@ import pacbot_rs
 
 from policies import ghost_aware_epsilons
 
-from utils import ghost_next_obs, random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
+from speed_sampling import SpeedSampler
+from utils import ghost_next_obs, training_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -56,16 +57,27 @@ class ReplayBuffer(Generic[P]):
             raise ValueError("random_start_proportion needs --single-model: the super pellet "
                              "model resets the games it finishes with the normal start")
         num_random = round(num_parallel_envs * random_start_proportion)
-        self._reset_configs = [
-            random_start_configuration(random_pellet_removal) if i < num_random else replay_buffer_obs_config()
-            for i in range(num_parallel_envs)
-        ]
+        self._random_start = [i < num_random for i in range(num_parallel_envs)]
+        self._random_pellet_removal = random_pellet_removal
+        # Each game's speed (utils.speed_sampling: uniform, or equal moves per speed)
+        self.speed_sampler = SpeedSampler()
+        self._speeds = [self.speed_sampler.draw() for _ in range(num_parallel_envs)]
+        self._moves = [0] * num_parallel_envs
         self._envs = [pacbot_rs.PacmanGym(DEFAULT_GYM_CONFIGURATION) for _ in range(num_parallel_envs)]
-        for env in self._envs:
+        for env, speed in zip(self._envs, self._speeds):
             env.ghost_next_obs = ghost_next_obs()
+            # The first game too starts normally, at its drawn speed
+            reset_env(env, training_configuration(speed))
+
         self._last_obs = self._make_current_obs()
         if storage is not None:
             storage.set_initial_obs(self._last_obs)
+
+    def _reset_configuration(self, i: int):
+        """The configuration environment i's next game starts with: its drawn speed, and a random
+        start (with random_pellet_removal, if set) for the first random_start_proportion."""
+        random_start = self._random_start[i]
+        return training_configuration(self._speeds[i], random_start, random_start and self._random_pellet_removal)
 
     def __len__(self) -> int:
         return len(self._buffer) if self.storage is None else len(self.storage)
@@ -106,11 +118,14 @@ class ReplayBuffer(Generic[P]):
         # the new observations to the device in one transfer instead of one per environment.
         transitions = []
         new_obs = []
-        for env, action, reset_config in zip(self._envs, actions, self._reset_configs):
+        for i, (env, action) in enumerate(zip(self._envs, actions)):
             reward, done = env.step(action)
+            self._moves[i] += 1
             if done:
                 next_action_mask = [False] * NUM_ACTIONS
-                reset_env(env, reset_config)
+                self.speed_sampler.record(self._speeds[i], self._moves[i])
+                self._speeds[i], self._moves[i] = self.speed_sampler.draw(), 0
+                reset_env(env, self._reset_configuration(i))
             else:
                 next_action_mask = replay_buffer_action_mask(env)
             transitions.append((action, reward, done, next_action_mask))

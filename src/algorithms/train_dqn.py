@@ -79,7 +79,7 @@ from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
 from dqn_update import EagerUpdate, GraphedUpdate, set_capturable, set_learning_rate
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, TRAINING_SPEEDS, NORMAL_SPEED
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, training_speeds, NORMAL_SPEED, set_speed_sampling, set_max_speed, SPEED_SAMPLING_MODES, MIN_SPEED
 import parallel_training
 
 
@@ -152,6 +152,12 @@ if __name__ == "__main__":
     # Before any actor or evaluation process starts, so they inherit it (--eval uses the checkpoint's)
     set_single_model(args.single_model)
     set_ghost_next_obs(args.ghost_next_obs)
+    if args.speed_sampling not in SPEED_SAMPLING_MODES:
+        parser.error(f"--speed_sampling must be one of {SPEED_SAMPLING_MODES}")
+    if args.max_speed < MIN_SPEED:
+        parser.error(f"--max_speed must be at least {MIN_SPEED}")
+    set_speed_sampling(args.speed_sampling)
+    set_max_speed(args.max_speed)
     if args.random_start_proportion > 0 and not args.single_model:
         parser.error("--random_start_proportion needs --single-model")
     if args.random_pellet_removal and args.random_start_proportion == 0:
@@ -619,12 +625,12 @@ def _train(replay_buffer, evaluator, actors: bool):
                         results = {
                             k: [parallel_training.evaluate_episode(q_net, device, ENV_VERSION, ticks_per_step=k)
                                 for _ in range(games)]
-                            for k in TRAINING_SPEEDS
+                            for k in training_speeds()
                         }
                     consider_candidate(iter_num, results, build_metadata(iter_num), metrics)
                 else:
                     evaluator.submit_candidate(
-                        iter_num, q_net, TRAINING_SPEEDS, cpu_copy(build_metadata(iter_num)),
+                        iter_num, q_net, training_speeds(), cpu_copy(build_metadata(iter_num)),
                         games_per_speed=games,
                     )
             if evaluator is not None:
