@@ -2,6 +2,8 @@ pub mod candle_inference;
 pub mod candle_qnet;
 pub mod env;
 pub mod grid;
+#[cfg(feature = "python")]
+pub mod gumbel;
 // pub mod mcts;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -16,6 +18,8 @@ use env::{PacmanGym, PacmanGymConfiguration};
 fn pacbot_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PacmanGymConfiguration>()?;
     m.add_class::<PacmanGym>()?;
+    m.add_class::<gumbel::GumbelConfig>()?;
+    m.add_function(wrap_pyfunction!(gumbel::gumbel_search, m)?)?;
     // m.add_class::<MCTSContext>()?;
     Ok(())
 }

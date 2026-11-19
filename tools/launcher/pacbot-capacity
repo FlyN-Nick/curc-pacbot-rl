@@ -1,0 +1,18 @@
+#!/bin/bash
+# pacbot-capacity [N]: show, or (machine owner only) set, how many teammates' runs may train at
+# once (0 to PACBOT_TRAIN_MAX). Lowering it stops the newest teammate runs at their latest
+# checkpoint within about 20 seconds; they resume from it when it goes back up. The owner's own
+# runs aren't limited by it, only by the overall maximum. From Windows: wsl pacbot-capacity 0
+set -euo pipefail
+STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
+OWNER=${PACBOT_TRAIN_OWNER:-nassa}
+MAX=${PACBOT_TRAIN_MAX:-3}
+if [ $# -eq 0 ]; then
+  echo "Teammate runs allowed at once: $(cat "$STATE/capacity" 2>/dev/null || echo "$MAX") (overall maximum $MAX)"
+  exit 0
+fi
+[[ $1 =~ ^[0-9]+$ ]] && [ "$1" -le "$MAX" ] || { echo "usage: pacbot-capacity [0-$MAX]" >&2; exit 1; }
+[ "$(id -un)" = "$OWNER" ] || { echo "pacbot-capacity: only $OWNER can change it" >&2; exit 1; }
+tmp=$(mktemp "$STATE/.capacity.XXXXXX")
+echo "$1" > "$tmp"; chmod 644 "$tmp"; mv -f "$tmp" "$STATE/capacity"
+echo "Teammate runs allowed at once: $1 (takes effect within about 20 seconds)"

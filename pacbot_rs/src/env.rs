@@ -27,6 +27,10 @@ pub struct PacmanGymConfiguration {
     /// If this && `random_start`, randomize the ghosts' starting positions
     #[pyo3(get, set)]
     pub randomize_ghosts: bool,
+    /// If this && `random_start`, instead of wiping half the board (4 times in 5), remove a
+    /// random share of the pellets, drawn uniformly from 0 to 98% per game, anywhere on the board
+    #[pyo3(get, set)]
+    pub random_pellet_removal: bool,
 
     /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
     #[pyo3(get, set)]
@@ -70,6 +74,9 @@ pub struct PacmanGymConfiguration {
     pub random_start: bool,
     /// If this && `random_start`, randomize the ghosts' starting positions
     pub randomize_ghosts: bool,
+    /// If this && `random_start`, instead of wiping half the board (4 times in 5), remove a
+    /// random share of the pellets, drawn uniformly from 0 to 98% per game, anywhere on the board
+    pub random_pellet_removal: bool,
 
     /// If true, randomize pacman speed per game, else [`NORMAL_TICKS_PER_STEP`]
     pub random_ticks: bool,
@@ -104,6 +111,7 @@ impl Default for PacmanGymConfiguration {
             random_start: false,
             random_ticks: false,
             randomize_ghosts: false,
+            random_pellet_removal: false,
 
             random_ticks_per_step_min: 4,
             random_ticks_per_step_max: 14,
@@ -234,6 +242,11 @@ pub struct PacmanGym {
     /// Kept across resets.
     #[pyo3(get)]
     pub env_version: u32,
+
+    /// Observation channels 8-11 hold each ghost's next square (its square plus the
+    /// direction it is moving in) instead of a copy of its current square. Kept across resets.
+    #[pyo3(get, set)]
+    pub ghost_next_obs: bool,
 }
 
 #[cfg(not(feature = "python"))]
@@ -250,6 +263,9 @@ pub struct PacmanGym {
     /// Version of the environment rules; see [`LATEST_ENV_VERSION`].
     /// Kept across resets.
     pub env_version: u32,
+
+    /// See the Python build's field of the same name.
+    pub ghost_next_obs: bool,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -270,6 +286,18 @@ fn loc_to_pos(loc: LocationState) -> Option<(usize, usize)> {
     }
 }
 
+/// The square a ghost moves to at the next update, in our coords: one square ahead in the
+/// direction it is facing. None if the ghost is off the board or the square is outside it.
+fn ghost_next_pos(loc: LocationState) -> Option<(usize, usize)> {
+    loc_to_pos(loc)?;
+    let (row, col) = loc.get_ahead_coords(1);
+    if (0..31).contains(&row) && (0..28).contains(&col) {
+        loc_to_pos(LocationState { row, col, dir: loc.dir })
+    } else {
+        None
+    }
+}
+
 // Common Rust Implementation
 impl PacmanGym {
     pub fn new(config: &PacmanGymConfiguration) -> Self {
@@ -281,6 +309,7 @@ impl PacmanGym {
             game_state: GameState::new(),
             ticks_per_step: NORMAL_TICKS_PER_STEP,
             env_version: LATEST_ENV_VERSION,
+            ghost_next_obs: false,
         };
         s.reset(config);
         s
@@ -334,26 +363,43 @@ impl PacmanGym {
                 }
             }
 
-            // Randomly remove pellets from half the board (left, right, top, bottom) or don't.
-            let wipe_type = rng.gen_range(0..=4);
-            if wipe_type != 0 {
+            if config.random_pellet_removal {
+                // Remove each pellet with the same probability, drawn per game
+                let removal: f64 = rng.gen_range(0.0..=0.98);
                 for row in 0..31 {
                     for col in 0..28 {
-                        if self.game_state.pellet_at((row, col))
-                            && match wipe_type {
-                                1 => col < 28 / 2,
-                                2 => col >= 28 / 2,
-                                3 => row < 31 / 2,
-                                4 => row >= 31 / 2,
-                                _ => unreachable!(),
-                            }
-                        {
+                        if self.game_state.pellet_at((row, col)) && rng.gen_bool(removal) {
                             modify_bit_u32(
                                 &mut self.game_state.pellets[row as usize],
                                 col as usize,
                                 false,
                             );
                             self.game_state.decrement_num_pellets();
+                        }
+                    }
+                }
+            } else {
+                // Randomly remove pellets from half the board (left, right, top, bottom) or don't.
+                let wipe_type = rng.gen_range(0..=4);
+                if wipe_type != 0 {
+                    for row in 0..31 {
+                        for col in 0..28 {
+                            if self.game_state.pellet_at((row, col))
+                                && match wipe_type {
+                                    1 => col < 28 / 2,
+                                    2 => col >= 28 / 2,
+                                    3 => row < 31 / 2,
+                                    4 => row >= 31 / 2,
+                                    _ => unreachable!(),
+                                }
+                            {
+                                modify_bit_u32(
+                                    &mut self.game_state.pellets[row as usize],
+                                    col as usize,
+                                    false,
+                                );
+                                self.game_state.decrement_num_pellets();
+                            }
                         }
                     }
                 }
@@ -476,11 +522,26 @@ impl PacmanGym {
             return total_distance < 30;
         }
         // Ghosts that aren't on the board (not yet spawned) are neither close nor far.
-        let mut on_board = self.game_state.ghosts.iter().filter(|g| loc_to_pos(g.loc).is_some()).peekable();
+        let mut on_board =
+            self.game_state.ghosts.iter().filter(|g| loc_to_pos(g.loc).is_some()).peekable();
         if on_board.peek().is_none() {
             return false;
         }
         on_board.map(|g| distance(g.loc) as i32).sum::<i32>() < 30
+    }
+
+    /// Maze distance, in squares, from Pacman to the nearest ghost that can catch him: one on
+    /// the maze that isn't frightened. None if there is none (e.g. all frightened or in the pen).
+    pub fn nearest_danger_distance(&self) -> Option<u8> {
+        let p = self.game_state.pacman_loc;
+        let pacman = coords_to_node((p.row, p.col))?;
+        self.game_state
+            .ghosts
+            .iter()
+            .filter(|g| !g.is_frightened())
+            .filter_map(|g| coords_to_node((g.loc.row, g.loc.col)))
+            .map(|ghost| DISTANCE_MATRIX[pacman][ghost])
+            .min()
     }
 
     pub fn remaining_pellets(&self) -> u16 {
@@ -662,10 +723,16 @@ impl PacmanGym {
             }
         }
 
-        // last ghost pos is not useful information because between most updates in real competition,
-        // the ghosts don't move. In the future, the ai should be given the ghost's next position
-        // based on the direction it is facing
-        for (i, pos) in /* self.last_ghost_pos */ new_ghost_pos.iter().enumerate() {
+        // The last ghost positions are not useful: between most updates in the real competition
+        // the ghosts don't move. These channels hold either a copy of the current positions or,
+        // with ghost_next_obs, each ghost's next square: the game moves a ghost one square in the
+        // direction it is facing at the next update, and the server broadcasts that direction.
+        for (i, g) in game_state.ghosts.iter().enumerate() {
+            let pos = if self.ghost_next_obs {
+                ghost_next_pos(g.loc).or(new_ghost_pos[i])
+            } else {
+                new_ghost_pos[i]
+            };
             if let Some(pos) = pos {
                 last_ghost[(i, pos.0, pos.1)] = 1.0;
             }
@@ -769,6 +836,11 @@ impl PacmanGym {
         self.are_ghosts_close()
     }
 
+    #[pyo3(name = "nearest_danger_distance")]
+    pub fn py_nearest_danger_distance(&self) -> Option<u8> {
+        self.nearest_danger_distance()
+    }
+
     #[pyo3(name = "remaining_pellets")]
     pub fn py_remaining_pellets(&self) -> u16 {
         self.remaining_pellets()
@@ -806,6 +878,31 @@ impl PacmanGym {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.set_state(new_state, ticks_per_step);
         Ok(())
+    }
+
+    /// A copy of this environment, for searching ahead. With `reseed` (the default), the copy's
+    /// random choices (frightened ghosts' moves) are drawn afresh instead of repeating the
+    /// original's, so a search can't see how the real game's randomness will turn out.
+    #[pyo3(signature = (reseed = true))]
+    pub fn copy(&self, reseed: bool) -> Self {
+        let mut env = self.clone();
+        if reseed {
+            env.game_state.seed = rand::random();
+        }
+        env
+    }
+
+    /// The seed of the game's random choices (frightened ghosts' moves; the start is chosen at
+    /// reset, from a fresh random source). Setting it after a reset makes the rest of the game
+    /// repeatable: the same seed and the same moves give the same game.
+    #[getter]
+    pub fn get_seed(&self) -> u64 {
+        self.game_state.seed
+    }
+
+    #[setter]
+    pub fn set_seed(&mut self, seed: u64) {
+        self.game_state.seed = seed;
     }
 
     #[classattr]

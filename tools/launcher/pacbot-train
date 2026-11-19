@@ -1,0 +1,308 @@
+#!/bin/bash
+# pacbot-train: shared launcher for DQN training runs on a machine several people use.
+#
+#   pacbot-train start NAME [-- TRAIN_DQN_ARGS...]   queue a run and return (runs detached)
+#   pacbot-train run NAME [-- TRAIN_DQN_ARGS...]     the same, but wait until it finishes
+#   pacbot-train list                                everyone's runs and the queue
+#   pacbot-train stop NAME                           stop one of your runs (it can be resumed)
+#   pacbot-train log NAME [USER]                     follow a run's training log
+#   pacbot-train forget NAME                         remove a finished run from the list
+#
+# Run it from your own curc-pacbot-rl checkout (anywhere inside it). A run trains with
+#   ../.venv/bin/python -m algorithms.train_dqn --checkpoint-dir checkpoints/NAME ARGS...
+# from that checkout's src/, logging to src/checkpoints/NAME/train.log. Starting a NAME again
+# resumes it from its latest checkpoint; a run that finished leaves a `done` file and isn't
+# started again. A run that's stopped or paused saves a checkpoint and its replay memory first,
+# so it resumes exactly where it stopped.
+#
+# At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way.
+# Waiting runs start in the order they were queued. The machine's owner sets how many of
+# those may be teammates' runs with pacbot-capacity; when it goes down, the newest teammate
+# runs stop (saving as above) and wait, and resume once there's room.
+set -euo pipefail
+
+STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
+OWNER=${PACBOT_TRAIN_OWNER:-nassa}          # whose runs pacbot-capacity doesn't limit
+MAX=${PACBOT_TRAIN_MAX:-3}
+POLL=${PACBOT_TRAIN_POLL:-20}               # seconds between checks
+MATCH=${PACBOT_TRAIN_MATCH:-algorithms.train_dqn}  # how other training processes are found
+JOBS=$STATE/jobs
+ME=$(id -un)
+
+die() { echo "pacbot-train: $*" >&2; exit 1; }
+now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
+[ -d "$JOBS" ] || die "$JOBS doesn't exist; run tools/launcher/install.sh first"
+
+capacity() {
+  local c
+  c=$(cat "$STATE/capacity" 2>/dev/null || echo "$MAX")
+  [[ $c =~ ^[0-9]+$ ]] || c=$MAX
+  echo "$c"
+}
+
+# Job records: $JOBS/USER.NAME holds key=value lines, written only by their owner (the
+# directory is sticky); USER.NAME.args holds the training arguments, NUL-separated.
+get() { sed -n "s/^$2=//p" "$JOBS/$1" 2>/dev/null | tail -1; }
+put() {  # put ID key value: rewrite one field, atomically
+  local tmp
+  tmp=$(mktemp "$JOBS/.$1.XXXXXX")
+  { grep -v "^$2=" "$JOBS/$1" 2>/dev/null || true; echo "$2=$3"; } > "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$JOBS/$1"
+}
+# /proc, not kill -0, so other users' processes count too
+alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ]; }
+job_ids() {
+  local f
+  for f in "$JOBS"/*; do
+    [ -f "$f" ] || continue
+    case $f in *.args|*.stop) continue ;; esac
+    basename "$f"
+  done
+}
+running() { [ "$(get "$1" state)" = running ] && alive "$(get "$1" pid)"; }
+
+# Number of training processes that weren't started by this launcher (e.g. queue scripts)
+others() {
+  local pids=" " id p n=0
+  for id in $(job_ids); do running "$id" && pids+="$(get "$id" pid) "; done
+  # Python processes running the module (not shells or editors whose command mentions it)
+  for p in $(pgrep -f -- "^[^ ]*python[^ ]*( [^ ]*\.py)? -u -m $MATCH( |\$)" || true); do
+    [[ $pids == *" $p "* ]] || n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# Called holding the lock: whether job $1 may start now
+may_start() {
+  local total teammates=0 id cap
+  total=$(others)
+  for id in $(job_ids); do
+    if running "$id"; then
+      total=$((total + 1))
+      [ "$(get "$id" user)" = "$OWNER" ] || teammates=$((teammates + 1))
+    fi
+  done
+  cap=$(capacity)
+  # The earliest waiting run that fits goes first
+  for id in $(for j in $(job_ids); do
+                # A waiting run whose launcher process is gone (e.g. after a reboot) doesn't hold its place
+                case $(get "$j" state) in queued|paused) alive "$(get "$j" sup)" && echo "$(get "$j" seq) $j" ;; esac
+              done | sort -n | cut -d' ' -f2); do
+    [ "$total" -lt "$MAX" ] || return 1
+    if [ "$(get "$id" user)" != "$OWNER" ] && [ "$teammates" -ge "$cap" ]; then
+      continue
+    fi
+    [ "$id" = "$1" ]
+    return
+  done
+  return 1
+}
+
+# Called holding the lock: whether running teammate job $1 must make room
+must_pause() {
+  local id over n=0
+  [ "$(get "$1" user)" = "$OWNER" ] && return 1
+  for id in $(job_ids); do
+    running "$id" && [ "$(get "$id" user)" != "$OWNER" ] && n=$((n + 1))
+  done
+  over=$((n - $(capacity)))
+  [ "$over" -gt 0 ] || return 1
+  # The newest `over` running teammate runs stop
+  for id in $(for j in $(job_ids); do
+                running "$j" && [ "$(get "$j" user)" != "$OWNER" ] && echo "$(get "$j" seq) $j"
+              done | sort -rn | head -n "$over" | cut -d' ' -f2); do
+    [ "$id" = "$1" ] && return 0
+  done
+  return 1
+}
+
+stop_training() {  # stop a training run and wait for it
+  local pid=$1 i
+  # SIGTERM to the training process alone: it saves a checkpoint and its replay memory, then
+  # shuts its worker processes down itself (a signal to them would cut it off mid-step).
+  # Saving a large replay memory takes a while; after 10 minutes, the whole group is killed.
+  kill -TERM -- "$pid" 2>/dev/null || true
+  for i in $(seq 600); do alive "$pid" || return 0; sleep 1; done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+}
+
+supervise() {
+  local id=$1 dir name log pid code args=()
+  dir=$(get "$id" dir); name=$(get "$id" name)
+  log=$dir/checkpoints/$name/launcher.log
+  [ -s "$JOBS/$id.args" ] && mapfile -d '' args < "$JOBS/$id.args"
+  put "$id" sup "$$"
+  while true; do
+    # Wait for room
+    while true; do
+      if [ -e "$JOBS/$id.stop" ]; then
+        put "$id" state stopped; rm -f "$JOBS/$id.stop"; echo "$(now) stopped while waiting" >> "$log"; return
+      fi
+      exec 9>>"$STATE/lock"; flock 9
+      if may_start "$id"; then
+        local ckpt=$dir/checkpoints/$name resume=()
+        if [ -f "$ckpt/q_net-latest.ckpt.pt" ]; then
+          cp "$ckpt/q_net-latest.ckpt.pt" "$ckpt/resume-from.ckpt.pt"
+          resume=(--finetune "checkpoints/$name/resume-from.ckpt.pt")
+        fi
+        (
+          exec 9>&-
+          cd "$dir"
+          export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -e systemprofile -e WindowsApps | paste -sd:)
+          export WANDB_NAME=$name
+          exec setsid "${PACBOT_TRAIN_PYTHON:-../.venv/bin/python}" -u -m "$MATCH" \
+            --checkpoint-dir "checkpoints/$name" "${resume[@]}" "${args[@]}" \
+            >> "checkpoints/$name/train.log" 2>&1 < /dev/null
+        ) &
+        pid=$!
+        put "$id" pid "$pid"; put "$id" state running; put "$id" started "$(now)"
+        flock -u 9
+        echo "$(now) started (pid $pid)${resume:+, resuming from the latest checkpoint}" >> "$log"
+        break
+      fi
+      flock -u 9
+      sleep "$POLL"
+    done
+
+    # Watch it
+    local paused=0 stopped=0
+    while alive "$pid"; do
+      sleep "$POLL"
+      alive "$pid" || break
+      if [ -e "$JOBS/$id.stop" ]; then
+        stopped=1; stop_training "$pid"; break
+      fi
+      exec 9>>"$STATE/lock"; flock 9
+      if must_pause "$id"; then
+        put "$id" state pausing; flock -u 9
+        paused=1; stop_training "$pid"; break
+      fi
+      flock -u 9
+    done
+    code=0; wait "$pid" || code=$?
+    if [ "$stopped" = 1 ]; then
+      rm -f "$JOBS/$id.stop"; put "$id" state stopped
+      echo "$(now) stopped by request" >> "$log"; return
+    elif [ "$paused" = 1 ]; then
+      put "$id" state paused
+      echo "$(now) paused to make room (pacbot-capacity $(capacity)); resumes when there's room" >> "$log"
+    elif [ "$code" = 0 ]; then
+      touch "$dir/checkpoints/$name/done"; put "$id" state done; put "$id" finished "$(now)"
+      echo "$(now) finished" >> "$log"; return
+    else
+      put "$id" state failed; put "$id" finished "$(now) (exit $code)"
+      echo "$(now) failed with exit code $code; see train.log" >> "$log"; return
+    fi
+  done
+}
+
+checkout_src() {
+  local top
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside your curc-pacbot-rl checkout"
+  [ -f "$top/src/algorithms/train_dqn.py" ] || die "$top isn't a curc-pacbot-rl checkout (no src/algorithms/train_dqn.py)"
+  [ -x "$top/.venv/bin/python" ] || [ -n "${PACBOT_TRAIN_PYTHON:-}" ] || die "$top/.venv is missing; set up the checkout first (see its README)"
+  echo "$top/src"
+}
+
+cmd_start() {
+  local wait=$1 name=$2; shift 2
+  [ "${1:-}" = "--" ] && shift
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "NAME may use letters, digits, '.', '_' and '-'"
+  local a; for a in "$@"; do
+    case $a in --checkpoint-dir*|--finetune*|--eval*) die "$a is set by the launcher" ;; esac
+  done
+  local id=$ME.$name dir
+  dir=$(checkout_src)
+  if alive "$(get "$id" sup)" || running "$id"; then
+    die "$name is already $(get "$id" state)"
+  fi
+  [ -f "$dir/checkpoints/$name/done" ] && die "$name already finished ($dir/checkpoints/$name/done)"
+  mkdir -p "$dir/checkpoints/$name"
+  rm -f "$JOBS/$id.stop"
+  if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi > "$JOBS/$id.args"; chmod 644 "$JOBS/$id.args"
+  local seq
+  exec 9>>"$STATE/lock"; flock 9
+  seq=$(( $(cat "$STATE/seq" 2>/dev/null || echo 0) + 1 )); echo "$seq" > "$STATE/seq"
+  flock -u 9
+  : > "$JOBS/$id"; chmod 644 "$JOBS/$id"
+  put "$id" user "$ME"; put "$id" name "$name"; put "$id" dir "$dir"; put "$id" seq "$seq"
+  put "$id" queued "$(now)"; put "$id" state queued
+  echo "$(now) queued: $*" >> "$dir/checkpoints/$name/launcher.log"
+  if [ "$wait" = 1 ]; then
+    supervise "$id"
+    [ "$(get "$id" state)" = done ]
+  else
+    setsid nohup "$0" __supervise "$id" >> "$dir/checkpoints/$name/launcher.log" 2>&1 < /dev/null &
+    echo "Queued $name. Follow it with: pacbot-train log $name   (or: pacbot-train list)"
+  fi
+}
+
+progress() {  # the latest "N/TOTAL [elapsed<left, speed]" from a training log
+  [ -f "$1" ] || return 0
+  tail -c 4000 "$1" | tr '\r' '\n' | grep -oE '[0-9]+/[0-9]+ \[[^]]*\]' | tail -1 || true
+}
+
+cmd_list() {
+  local id n=0 t=0
+  for id in $(job_ids); do
+    if running "$id"; then
+      n=$((n + 1))
+      [ "$(get "$id" user)" = "$OWNER" ] || t=$((t + 1))
+    fi
+  done
+  local o; o=$(others)
+  printf 'Training now: %s of at most %s (teammate runs: %s of at most %s)\n\n' \
+    "$((n + o))" "$MAX" "$t" "$(capacity)"
+  printf '%-4s %-8s %-24s %-9s %s\n' SEQ USER NAME STATE PROGRESS
+  for id in $(for j in $(job_ids); do echo "$(get "$j" seq) $j"; done | sort -n | cut -d' ' -f2); do
+    local state; state=$(get "$id" state)
+    case $state in
+      running) alive "$(get "$id" pid)" || state="gone" ;;
+      queued|paused) alive "$(get "$id" sup)" || state="gone" ;;
+    esac
+    printf '%-4s %-8s %-24s %-9s %s\n' "$(get "$id" seq)" "$(get "$id" user)" "$(get "$id" name)" \
+      "$state" "$(progress "$(get "$id" dir)/checkpoints/$(get "$id" name)/train.log" 2>/dev/null)"
+  done
+  [ "$o" -gt 0 ] && printf '\n%s more training run(s) started outside the launcher\n' "$o"
+  return 0
+}
+
+cmd_stop() {
+  local id=$ME.$1
+  [ -f "$JOBS/$id" ] || die "you have no run named $1"
+  case $(get "$id" state) in
+    queued|running|paused|pausing) alive "$(get "$id" sup)" || { put "$id" state stopped; echo "$1 wasn't running (stopped)"; return; }
+      touch "$JOBS/$id.stop"; chmod 644 "$JOBS/$id.stop"
+      echo "Stopping $1 (within ${POLL}s). Start it again later to resume from its latest checkpoint." ;;
+    *) echo "$1 is $(get "$id" state)" ;;
+  esac
+}
+
+cmd_log() {
+  local user=${2:-$ME} id
+  id=$user.$1
+  [ -f "$JOBS/$id" ] || die "no run $1 for $user"
+  tail -n 20 -F "$(get "$id" dir)/checkpoints/$1/train.log"
+}
+
+cmd_forget() {
+  local id=$ME.$1
+  [ -f "$JOBS/$id" ] || die "you have no run named $1"
+  if alive "$(get "$id" sup)" || running "$id"; then die "$1 is $(get "$id" state); stop it first"; fi
+  rm -f "$JOBS/$id" "$JOBS/$id.args" "$JOBS/$id.stop"
+  echo "Removed $1 from the list (its checkpoints stay)"
+}
+
+case ${1:-} in
+  start) [ $# -ge 2 ] || die "usage: pacbot-train start NAME [-- ARGS...]"; shift; cmd_start 0 "$@" ;;
+  run) [ $# -ge 2 ] || die "usage: pacbot-train run NAME [-- ARGS...]"; shift; cmd_start 1 "$@" ;;
+  list|"") cmd_list ;;
+  stop) [ $# -eq 2 ] || die "usage: pacbot-train stop NAME"; cmd_stop "$2" ;;
+  log) [ $# -ge 2 ] || die "usage: pacbot-train log NAME [USER]"; cmd_log "$2" "${3:-}" ;;
+  forget) [ $# -eq 2 ] || die "usage: pacbot-train forget NAME"; cmd_forget "$2" ;;
+  __supervise) supervise "$2" ;;
+  -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command $1 (try: pacbot-train help)" ;;
+esac

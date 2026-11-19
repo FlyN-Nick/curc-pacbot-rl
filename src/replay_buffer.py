@@ -7,7 +7,9 @@ import numpy as np
 
 import pacbot_rs
 
-from utils import reset_env, NUM_ACTIONS, P, REPLAY_BUFFER_OBS_GYM_CONFIGURATION, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_while_not_policy
+from policies import ghost_aware_epsilons
+
+from utils import ghost_next_obs, random_start_configuration, reset_env, single_model, NUM_ACTIONS, P, replay_buffer_obs_config, DEFAULT_GYM_CONFIGURATION, replay_buffer_action_mask, step_envs_while_not_policy
 
 class ReplayItem(NamedTuple):
     obs: torch.Tensor
@@ -28,23 +30,48 @@ class ReplayBuffer(Generic[P]):
         num_parallel_envs: int,
         random_start_proportion: float,
         device: torch.device = torch.device("cpu"),
+        storage: "ReplayStorage | None" = None,
+        random_pellet_removal: bool = False,
+        near_ghost_epsilon: "tuple[float, int] | None" = None,
     ) -> None:
+        """
+        With `near_ghost_epsilon` (exploration rate, radius), the policy (an EpsilonGreedy)
+        explores at that rate near dangerous ghosts (see policies.ghost_aware_epsilons).
+        With `storage` (a replay_storage.ReplayStorage), transitions go there, and are sampled
+        with sample(); otherwise they're kept as ReplayItems, sampled with sample_batch().
+        """
         self._buffer = deque[ReplayItem](maxlen=maxlen)
+        self._maxlen = maxlen
+        self.storage = storage
         self.policy = policy
         self.device = device
+        self.near_ghost_epsilon = near_ghost_epsilon
 
-        # Initialize the environments.
-        self._envs = [
-            pacbot_rs.PacmanGym(
-                # pacbot_rs.PacmanGymConfiguration({"random_start":i < num_parallel_envs * random_start_proportion, "random_ticks": True})
-                DEFAULT_GYM_CONFIGURATION
-            )
+        # Initialize the environments. The first `random_start_proportion` of them start each
+        # game after the first from a random Pacman position, on a board with half its pellets
+        # removed 4 times in 5 (PacmanGymConfiguration.random_start), or with
+        # `random_pellet_removal` a random share of them, for practice at clearing the board;
+        # the rest start normally.
+        if random_start_proportion > 0 and not single_model():
+            raise ValueError("random_start_proportion needs --single-model: the super pellet "
+                             "model resets the games it finishes with the normal start")
+        num_random = round(num_parallel_envs * random_start_proportion)
+        self._reset_configs = [
+            random_start_configuration(random_pellet_removal) if i < num_random else replay_buffer_obs_config()
             for i in range(num_parallel_envs)
         ]
+        self._envs = [pacbot_rs.PacmanGym(DEFAULT_GYM_CONFIGURATION) for _ in range(num_parallel_envs)]
+        for env in self._envs:
+            env.ghost_next_obs = ghost_next_obs()
         self._last_obs = self._make_current_obs()
+        if storage is not None:
+            storage.set_initial_obs(self._last_obs)
+
+    def __len__(self) -> int:
+        return len(self._buffer) if self.storage is None else len(self.storage)
 
     def _make_current_obs(self) -> torch.Tensor:
-        obs = [env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION) for env in self._envs]
+        obs = [env.obs_numpy(replay_buffer_obs_config()) for env in self._envs]
         return torch.from_numpy(np.stack(obs)).to(self.device)
 
     @property
@@ -53,7 +80,7 @@ class ReplayBuffer(Generic[P]):
 
     def fill(self) -> None:
         """Generates experience until the buffer is filled to capacity."""
-        while len(self._buffer) < self._buffer.maxlen:
+        while len(self) < self._maxlen:
             self.generate_experience_step()
 
     @torch.no_grad()
@@ -61,24 +88,45 @@ class ReplayBuffer(Generic[P]):
         """Generates one step of experience for each parallel env and adds them to the buffer."""
 
         # if other models should take actions in the current state of the games, let them go first
-        for env in self._envs:
-            step_while_not_policy(env, self.device, reset_if_necessary=True)
+        step_envs_while_not_policy(self._envs, self.device)
 
         # Choose an action using the provided policy.
         action_masks = [replay_buffer_action_mask(env) for env in self._envs]
         action_masks = torch.from_numpy(np.stack(action_masks)).to(self.device)
-        actions = self.policy(self._last_obs, action_masks)
+        if self.near_ghost_epsilon is None:
+            actions = self.policy(self._last_obs, action_masks).tolist()
+        else:
+            epsilons = ghost_aware_epsilons(
+                self.policy.epsilon, [env.nearest_danger_distance() for env in self._envs],
+                *self.near_ghost_epsilon,
+            )
+            actions = self.policy(self._last_obs, action_masks, epsilons).tolist()
 
-        next_obs_stack = []
-        for env, last_obs, action in zip(self._envs, self._last_obs, actions.tolist()):
-            # Perform the action and observe the transition.
+        # Step every environment (resetting finished ones, in order, as before), then move all
+        # the new observations to the device in one transfer instead of one per environment.
+        transitions = []
+        new_obs = []
+        for env, action, reset_config in zip(self._envs, actions, self._reset_configs):
             reward, done = env.step(action)
             if done:
-                next_obs = None
                 next_action_mask = [False] * NUM_ACTIONS
+                reset_env(env, reset_config)
             else:
-                next_obs = torch.from_numpy(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION)).to(self.device)
                 next_action_mask = replay_buffer_action_mask(env)
+            transitions.append((action, reward, done, next_action_mask))
+            new_obs.append(env.obs_numpy(replay_buffer_obs_config()))
+        new_obs = torch.from_numpy(np.stack(new_obs)).to(self.device)
+
+        if self.storage is not None:
+            self.storage.add_step(new_obs, *zip(*transitions))
+            self._last_obs = new_obs
+            return
+
+        for last_obs, obs, (action, reward, done, next_action_mask) in zip(
+            self._last_obs, new_obs, transitions
+        ):
+            # A finished game has no next observation; its row of new_obs is the reset game.
+            next_obs = None if done else obs
 
             # # Subsample to focus training on end-game states.
             # keep_prob = 1.0 if env.remaining_pellets() < 140 else 0.1
@@ -90,15 +138,12 @@ class ReplayBuffer(Generic[P]):
             # Add the transition to the replay buffer.
             self._buffer.append(ReplayItem(last_obs, action, reward, next_obs, next_action_mask))
 
-            # Reset the environment if necessary and update last_obs.
-            if next_obs is None:
-                reset_env(env, REPLAY_BUFFER_OBS_GYM_CONFIGURATION)
-                next_obs_stack.append(torch.from_numpy(env.obs_numpy(REPLAY_BUFFER_OBS_GYM_CONFIGURATION)).to(self.device))
-            else:
-                next_obs_stack.append(next_obs)
-
-        self._last_obs = torch.stack(next_obs_stack)
+        self._last_obs = new_obs
 
     def sample_batch(self, batch_size: int) -> list[ReplayItem]:
-        """Samples a batch of transitions from the buffer."""
+        """Samples a batch of transitions from the buffer (without storage)."""
         return random.sample(self._buffer, k=batch_size)
+
+    def sample(self, batch_size: int):
+        """Samples a replay_storage.Batch (with storage)."""
+        return self.storage.sample(batch_size)
