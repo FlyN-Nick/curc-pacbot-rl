@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 import models  # noqa: E402
 import utils  # noqa: E402
-from alphazero import Example, NetworkEvaluator, Targets, TrainingStore, evaluate_games, losses  # noqa: E402
+from alphazero import Example, NetworkEvaluator, QNetworkEvaluator, Targets, TrainingStore, evaluate_games, losses  # noqa: E402
 from pacbot_rs import GumbelConfig, gumbel_search  # noqa: E402
 from utils import NUM_ACTIONS, OBS_SHAPE  # noqa: E402
 
@@ -261,6 +261,24 @@ class EvaluationTests(unittest.TestCase):
         big = np.concatenate([obs, obs])
         np.testing.assert_allclose(graphed(big, np.ones((10, 5), bool))[1], plain(big, np.ones((10, 5), bool))[1],
                                    rtol=1e-3, atol=1e-4)
+
+    def test_q_network_evaluator_uses_the_best_legal_q_value(self):
+        class FixedQ(torch.nn.Module):
+            def forward(self, obs):
+                return torch.tensor([[1.0, 5.0, -2.0, 3.0, 0.5]]).expand(obs.shape[0], -1)
+
+        ev = QNetworkEvaluator(FixedQ(), torch.device("cpu"), temperature=0.5)
+        legal = np.array([[True, False, True, True, False], [True] * 5])
+        values, logits = ev(np.zeros((2, *OBS_SHAPE), np.float32), legal)
+        np.testing.assert_allclose(values, [3.0, 5.0])  # the illegal 5.0 doesn't count in row 0
+        np.testing.assert_allclose(logits[0], [2.0, 0.0, -4.0, 6.0, 0.0])
+        np.testing.assert_allclose(logits[1], [2.0, 10.0, -4.0, 6.0, 1.0])
+        # It drives the search like any evaluator
+        envs = random_states(3, seed=14)
+        q_net = models.QNetV2(OBS_SHAPE, NUM_ACTIONS)
+        actions = gumbel_search(envs, QNetworkEvaluator(q_net, torch.device("cpu"), 0.3),
+                                GumbelConfig(num_simulations=4, gumbel_scale=0.0), OBS_CONFIG, 0)[0]
+        self.assertTrue(all(envs[i].action_mask()[a] for i, a in enumerate(actions)))
 
     def test_network_evaluator_shapes(self):
         net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)

@@ -76,6 +76,28 @@ class NetworkEvaluator:
         return value.float().cpu().numpy(), logits.float().cpu().numpy()
 
 
+class QNetworkEvaluator:
+    """
+    A DQN Q network as the search's evaluator, so DQN agents can play with the same search:
+    the value of a state is its best legal Q value, and the policy's logits are the legal Q
+    values divided by `temperature`. DQN training uses the same reward scale and discount as
+    the search (0.02 and 0.99), so its Q values are already in the search's units.
+    """
+
+    def __init__(self, q_net: torch.nn.Module, device: torch.device, temperature: float) -> None:
+        self.q_net = q_net
+        self.device = device
+        self.temperature = temperature
+
+    @torch.inference_mode()
+    def __call__(self, obs: np.ndarray, legal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        q = self.q_net(torch.from_numpy(obs).to(self.device)).float()
+        q = q.masked_fill(~torch.from_numpy(legal).to(self.device), -torch.inf)
+        value = q.amax(dim=1)
+        logits = (q / self.temperature).masked_fill(q == -torch.inf, 0.0)
+        return value.cpu().numpy(), logits.cpu().numpy()
+
+
 class Example(NamedTuple):
     obs: np.ndarray     # (17, 28, 31) float32
     legal: np.ndarray   # (5,) bool
@@ -199,12 +221,13 @@ def losses(net: torch.nn.Module, batch: Batch) -> tuple[torch.Tensor, torch.Tens
 @torch.inference_mode()
 def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int, obs_config,
                    speeds, seeds, search: GumbelConfig | None = None, max_steps: int = 10_000,
-                   search_seed: int = 0) -> list[dict]:
+                   search_seed: int = 0, evaluator=None) -> list[dict]:
     """
     Plays one game per (speed, seed) from the normal start, all at once, until each loses a
     life, clears the board or reaches max_steps: greedily by the network's policy, or with
-    `search` (use gumbel_scale=0 for no exploration). Returns one dict per game: speed, seed,
-    score, steps, cleared, pellets_left.
+    `search` (use gumbel_scale=0 for no exploration). The search evaluates states with
+    `evaluator` if given (e.g. QNetworkEvaluator), else with the network. Returns one dict per
+    game: speed, seed, score, steps, cleared, pellets_left.
     """
     net.eval()
     games = []
@@ -213,7 +236,8 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
             env = make_gym(speed_configuration(speed), env_version)
             env.seed = seed
             games.append({"speed": speed, "seed": seed, "env": env, "steps": 0, "done": False})
-    evaluator = NetworkEvaluator(net, device, max_batch=len(games)) if search is not None else None
+    if search is not None and evaluator is None:
+        evaluator = NetworkEvaluator(net, device, max_batch=len(games))
     step = 0
     while True:
         live = [g for g in games if not g["done"]]
