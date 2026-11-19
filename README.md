@@ -29,7 +29,7 @@ uv sync --python 3.11
 
 Initially, and after making changes to Rust code in `pacbot_rs/`, build the extension and install it into the project environment:
 ```sh
-uv run --project . --directory pacbot_rs maturin develop --release
+uv run --project .. --directory pacbot_rs maturin develop --release
 ```
 
 ## Training
