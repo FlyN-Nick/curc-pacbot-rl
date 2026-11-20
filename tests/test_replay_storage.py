@@ -28,11 +28,10 @@ if torch.backends.mps.is_available():  # Apple Silicon GPU
     DEVICES.append(torch.device("mps"))
 
 
-def real_observations(games: int = 40, steps: int = 300, max_games: int = 400) -> torch.Tensor:
+def real_observations(games: int = 40, steps: int = 300) -> torch.Tensor:
     """
-    Observations from real games: varied starts, speeds, frightened ghosts, both configs.
-    Random starts make the games differ from run to run, and in about 1 run in 40 no random
-    walk in the first `games` games ate a super pellet, so play on until a ghost is frightened.
+    Observations from real games: varied starts, speeds, frightened ghosts, both configs. The
+    games are seeded, so they are the same in every run.
     """
     from pacbot_rs import PacmanGym
 
@@ -41,16 +40,12 @@ def real_observations(games: int = 40, steps: int = 300, max_games: int = 400) -
               C({"random_ticks": True}), C({"random_start": True, "random_pellet_removal": True})]
     rng = random.Random(0)
     out = []
-    frightened = False
-    for game in range(max_games):
-        if game >= games and frightened:
-            break
-        env = PacmanGym(starts[game % len(starts)])
+    for game in range(games):
+        env = PacmanGym(starts[game % len(starts)], seed=game)
         env.ghost_next_obs = game % 3 == 2
         for step in range(steps):
             for config in (C({}), C({"obs_ignore_super_pellets": True})):
                 out.append(env.obs_numpy(config))
-            frightened = frightened or bool((out[-1][14] > 0).any())
             if step % 5 == 0:
                 action = rng.choice([a for a, ok in enumerate(env.action_mask()) if ok])
             _, done = env.step(action)
