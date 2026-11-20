@@ -26,7 +26,7 @@ class TrainingConfigurationTests(unittest.TestCase):
     def test_games_run_at_the_speed_asked_for_up_to_18(self):
         for speed in (4, 8, 14, 15, 18):
             for random_start in (False, True):
-                env = utils.make_gym(utils.training_configuration(speed, random_start), utils.ENV_VERSION)
+                env = utils.make_gym(utils.training_configuration(speed, random_start), utils.ENV_VERSION, seed=speed)
                 # Channel 15: Pacman's ticks per move over the ghosts' (12)
                 self.assertAlmostEqual(float(env.obs_numpy(CONFIG)[15, 0, 0]), speed / 12, places=5)
                 rng = random.Random(speed)

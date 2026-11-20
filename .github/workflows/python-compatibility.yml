@@ -38,6 +38,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache the Rust build
+        # Compiled dependencies, per OS and Python version (pyo3 builds for the Python it finds)
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: pacbot_rs -> target
+          key: py${{ matrix.python-version }}
       - name: Check lockfile
         run: uv lock --check
       - name: Install locked dependencies

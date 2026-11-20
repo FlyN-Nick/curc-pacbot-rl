@@ -32,8 +32,8 @@ def random_states(n, seed=0, max_moves=300):
     rng = random.Random(seed)
     states = []
     while len(states) < n:
-        env = utils.make_gym(utils.speed_configuration(rng.randint(4, 14)), utils.ENV_VERSION)
-        env.seed = rng.randrange(2**63)  # the same states every run
+        env = utils.make_gym(utils.speed_configuration(rng.randint(4, 14)), utils.ENV_VERSION,
+                             seed=rng.randrange(2**63))  # the same states every run
         for _ in range(rng.randint(0, max_moves)):
             mask = env.action_mask()
             _, done = env.step(rng.choice([a for a in range(NUM_ACTIONS) if mask[a]]))

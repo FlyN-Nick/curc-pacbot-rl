@@ -39,10 +39,10 @@ class SingleModelTests(unittest.TestCase):
         self.assertFalse(utils.single_model())
 
     def test_network_plays_every_state_with_the_normal_mask(self):
-        env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
+        env = PacmanGym(DEFAULT_GYM_CONFIGURATION, seed=0)
         rng = np.random.default_rng(0)
         seen_outside_purgatory = False
-        for _ in range(600):
+        for step in range(600):
             utils.set_single_model(False)
             two_model = (utils.in_purgatory(env), utils.replay_buffer_action_mask(env))
             seen_outside_purgatory |= not two_model[0]
@@ -53,7 +53,7 @@ class SingleModelTests(unittest.TestCase):
             actions = [a for a, ok in enumerate(env.action_mask()) if ok]
             _, done = env.step(int(rng.choice(actions)))
             if done:
-                env.reset(DEFAULT_GYM_CONFIGURATION)
+                env.reset(DEFAULT_GYM_CONFIGURATION, seed=step)
         self.assertTrue(seen_outside_purgatory, "the walk never left purgatory; test proves nothing")
 
     def test_observations_keep_super_pellets(self):
@@ -89,8 +89,8 @@ class SingleModelTests(unittest.TestCase):
         full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
         env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
         pellets = []
-        for _ in range(40):
-            env.reset(utils.random_start_configuration())
+        for seed in range(40):
+            env.reset(utils.random_start_configuration(), seed=seed)
             pellets.append(env.remaining_pellets())
         self.assertLess(min(pellets), full * 0.7, "random starts should often remove half the board")
 
@@ -107,8 +107,8 @@ class SingleModelTests(unittest.TestCase):
         full = PacmanGym(DEFAULT_GYM_CONFIGURATION).remaining_pellets()
         env = PacmanGym(DEFAULT_GYM_CONFIGURATION)
         shares = []
-        for _ in range(300):
-            env.reset(utils.random_start_configuration(random_pellet_removal=True))
+        for seed in range(300):
+            env.reset(utils.random_start_configuration(random_pellet_removal=True), seed=seed)
             shares.append(env.remaining_pellets() / full)
         # Uniform removal of 0-98%: boards from nearly full to nearly empty, not just halves
         self.assertGreater(max(shares), 0.9)

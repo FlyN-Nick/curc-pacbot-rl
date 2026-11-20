@@ -31,7 +31,7 @@ class ConstantQ(nn.Module):
 
 def played_env(steps: int, seed: int = 0) -> PacmanGym:
     rng = random.Random(seed)
-    env = PacmanGym(PacmanGymConfiguration({}))
+    env = PacmanGym(PacmanGymConfiguration({}), seed=seed)
     for _ in range(steps):
         env.step(rng.choice([a for a, ok in enumerate(env.action_mask()) if ok]))
     return env
@@ -93,7 +93,7 @@ class LookaheadTests(unittest.TestCase):
         flat = ConstantQ([0.0] * NUM_ACTIONS)
         results = {}
         for depth in (0, 3):
-            env = PacmanGym(PacmanGymConfiguration({}))
+            env = PacmanGym(PacmanGymConfiguration({}), seed=0)
             results[depth] = play_game(env, LookaheadPolicy(flat, depth, SCALE, GAMMA), max_steps=150)
         self.assertGreater(results[3]["pellets_eaten"], results[0]["pellets_eaten"] + 10)
 

@@ -98,9 +98,12 @@ def checkpoint_env_version(loaded) -> int:
     return 1  # legacy full-module checkpoint
 
 
-def make_gym(config: "PacmanGymConfiguration", env_version: int) -> PacmanGym:
-    """A PacmanGym following the rules of the given environment version."""
-    env = PacmanGym(config)
+def make_gym(config: "PacmanGymConfiguration", env_version: int, seed: int | None = None) -> PacmanGym:
+    """
+    A PacmanGym following the rules of the given environment version. With `seed`, the game
+    is repeatable (its start and its random choices come from the seed).
+    """
+    env = PacmanGym(config, seed=seed)
     env.env_version = env_version
     env.ghost_next_obs = ghost_next_obs()
     return env

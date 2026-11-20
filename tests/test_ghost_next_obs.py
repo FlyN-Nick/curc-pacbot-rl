@@ -36,12 +36,13 @@ class GhostNextObsTests(unittest.TestCase):
     def test_off_by_default_and_copies_the_current_squares(self):
         os.environ.pop("PACBOT_GHOST_NEXT_OBS", None)
         self.assertFalse(utils.ghost_next_obs())
-        gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION)
+        gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION, seed=1)
         self.assertFalse(gym.ghost_next_obs)
+        rng = random.Random(1)
         for _ in range(30):
             obs = gym.obs_numpy(DEFAULT_GYM_CONFIGURATION)
             np.testing.assert_array_equal(obs[8:12], obs[4:8])
-            if gym.step(random.choice([i for i, ok in enumerate(gym.action_mask()) if ok]))[1]:
+            if gym.step(rng.choice([i for i, ok in enumerate(gym.action_mask()) if ok]))[1]:
                 break
 
     def test_make_gym_follows_the_mode_and_resets_keep_it(self):
@@ -56,8 +57,8 @@ class GhostNextObsTests(unittest.TestCase):
         utils.set_ghost_next_obs(True)
         rng = random.Random(0)
         checked = matched = 0
-        for _ in range(5):
-            gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION)
+        for game in range(5):
+            gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION, seed=game)
             obs = gym.obs_numpy(DEFAULT_GYM_CONFIGURATION)
             for _ in range(300):
                 lives = gym.lives()
@@ -79,7 +80,8 @@ class GhostNextObsTests(unittest.TestCase):
 
     def test_one_square_per_ghost_on_the_board(self):
         utils.set_ghost_next_obs(True)
-        gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION)
+        gym = utils.make_gym(DEFAULT_GYM_CONFIGURATION, ENV_VERSION, seed=2)
+        rng = random.Random(2)
         for _ in range(50):
             obs = gym.obs_numpy(DEFAULT_GYM_CONFIGURATION)
             for g, n in zip(GHOSTS, NEXT):
@@ -87,7 +89,7 @@ class GhostNextObsTests(unittest.TestCase):
                 cur, nxt = _square(obs[g]), _square(obs[n])
                 if cur is not None:
                     self.assertLessEqual(abs(cur[0] - nxt[0]) + abs(cur[1] - nxt[1]), 1)
-            if gym.step(random.choice([i for i, ok in enumerate(gym.action_mask()) if ok]))[1]:
+            if gym.step(rng.choice([i for i, ok in enumerate(gym.action_mask()) if ok]))[1]:
                 break
 
     def test_checkpoint_flag(self):

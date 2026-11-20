@@ -11,7 +11,7 @@ use pacbot_rs_2::variables::{self, GHOST_FRIGHT_STEPS, INIT_LEVEL};
 use pyo3::exceptions::PyValueError;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
-use rand::{seq::SliceRandom, Rng};
+use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "python")]
@@ -301,6 +301,11 @@ fn ghost_next_pos(loc: LocationState) -> Option<(usize, usize)> {
 // Common Rust Implementation
 impl PacmanGym {
     pub fn new(config: &PacmanGymConfiguration) -> Self {
+        Self::new_with_seed(config, None)
+    }
+
+    /// A new game; see reset_with_seed.
+    pub fn new_with_seed(config: &PacmanGymConfiguration, seed: Option<u64>) -> Self {
         let mut s = Self {
             purgatory_pellets: 0,
             ghost_proximities: 0,
@@ -311,18 +316,27 @@ impl PacmanGym {
             env_version: LATEST_ENV_VERSION,
             ghost_next_obs: false,
         };
-        s.reset(config);
+        s.reset_with_seed(config, seed);
         s
     }
 
     pub fn reset(&mut self, config: &PacmanGymConfiguration) {
+        self.reset_with_seed(config, None)
+    }
+
+    /// A reset whose random choices all come from `seed`, when given: the start (speed,
+    /// positions, pellets) and the game's own randomness (frightened ghosts' moves), so the
+    /// same seed and the same moves give the same game. Without one, they are random.
+    pub fn reset_with_seed(&mut self, config: &PacmanGymConfiguration, seed: Option<u64>) {
+        let rng = &mut match seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_entropy(),
+        };
         self.purgatory_pellets = 0;
         self.last_score = 0;
         self.last_action = Action::Stay;
-        self.game_state = GameState::new();
+        self.game_state = GameState::new_with_seed(rng.gen());
         self.game_state.paused = false;
-
-        let rng = &mut rand::thread_rng();
 
         self.ticks_per_step = if config.random_ticks {
             rng.gen_range(config.random_ticks_per_step_min..=config.random_ticks_per_step_max)
@@ -786,14 +800,17 @@ impl PacmanGym {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PacmanGym {
+    /// With `seed`, the whole game is repeatable: the start and the game's own randomness come
+    /// from it, so the same seed and the same moves give the same game.
     #[new]
-    pub fn py_new(config: &PacmanGymConfiguration) -> Self {
-        Self::new(config)
+    #[pyo3(signature = (config, seed = None))]
+    pub fn py_new(config: &PacmanGymConfiguration, seed: Option<u64>) -> Self {
+        Self::new_with_seed(config, seed)
     }
 
-    #[pyo3(name = "reset")]
-    pub fn py_reset(&mut self, config: &PacmanGymConfiguration) {
-        self.reset(config)
+    #[pyo3(name = "reset", signature = (config, seed = None))]
+    pub fn py_reset(&mut self, config: &PacmanGymConfiguration, seed: Option<u64>) {
+        self.reset_with_seed(config, seed)
     }
 
     #[pyo3(name = "step")]
@@ -893,8 +910,9 @@ impl PacmanGym {
     }
 
     /// The seed of the game's random choices (frightened ghosts' moves; the start is chosen at
-    /// reset, from a fresh random source). Setting it after a reset makes the rest of the game
-    /// repeatable: the same seed and the same moves give the same game.
+    /// reset, from the seed given to reset or the constructor, or else at random). Setting it
+    /// after a reset makes the rest of the game repeatable: the same seed and the same moves
+    /// give the same game.
     #[getter]
     pub fn get_seed(&self) -> u64 {
         self.game_state.seed
