@@ -7,11 +7,13 @@ with each simulation count and device, and prints the time per move (median, 95t
 worst) next to the time the game gives a move: 24 game ticks per second, so 4-14 ticks per move
 is ~167-583 ms (the robot still has to move, so the search should use well under that).
 
-The network's weights don't change its speed, so by default it is freshly initialized; pass
---checkpoint to use a trained one (then the states come from games it plays with search).
+The network's weights don't change its speed, so by default each model in --models is freshly
+initialized (PVNetV2 and PVNetV2Wide for AlphaZero, QNetV2Wide for the wide DQN, which plays
+with search through QNetworkEvaluator); pass --checkpoint to time a trained one instead.
 
 Run from src/ (after building pacbot_rs with maturin):
-  python benchmark_search.py [--devices cpu,mps] [--sims 8,16,32,64,128] [--states 30] [--checkpoint CKPT]
+  python benchmark_search.py [--devices cpu,mps] [--models PVNetV2,PVNetV2Wide,QNetV2Wide]
+                             [--sims 8,16,32,64,128] [--states 30] [--checkpoint CKPT]
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import torch
 
 import models
 import utils
-from alphazero import NetworkEvaluator
+from alphazero import NetworkEvaluator, QNetworkEvaluator
 from pacbot_rs import GumbelConfig, gumbel_search
 
 
@@ -60,6 +62,8 @@ def main() -> None:
     parser.add_argument("--devices", default=",".join(available))
     parser.add_argument("--sims", default="8,16,32,64,128")
     parser.add_argument("--states", type=int, default=30)
+    parser.add_argument("--models", default="PVNetV2,PVNetV2Wide,QNetV2Wide",
+                        help="model classes to time, freshly initialized (ignored with --checkpoint)")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--cpu-threads", type=int, default=None, help="torch CPU threads (default: torch's)")
     args = parser.parse_args()
@@ -71,20 +75,27 @@ def main() -> None:
     states = game_states(args.states, seed=0)
     print(f"{len(states)} game states; torch {torch.__version__}, {torch.get_num_threads()} CPU threads")
     print(f"time per move at 24 ticks/s: speed 4 = 167 ms, 8 = 333 ms, 14 = 583 ms\n")
-    print(f"{'device':6s} {'sims':>5s} {'median':>8s} {'p95':>8s} {'worst':>8s}   per network call")
+    print(f"{'model':12s} {'device':6s} {'params':>7s} {'sims':>5s} {'median':>8s} {'p95':>8s} {'worst':>8s}"
+          f"   per network call")
 
-    for name in args.devices.split(","):
+    if args.checkpoint:
+        ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        runs = [(ck["config"]["model"], ck["state_dict"])]
+    else:
+        runs = [(model_name, None) for model_name in args.models.split(",")]
+    for (model_name, state_dict), name in ((r, d) for r in runs for d in args.devices.split(",")):
         device = torch.device(name)
-        if args.checkpoint:
-            ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-            net = getattr(models, ck["config"]["model"])(utils.OBS_SHAPE, utils.NUM_ACTIONS)
-            net.load_state_dict(ck["state_dict"])
-        else:
-            net = models.PVNetV2(utils.OBS_SHAPE, utils.NUM_ACTIONS)
+        net = getattr(models, model_name)(utils.OBS_SHAPE, utils.NUM_ACTIONS)
+        if state_dict is not None:
+            net.load_state_dict(state_dict)
+        params = sum(p.numel() for p in net.parameters())
         net = net.to(device).eval()
         if device.type != "mps":
             net = net.to(memory_format=torch.channels_last)
-        evaluator = NetworkEvaluator(net, device, max_batch=1)  # a CUDA graph on CUDA; plain calls elsewhere
+        if model_name.startswith("Q"):  # a DQN, searching with its Q values (temperature 0.3 as in eval)
+            evaluator = QNetworkEvaluator(net, device, temperature=0.3)
+        else:
+            evaluator = NetworkEvaluator(net, device, max_batch=1)  # a CUDA graph on CUDA; plain calls elsewhere
 
         # Warm up (first calls compile kernels / pick algorithms)
         for env in states[:3]:
@@ -110,7 +121,7 @@ def main() -> None:
                 times.append((time.perf_counter() - t) * 1000)
             times.sort()
             p95 = times[min(len(times) - 1, int(0.95 * len(times)))]
-            print(f"{name:6s} {sims:5d} {statistics.median(times):7.1f}ms {p95:7.1f}ms {times[-1]:7.1f}ms"
+            print(f"{model_name:12s} {name:6s} {params / 1e6:6.2f}M {sims:5d} {statistics.median(times):7.1f}ms {p95:7.1f}ms {times[-1]:7.1f}ms"
                   f"   {per_call:.2f} ms", flush=True)
         print()
 

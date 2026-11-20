@@ -230,6 +230,19 @@ class StoreAndLossTests(unittest.TestCase):
         self.assertLess(value_loss.item(), 0.5 * first[1])
 
 
+class PolicyValueNetTests(unittest.TestCase):
+    def test_both_sizes_start_uniform_and_the_wide_one_is_bigger(self):
+        obs = torch.from_numpy(np.stack([e.obs_numpy(OBS_CONFIG) for e in random_states(3, seed=5)]))
+        sizes = {}
+        for cls in (models.PVNetV2, models.PVNetV2Wide):
+            net = cls(OBS_SHAPE, NUM_ACTIONS)
+            logits, value = net(obs)
+            self.assertEqual((logits.shape, value.shape), ((3, NUM_ACTIONS), (3,)))
+            self.assertTrue((logits == 0).all() and (value == 0).all(), cls.__name__)
+            sizes[cls] = sum(p.numel() for p in net.parameters())
+        self.assertGreater(sizes[models.PVNetV2Wide], 3 * sizes[models.PVNetV2])
+
+
 class EvaluationTests(unittest.TestCase):
     def test_greedy_and_search_games(self):
         torch.manual_seed(0)
