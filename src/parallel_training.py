@@ -365,8 +365,12 @@ class ActorReplayBuffer:
     ) -> None:
         if not 1 <= num_actors <= num_parallel_envs:
             raise ValueError(f"num_actors must be 1..{num_parallel_envs}, got {num_actors}")
-        if any(True for _ in q_net.buffers()):
-            raise ValueError("ActorReplayBuffer only shares parameters; this model has buffers")
+        # Buffers that are state (in the state dict, like batch norm statistics) would differ
+        # between the actors and this process; non-persistent ones are constants every copy of
+        # the model builds the same way (the maze graph models' tables)
+        stateful = set(q_net.state_dict()) - {name for name, _ in q_net.named_parameters()}
+        if stateful:
+            raise ValueError(f"ActorReplayBuffer only shares parameters; this model has buffers {sorted(stateful)}")
 
         self.storage = ReplayStorage(maxlen, num_parallel_envs, device)
         # train_dqn reads and sets the exploration rate through policy.epsilon
