@@ -14,7 +14,7 @@ OBS_SHAPE = PacmanGym(DEFAULT_GYM_CONFIGURATION).obs_numpy(DEFAULT_GYM_CONFIGURA
 
 REPLAY_BUFFER_OBS_GYM_CONFIGURATION = PacmanGymConfiguration({"random_start": False, "random_ticks": True, "obs_ignore_super_pellets": True})
 def replay_buffer_action_mask(env: PacmanGym) -> list[bool]:
-    return env.purgatory_action_mask()
+    return env.safety_action_mask(env.purgatory_action_mask())
 
 P = TypeVar("P", bound=Policy)
 
@@ -50,7 +50,7 @@ def safetensors_qnet(filename: str, force_reload: bool=False, device="cpu") -> P
 
 def _step_always_with(env: PacmanGym, policy: Policy, config: PacmanGymConfiguration, action_mask: list[bool], device) -> tuple[int, bool]:
     obs = torch.from_numpy(env.obs_numpy(config)).to(device).unsqueeze(0)
-    action_mask = torch.tensor(action_mask, device=device).unsqueeze(0)
+    action_mask = torch.tensor(env.safety_action_mask(action_mask), device=device).unsqueeze(0)
     return env.step(policy(obs, action_mask).item())
 
 def reset_env(env: PacmanGym, config: PacmanGymConfiguration) -> None:

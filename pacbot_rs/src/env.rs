@@ -58,6 +58,15 @@ pub struct PacmanGymConfiguration {
     /// Note: regular pellets may still appear
     #[pyo3(get, set)]
     pub obs_ignore_super_pellets: bool,
+    /// Preferred corridor distance from dangerous ghosts.
+    #[pyo3(get, set)]
+    pub ghost_clearance: u32,
+    /// Clearance required after the estimated ghost movement allowance.
+    #[pyo3(get, set)]
+    pub safety_clearance: u32,
+    /// Additional ticks reserved for command and turning delays.
+    #[pyo3(get, set)]
+    pub safety_delay_ticks: u32,
 }
 
 #[cfg(not(feature = "python"))]
@@ -96,6 +105,12 @@ pub struct PacmanGymConfiguration {
     ///
     /// Note: regular pellets may still appear
     pub obs_ignore_super_pellets: bool,
+    /// Preferred corridor distance from dangerous ghosts.
+    pub ghost_clearance: u32,
+    /// Clearance required after the estimated ghost movement allowance.
+    pub safety_clearance: u32,
+    /// Additional ticks reserved for command and turning delays.
+    pub safety_delay_ticks: u32,
 }
 
 impl Default for PacmanGymConfiguration {
@@ -110,6 +125,9 @@ impl Default for PacmanGymConfiguration {
 
             obs_ignore_regular_pellets: false,
             obs_ignore_super_pellets: false,
+            ghost_clearance: 4,
+            safety_clearance: 2,
+            safety_delay_ticks: 4,
         }
     }
 }
@@ -119,9 +137,7 @@ impl Default for PacmanGymConfiguration {
 impl PacmanGymConfiguration {
     #[new]
     pub fn new(configuration: Py<PyAny>) -> Self {
-        Python::attach(|py| {
-            serde_pyobject::from_pyobject(configuration.bind(py).clone()).unwrap()
-        })
+        Python::attach(|py| serde_pyobject::from_pyobject(configuration.bind(py).clone()).unwrap())
     }
 }
 
@@ -220,6 +236,7 @@ pub struct PacmanGym {
     pub ghost_proximities: u32,
 
     pub ticks_per_step: u32,
+    safety_config: PacmanGymConfiguration,
 }
 
 #[cfg(not(feature = "python"))]
@@ -232,6 +249,7 @@ pub struct PacmanGym {
     pub ghost_proximities: u32,
 
     pub ticks_per_step: u32,
+    safety_config: PacmanGymConfiguration,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -262,12 +280,14 @@ impl PacmanGym {
             last_action: Action::Stay,
             game_state: GameState::new(),
             ticks_per_step: NORMAL_TICKS_PER_STEP,
+            safety_config: *config,
         };
         s.reset(config);
         s
     }
 
     pub fn reset(&mut self, config: &PacmanGymConfiguration) {
+        self.safety_config = *config;
         self.purgatory_pellets = 0;
         self.last_score = 0;
         self.last_action = Action::Stay;
@@ -385,18 +405,12 @@ impl PacmanGym {
                 reward += LAST_REWARD as i32;
             }
         }
-        // Punishment for being too close to a ghost
-        let pacbot_pos = self.game_state.pacman_loc;
+        // Penalize insufficient corridor clearance while preserving ghost clustering.
         for ghost in &game_state.ghosts {
             if !ghost.is_frightened() {
-                let ghost_pos = ghost.loc;
-                reward += match (pacbot_pos.row - ghost_pos.row).abs()
-                    + (pacbot_pos.col - ghost_pos.col).abs()
-                {
-                    1 => -50,
-                    2 => -20,
-                    _ => 0,
-                };
+                let distance = Self::corridor_distance(game_state.pacman_loc, ghost.loc);
+                let deficit = self.safety_config.ghost_clearance.saturating_sub(distance);
+                reward -= (5 * deficit * deficit) as i32;
             }
         }
         // Purgatory only
@@ -452,6 +466,53 @@ impl PacmanGym {
         }
         // for now, acceptable distance maximum is 30
         return total_distance < 30;
+    }
+
+    fn corridor_distance(a: LocationState, b: LocationState) -> u32 {
+        match (coords_to_node((a.row, a.col)), coords_to_node((b.row, b.col))) {
+            (Some(a), Some(b)) => DISTANCE_MATRIX[a][b] as u32,
+            _ => u32::MAX,
+        }
+    }
+
+    /// Conservative reachability over a move plus a delay allowance.
+    /// Ghosts are assumed able to advance one corridor cell per 12 game ticks
+    /// (the level-one simulator cadence), including an imminent first advance.
+    pub fn safety_action_mask(&self, allowed: [bool; 5]) -> [bool; 5] {
+        let horizon = self.ticks_per_step.saturating_add(self.safety_config.safety_delay_ticks);
+        let ghost_moves = horizon / TICKS_PER_UPDATE + 1;
+        let origin = self.game_state.pacman_loc;
+        let mut margins = [i64::MIN; 5];
+        let mut safe = [false; 5];
+        for action in 0..5 {
+            if !allowed[action] {
+                continue;
+            }
+            let mut candidate = self.clone();
+            candidate.move_one_cell(Action::from_index(action));
+            let destination = candidate.game_state.pacman_loc;
+            let mut destination_margin = i64::MAX;
+            let mut path_margin = i64::MAX;
+            for ghost in &self.game_state.ghosts {
+                if ghost.is_frightened() {
+                    continue;
+                }
+                let end_distance = Self::corridor_distance(destination, ghost.loc) as i64;
+                let start_distance = Self::corridor_distance(origin, ghost.loc) as i64;
+                destination_margin = destination_margin.min(end_distance - ghost_moves as i64);
+                // Both ends of this one-cell edge remain exposed during traversal.
+                path_margin =
+                    path_margin.min(start_distance.min(end_distance) - ghost_moves as i64);
+            }
+            margins[action] = destination_margin;
+            safe[action] = path_margin >= self.safety_config.safety_clearance as i64;
+        }
+        if safe.iter().any(|value| *value) {
+            return safe;
+        }
+        // When already surrounded, retain moves with the best escape clearance.
+        let best = *margins.iter().max().unwrap();
+        std::array::from_fn(|i| allowed[i] && margins[i] == best)
     }
 
     pub fn remaining_pellets(&self) -> u16 {
@@ -745,6 +806,11 @@ impl PacmanGym {
         self.remaining_pellets()
     }
 
+    #[pyo3(name = "safety_action_mask")]
+    pub fn py_safety_action_mask(&self, allowed: [bool; 5]) -> [bool; 5] {
+        self.safety_action_mask(allowed)
+    }
+
     #[pyo3(name = "action_mask")]
     pub fn py_action_mask(&self) -> [bool; 5] {
         self.action_mask()
@@ -766,4 +832,42 @@ impl PacmanGym {
     }
 
     // ghost_proximities and purgatory_pellets are properties (get, set) on struct, so no need for methods.
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    #[test]
+    fn corridor_distance_matches_grid_coordinates() {
+        let (row, col) = NODE_COORDS[0];
+        let position = LocationState::new(row, col, Up);
+        assert_eq!(PacmanGym::corridor_distance(position, position), 0);
+        for &(other_row, other_col) in &NODE_COORDS {
+            let other = LocationState::new(other_row, other_col, Up);
+            assert_eq!(
+                PacmanGym::corridor_distance(position, other),
+                PacmanGym::corridor_distance(other, position)
+            );
+        }
+    }
+
+    #[test]
+    fn safety_filter_preserves_legal_escape_and_does_not_move_game() {
+        let env = PacmanGym::new(&PacmanGymConfiguration::default());
+        let origin = env.game_state.pacman_loc;
+        for allowed in [env.action_mask(), env.purgatory_action_mask()] {
+            let filtered = env.safety_action_mask(allowed);
+            assert!(filtered.iter().any(|&valid| valid));
+            for i in 0..5 {
+                assert!(!filtered[i] || allowed[i]);
+            }
+        }
+        assert_eq!(env.game_state.pacman_loc.row, origin.row);
+        assert_eq!(env.game_state.pacman_loc.col, origin.col);
+        // Even when only staying is permitted, the fallback must remain usable.
+        let stay_only = [true, false, false, false, false];
+        assert_eq!(env.safety_action_mask(stay_only), stay_only);
+        assert_eq!(env.safety_action_mask([false; 5]), [false; 5]);
+    }
 }

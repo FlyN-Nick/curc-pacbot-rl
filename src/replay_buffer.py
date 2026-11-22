@@ -64,6 +64,9 @@ class ReplayBuffer(Generic[P]):
         for env in self._envs:
             step_while_not_policy(env, self.device, reset_if_necessary=True)
 
+        # The other policy may have moved or reset the game.
+        self._last_obs = self._make_current_obs()
+
         # Choose an action using the provided policy.
         action_masks = [replay_buffer_action_mask(env) for env in self._envs]
         action_masks = torch.from_numpy(np.stack(action_masks)).to(self.device)
