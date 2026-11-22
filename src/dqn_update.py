@@ -45,6 +45,11 @@ def dqn_update(
     """
     device = batch.obs.device
     reward = (batch.reward * reward_scale).float()
+    if hasattr(q_net, "components"):
+        loss, all_predicted_q_values, target_q_values = _split_reward_loss(
+            q_net, target_q_net, batch, reward, discount_factor, bf16, huber_delta, device)
+        return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
+                       reward_scale, grad_clip_norm, zero_grad)
     if hasattr(q_net, "quantiles"):
         loss, all_predicted_q_values, target_q_values = _quantile_loss(
             q_net, target_q_net, batch, reward, discount_factor, bf16, huber_delta, device)
@@ -76,6 +81,33 @@ def dqn_update(
             loss = F.mse_loss(predicted_q_values.float(), target_q_values.float())
     return _finish(q_net, optimizer, loss, all_predicted_q_values, target_q_values,
                    reward_scale, grad_clip_norm, zero_grad=False)
+
+
+def _split_reward_loss(q_net, target_q_net, batch: Batch, reward, discount_factor, bf16, huber_delta, device):
+    """
+    Split rewards (Hybrid Reward Architecture, van Seijen et al. 2017) for a network with
+    components() (each reward part's Q values) and rewards of shape (batch, parts): each part
+    learns its own double DQN target, its reward plus its discounted next value. All parts
+    take the next action the online network's summed Q values pick, so the parts' targets add
+    up to the ordinary target. The loss is the parts' losses added up.
+    """
+    with torch.no_grad(), _autocast(device, bf16 == "all"):
+        online_next_q_values = q_net(batch.next_obs).masked_fill(~batch.next_action_mask, -torch.inf)
+        next_actions = online_next_q_values.argmax(dim=1)
+        next_parts = target_q_net.components(batch.next_obs).float()
+        k = next_parts.shape[1]
+        next_parts = next_parts.gather(2, next_actions.view(-1, 1, 1).expand(-1, k, 1)).squeeze(2)
+        target = reward + (discount_factor * next_parts).masked_fill(batch.done.unsqueeze(1), 0.0)
+
+    with _autocast(device, bf16 in ("update", "all")):
+        all_parts = q_net.components(batch.obs)
+    all_parts = all_parts.float()
+    predicted = all_parts.gather(2, batch.action.view(-1, 1, 1).expand(-1, k, 1)).squeeze(2)
+    if huber_delta > 0:
+        loss = F.huber_loss(predicted, target, delta=huber_delta, reduction="none")
+    else:
+        loss = F.mse_loss(predicted, target, reduction="none")
+    return loss.sum(dim=1).mean(), all_parts.sum(dim=1), target.sum(dim=1)
 
 
 def _quantile_loss(q_net, target_q_net, batch: Batch, reward, discount_factor, bf16, huber_delta, device):

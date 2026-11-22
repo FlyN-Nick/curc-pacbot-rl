@@ -34,8 +34,11 @@ class ReplayBuffer(Generic[P]):
         storage: "ReplayStorage | None" = None,
         random_pellet_removal: bool = False,
         near_ghost_epsilon: "tuple[float, int] | None" = None,
+        reward_parts: bool = False,
     ) -> None:
         """
+        With `reward_parts`, each transition's reward is the game's reward_parts() (a list that
+        adds up to the reward) instead of the reward, for split-reward training.
         With `near_ghost_epsilon` (exploration rate, radius), the policy (an EpsilonGreedy)
         explores at that rate near dangerous ghosts (see policies.ghost_aware_epsilons).
         With `storage` (a replay_storage.ReplayStorage), transitions go there, and are sampled
@@ -47,6 +50,7 @@ class ReplayBuffer(Generic[P]):
         self.policy = policy
         self.device = device
         self.near_ghost_epsilon = near_ghost_epsilon
+        self.reward_parts = reward_parts
 
         # Initialize the environments. The first `random_start_proportion` of them start each
         # game after the first from a random Pacman position, on a board with half its pellets
@@ -120,6 +124,8 @@ class ReplayBuffer(Generic[P]):
         new_obs = []
         for i, (env, action) in enumerate(zip(self._envs, actions)):
             reward, done = env.step(action)
+            if self.reward_parts:
+                reward = env.reward_parts()
             self._moves[i] += 1
             if done:
                 next_action_mask = [False] * NUM_ACTIONS

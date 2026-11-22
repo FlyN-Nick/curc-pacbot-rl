@@ -270,6 +270,50 @@ class QRNetV2(nn.Module):
         return self.quantiles(input_batch).mean(dim=2)
 
 
+class HRANetV2(nn.Module):
+    """
+    Split rewards (Hybrid Reward Architecture, van Seijen et al. 2017) on QNetV2's backbone: a
+    dueling head per reward part (pacbot_rs.PacmanGym.REWARD_PART_NAMES: pellets, super
+    pellets, ghosts and fruit, death, clear, shaping), each predicting that part's return.
+    forward() returns their sum, the Q values, so playing, evaluating and searching work as
+    with any Q network; training uses components().
+    """
+
+    REWARD_PARTS = 6
+    WIDTHS = (16, 32, 64, 128)
+    FC_WIDTH = 256
+
+    def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
+        super().__init__()
+        self.action_count = action_count
+        k = self.REWARD_PARTS
+        self.backbone = _v2_backbone(obs_shape[0], self.WIDTHS, self.FC_WIDTH)
+        self.value_head = nn.Sequential(nn.Linear(self.FC_WIDTH, k))
+        self.advantage_head = nn.Sequential(nn.Linear(self.FC_WIDTH, k * action_count))
+        init_orthogonal(self)
+        with torch.no_grad():
+            for linear_layer in [self.value_head[-1], self.advantage_head[-1]]:
+                linear_layer.weight.fill_(0)
+                linear_layer.bias.fill_(0)
+
+    def components(self, input_batch: torch.Tensor) -> torch.Tensor:
+        """Each reward part's Q values, shape (batch, REWARD_PARTS, actions)."""
+        features = self.backbone(input_batch)
+        value = self.value_head(features).unsqueeze(2)
+        advantages = self.advantage_head(features).view(-1, self.REWARD_PARTS, self.action_count)
+        return value - advantages.mean(dim=2, keepdim=True) + advantages
+
+    def forward(self, input_batch: torch.Tensor) -> torch.Tensor:
+        return self.components(input_batch).sum(dim=1)
+
+
+class HRANetV2Wide(HRANetV2):
+    """HRANetV2 at QNetV2Wide's size."""
+
+    WIDTHS = (32, 64, 128, 256)
+    FC_WIDTH = 512
+
+
 class PVNetV2(nn.Module):
     """
     A policy and value network for AlphaZero-style training (src/algorithms/train_alphazero.py),

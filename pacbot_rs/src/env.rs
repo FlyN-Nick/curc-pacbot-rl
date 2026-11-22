@@ -160,6 +160,19 @@ const TURN_PENALTY: i32 = -2;
 
 const LAST_REWARD: u16 = 3_000;
 
+/// The parts a step's reward is split into, for training with a separate value for each
+/// (Hybrid Reward Architecture, van Seijen et al. 2017); they add up to the step's reward:
+/// 0. pellets eaten (10 points each)
+/// 1. super pellets eaten (50 points each)
+/// 2. the rest of the score: ghosts eaten and fruit
+/// 3. the death penalty
+/// 4. the clear bonus
+/// 5. shaping: the turn penalty, the penalty for being next to a ghost, and the ghosts'
+///    closeness while they wait to be freed
+pub const NUM_REWARD_PARTS: usize = 6;
+pub const REWARD_PART_NAMES: [&str; NUM_REWARD_PARTS] =
+    ["pellets", "super_pellets", "ghosts_fruit", "death", "clear", "shaping"];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum Action {
@@ -231,6 +244,7 @@ pub struct PacmanGym {
     pub game_state: GameState,
     last_score: u16,
     last_action: Action,
+    last_reward_parts: [i32; NUM_REWARD_PARTS],
     #[pyo3(get, set)]
     pub purgatory_pellets: u16,
     #[pyo3(get, set)]
@@ -263,6 +277,7 @@ pub struct PacmanGym {
     pub game_state: GameState,
     last_score: u16,
     last_action: Action,
+    last_reward_parts: [i32; NUM_REWARD_PARTS],
     pub purgatory_pellets: u16,
     pub ghost_proximities: u32,
 
@@ -322,6 +337,7 @@ impl PacmanGym {
             ghost_proximities: 0,
             last_score: 0,
             last_action: Action::Stay,
+            last_reward_parts: [0; NUM_REWARD_PARTS],
             game_state: GameState::new(),
             ticks_per_step: NORMAL_TICKS_PER_STEP,
             env_version: LATEST_ENV_VERSION,
@@ -443,6 +459,8 @@ impl PacmanGym {
         let level_before = self.game_state.get_level();
         // Update Pacman pos
         self.move_one_cell(action);
+        // Pacman moves only here, so a pellet eaten this step is on this square
+        let pacman_square = (self.game_state.pacman_loc.row, self.game_state.pacman_loc.col);
 
         // step through environment multiple times
         let turn_penalty = if self.last_action == action || self.last_action == Action::Stay {
@@ -478,21 +496,35 @@ impl PacmanGym {
         }
 
         // The reward is raw difference in game score, minus a penalty for dying or
-        // plus a bonus for clearing the board.
-        let mut reward = (game_state.curr_score as i32 - self.last_score as i32) + turn_penalty;
+        // plus a bonus for clearing the board, kept split into its parts (NUM_REWARD_PARTS).
+        let mut parts = [0_i32; NUM_REWARD_PARTS];
+        let score_change = game_state.curr_score as i32 - self.last_score as i32;
+        // A cleared board was eaten to its last pellet, and the next board starts with
+        // Pacman's square eaten too
+        let eaten = if cleared {
+            pellets_before + variables::INIT_PELLET_COUNT.saturating_sub(pellets_after)
+        } else {
+            pellets_before.saturating_sub(pellets_after)
+        } as i32;
+        // Every pellet eaten this step was on Pacman's square
+        let super_eaten = if pacbot_rs_2::location::is_super_pellet(pacman_square) { eaten } else { 0 };
+        parts[0] = (eaten - super_eaten) * variables::PELLET_POINTS as i32;
+        parts[1] = super_eaten * variables::SUPER_PELLET_POINTS as i32;
+        parts[2] = score_change - parts[0] - parts[1];
+        parts[5] += turn_penalty;
         if lost_life {
             // Pacman died.
-            reward += -200;
+            parts[3] += -200;
         } else if cleared {
             // Pacman cleared the board! Good Pacman.
-            reward += LAST_REWARD as i32;
+            parts[4] += LAST_REWARD as i32;
         }
         // Punishment for being too close to a ghost
         let pacbot_pos = self.game_state.pacman_loc;
         for ghost in &game_state.ghosts {
             if !ghost.is_frightened() {
                 let ghost_pos = ghost.loc;
-                reward += match (pacbot_pos.row - ghost_pos.row).abs()
+                parts[5] += match (pacbot_pos.row - ghost_pos.row).abs()
                     + (pacbot_pos.col - ghost_pos.col).abs()
                 {
                     1 => -50,
@@ -508,10 +540,12 @@ impl PacmanGym {
             let prox = self.calc_ghost_proximities();
             if prox != 0 {
                 self.ghost_proximities = prox;
-                reward += (prox_old as i32 - self.ghost_proximities as i32) / 10;
+                parts[5] += (prox_old as i32 - self.ghost_proximities as i32) / 10;
             }
         }
         self.last_score = game_state.curr_score;
+        self.last_reward_parts = parts;
+        let reward = parts.iter().sum();
 
         (reward, done)
     }
@@ -979,6 +1013,15 @@ impl PacmanGym {
     pub fn ticks_per_step(&self) -> u32 {
         self.ticks_per_step
     }
+
+    /// The last step's reward split into its parts (see `NUM_REWARD_PARTS`): pellets, super
+    /// pellets, ghosts and fruit, death, clear, shaping. They add up to the step's reward.
+    pub fn reward_parts(&self) -> [i32; NUM_REWARD_PARTS] {
+        self.last_reward_parts
+    }
+
+    #[classattr]
+    const REWARD_PART_NAMES: [&'static str; NUM_REWARD_PARTS] = REWARD_PART_NAMES;
 
     // ghost_proximities and purgatory_pellets are properties (get, set) on struct, so no need for methods.
 }
