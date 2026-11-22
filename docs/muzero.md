@@ -20,24 +20,24 @@ our Rust game:
 
 ## Setup
 
-LightZero needs numpy below 2, so it gets its own environment, `.venv-lz`, beside the
-project's. Install the CUDA build of PyTorch that fits your GPU (CUDA 12.8 here), LightZero and
-our game:
+LightZero needs numpy below 2, which the main project can't use, so it gets its own locked uv
+project, `lightzero/`, with its own environment (`lightzero/.venv`). From the repo root:
 
 ```sh
-uv venv --python 3.11 .venv-lz
-VIRTUAL_ENV=.venv-lz uv pip install --index-strategy unsafe-best-match \
-  --extra-index-url https://download.pytorch.org/whl/cu128 "torch==2.9.1+cu128" "LightZero==0.2.0" maturin safetensors
-cd pacbot_rs && VIRTUAL_ENV=../.venv-lz ../.venv-lz/bin/maturin develop --release
+uv sync --project lightzero
+uv run --project ../lightzero --directory pacbot_rs maturin develop --release
 ```
 
-Rebuild the game into `.venv-lz` too after changing Rust code.
+The second command builds our game into that environment; rerun it after changing Rust code.
+LightZero 0.2.0 publishes builds for Linux and macOS only, so this doesn't work on Windows
+(use WSL). On Linux and Windows the lock installs PyTorch's CUDA 12.8 build, as the main project
+does.
 
 ## Training
 
 ```sh
 cd src
-PYTHONPATH=.:../model_package ../.venv-lz/bin/python -m algorithms.train_lightzero \
+uv run --project ../lightzero python -m algorithms.train_lightzero \
   --algorithm muzero --checkpoint-dir checkpoints/mz1
 ```
 
@@ -52,7 +52,7 @@ PYTHONPATH=.:../model_package ../.venv-lz/bin/python -m algorithms.train_lightze
 ## Evaluating
 
 ```sh
-PYTHONPATH=.:../model_package ../.venv-lz/bin/python eval_lightzero_seeds.py 48 results.csv \
+uv run --project ../lightzero python eval_lightzero_seeds.py 48 results.csv \
   muzero:checkpoints/mz1/run-.../ckpt/ckpt_best.pth.tar:128
 ```
 
@@ -61,7 +61,9 @@ PYTHONPATH=.:../model_package ../.venv-lz/bin/python eval_lightzero_seeds.py 48 
 - `PACBOT_FULL_GAME=1` plays full games, as with `eval_az_seeds.py`.
 
 `tests/test_lightzero.py` checks the environment and that every algorithm's search runs as
-LightZero's evaluator and our scorer call it; it's skipped without LightZero.
+LightZero's evaluator and our scorer call it. It's skipped without LightZero; to run it, from
+`src/`: `uv run --project ../lightzero python -m unittest discover -s ../tests -p test_lightzero.py`.
+CI runs it on Linux.
 
 ## LightZero 0.2.0 workarounds
 

@@ -69,7 +69,7 @@ uv run --project . --directory src python -m algorithms.train_dqn --single-model
 
 ## MuZero, EfficientZero, Gumbel MuZero and Stochastic MuZero
 
-These are trained with [LightZero](https://github.com/opendilab/LightZero) on our game, in their own environment; see [the MuZero family](docs/muzero.md).
+These are trained with [LightZero](https://github.com/opendilab/LightZero) on our game, in their own locked environment (`lightzero/`, Linux and macOS); see [the MuZero family](docs/muzero.md).
 
 ## Environment versions
 
