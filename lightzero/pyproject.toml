@@ -1,5 +1,5 @@
 # The environment for the MuZero family (docs/muzero.md). LightZero needs numpy below 2, which
-# the main project can't use, so it gets its own locked environment:
+# the main project can't use, so it gets its own locked environment.
 # LightZero 0.2.0 publishes wheels for Linux and macOS only (no Windows, no source).
 [project]
 name = "pacbot-rl-lightzero"
