@@ -78,8 +78,8 @@ def evaluate_checkpoint(task: tuple[str, str, int, str, int]) -> dict:
     from utils import select_device
 
     device = select_device(None if device_name == "auto" else device_name)
-    q_net, _, _, _ = load_checkpoint(checkpoint, device)
-    episodes = [evaluate_episode(q_net, device) for _ in range(games)]
+    q_net, _, _, _, env_version = load_checkpoint(checkpoint, device)
+    episodes = [evaluate_episode(q_net, device, env_version) for _ in range(games)]
     scores = np.asarray([episode["score"] for episode in episodes], dtype=np.float64)
 
     # Percentile bootstrap intervals retain the empirical, potentially
