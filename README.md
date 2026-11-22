@@ -1,6 +1,6 @@
 # What is this repo?
 
-Reinforcement learning agents that control a robot in the Pacbot competition. Two algorithms are implemented from scratch and maintained: **DQN** and **AlphaZero** (Gumbel search). The training and evaluation scripts are in `src/algorithms/` and `src/`. An early **PPO** implementation is kept in `src/algorithms/deprecated/` for reference; it no longer runs against the current game code.
+Reinforcement learning agents that control a robot in the Pacbot competition. Three algorithms are implemented from scratch: **DQN**, **PPO** and **AlphaZero** (Gumbel search). The training and evaluation scripts are in `src/algorithms/` and `src/`. (`src/algorithms/deprecated/` keeps an early PPO, which no longer runs against the current game code, for reference.)
 
 The game environment and other performance-sensitive code, such as the batched Gumbel search, are written in Rust as a Python extension module (`pyo3` and `maturin`), in `pacbot_rs/`.
 
@@ -41,6 +41,21 @@ RAYON_NUM_THREADS=4 uv run --project . --directory src python -m algorithms.trai
   - SIGTERM or Ctrl-C saves `model-latest.ckpt.pt`, and `--resume` continues from it.
 - `RAYON_NUM_THREADS` sets the search's CPU threads; on a busy machine, fewer is faster.
 - Every hyperparameter is a flag: see `HYPERPARAMS` at the top of the script, or `--help`.
+
+## PPO
+
+`src/algorithms/train_ppo.py` trains the same policy and value network as AlphaZero (`--model PVNetV2`) with PPO, on the same games, so the two compare directly. PPO checkpoints play wherever AlphaZero's do: `eval_az_seeds.py` and the bot client, with or without search.
+
+```sh
+uv run --project . --directory src python -m algorithms.train_ppo \
+  --checkpoint-dir checkpoints/ppo1 --speed_sampling equal_moves --max_speed 18
+```
+
+- **Each rollout:** each of `--num_games` games (256) plays `--rollout_steps` moves (128), sampling from the policy over the legal moves.
+- **Then training:** `--epochs` passes (4) over the rollout in `--minibatches` (8), with PPO's clipped policy loss (`--clip_range` 0.2), the value loss (`--value_loss_weight` 0.5, optionally clipped with `--value_clip_range`) and an entropy bonus (`--entropy_coef` 0.01).
+- **Advantages:** GAE (`--discount` 0.99, `--gae_lambda` 0.95), on rewards scaled by `--reward_scale` (0.02), so the value is in the search's units.
+- **Shared options:** `--full_game`, `--speed_sampling`, `--max_speed`, the evaluations and checkpoints (`model-best.ckpt.pt`, `model-best-search.ckpt.pt`, `model-latest.ckpt.pt`; `--resume`) work as in AlphaZero training.
+- **More:** `--target_kl` stops a rollout's epochs early once the policy has moved that far. Every hyperparameter is a flag (`HYPERPARAMS` at the top of the script, or `--help`).
 
 ## DQN
 
