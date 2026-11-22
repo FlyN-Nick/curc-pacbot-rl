@@ -512,7 +512,11 @@ impl PacmanGym {
             if !ghost.is_frightened() {
                 let distance = Self::corridor_distance(game_state.pacman_loc, ghost.loc);
                 let deficit = self.safety_config.ghost_clearance.saturating_sub(distance);
-                reward -= (5 * deficit * deficit) as i32;
+                reward -= match distance {
+                    1 => 200,
+                    3 => 0,
+                    _ => (5 * deficit * deficit) as i32,
+                };
             }
         }
         // Purgatory only
