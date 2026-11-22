@@ -61,6 +61,7 @@ HYPERPARAMS = {
     "value_loss_weight": 0.25,
     "grad_clip_norm": 10.0,
     "random_start_proportion": 0.25,
+    "full_game": False,  # three lives and board after board, as in competition (utils.set_full_game)
     "speed_sampling": "uniform",  # or "equal_moves": each speed in about as many moves (speed_sampling.py)
     "max_speed": 14,  # games at 4..max_speed game ticks per move
     "c_visit": 50.0,
@@ -89,7 +90,8 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     for name, default in HYPERPARAMS.items():
-        parser.add_argument(f"--{name}", type=type(default), default=default, help="Default: %(default)s")
+        kind = utils.parse_bool if isinstance(default, bool) else type(default)
+        parser.add_argument(f"--{name}", type=kind, default=default, help="Default: %(default)s")
     args = parser.parse_args()
     if not hasattr(models, args.model):
         parser.error(f"unknown --model {args.model!r}")
@@ -120,6 +122,7 @@ def main() -> None:
     cfg = wandb.config
     utils.set_speed_sampling(cfg.speed_sampling)
     utils.set_max_speed(cfg.max_speed)
+    utils.set_full_game(cfg.full_game)
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,7 +169,8 @@ def main() -> None:
     def save(name: str) -> None:
         state = {"state_dict": net.state_dict(), "optimizer": optimizer.state_dict(), "config": dict(cfg),
                  "step": step, "moves": step * cfg.num_games, "best": best, "best_search": best_search,
-                 "wandb_id": run.id if run else None, "env_version": ENV_VERSION, "single_model": True}
+                 "wandb_id": run.id if run else None, "env_version": ENV_VERSION, "single_model": True,
+                 "full_game": bool(cfg.full_game)}
         tmp = checkpoint_dir / f".{name}.tmp"
         torch.save(state, tmp)
         os.replace(tmp, checkpoint_dir / name)

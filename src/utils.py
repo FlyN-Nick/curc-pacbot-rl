@@ -45,6 +45,37 @@ def ghost_next_obs() -> bool:
     return os.environ.get(_GHOST_NEXT_OBS_ENV) == "1"
 
 
+# Full games (PacmanGym.full_game): three lives and board after board, as in competition,
+# instead of ending at the first lost life or cleared board. Kept in the environment like
+# single-model mode, so every game make_gym builds (training, search, evaluation) plays them.
+_FULL_GAME_ENV = "PACBOT_FULL_GAME"
+
+
+def set_full_game(enabled: bool) -> None:
+    os.environ[_FULL_GAME_ENV] = "1" if enabled else "0"
+
+
+def full_game() -> bool:
+    return os.environ.get(_FULL_GAME_ENV) == "1"
+
+
+def parse_bool(text: str) -> bool:
+    """An argparse type for true/false flags (bool("False") would be True)."""
+    lowered = text.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"expected true or false, got {text!r}")
+
+
+def checkpoint_full_game(loaded) -> bool:
+    """Whether a checkpoint was trained on full games (False for checkpoints from before them)."""
+    if not isinstance(loaded, dict):
+        return False
+    return bool(loaded.get("full_game", (loaded.get("config") or {}).get("full_game", False)))
+
+
 # Training speeds: Pacman moves every 4..max_speed game ticks (the ghosts every 12), each
 # game's speed drawn by speed_sampling.SpeedSampler: "uniform" (every speed in as many games)
 # or "equal_moves" (every speed in about as many training moves: slow games last several
@@ -106,6 +137,7 @@ def make_gym(config: "PacmanGymConfiguration", env_version: int, seed: int | Non
     env = PacmanGym(config, seed=seed)
     env.env_version = env_version
     env.ghost_next_obs = ghost_next_obs()
+    env.full_game = full_game()
     return env
 
 

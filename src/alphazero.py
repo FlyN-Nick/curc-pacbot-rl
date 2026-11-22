@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from pacbot_rs import GumbelConfig, PacmanGym, gumbel_search
 from replay_storage import ObsCodec
-from utils import NUM_ACTIONS, OBS_SHAPE, make_gym, speed_configuration
+from utils import NUM_ACTIONS, OBS_SHAPE, full_game, make_gym, speed_configuration
 
 
 class NetworkEvaluator:
@@ -220,15 +220,20 @@ def losses(net: torch.nn.Module, batch: Batch) -> tuple[torch.Tensor, torch.Tens
 
 @torch.inference_mode()
 def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int, obs_config,
-                   speeds, seeds, search: GumbelConfig | None = None, max_steps: int = 10_000,
+                   speeds, seeds, search: GumbelConfig | None = None, max_steps: int | None = None,
                    search_seed: int = 0, evaluator=None) -> list[dict]:
     """
     Plays one game per (speed, seed) from the normal start, all at once, until each loses a
-    life, clears the board or reaches max_steps: greedily by the network's policy, or with
-    `search` (use gumbel_scale=0 for no exploration). The search evaluates states with
+    life, clears the board or reaches max_steps (10,000), or with utils.full_game() until it
+    loses its last life (or reaches max_steps, 40,000): greedily by the network's policy, or
+    with `search` (use gumbel_scale=0 for no exploration). The search evaluates states with
     `evaluator` if given (e.g. QNetworkEvaluator), else with the network. Returns one dict per
-    game: speed, seed, score, steps, cleared, pellets_left.
+    game: speed, seed, score, steps, cleared, pellets_left, boards (boards cleared) and lives
+    (lives left).
     """
+    full = full_game()
+    if max_steps is None:
+        max_steps = 40_000 if full else 10_000
     net.eval()
     games = []
     for speed in speeds:
@@ -260,7 +265,10 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
     results = []
     for g in games:
         env = g["env"]
-        cleared = env.is_done() and env.lives() == 3
+        boards = env.level() - 1
+        # A full game's "cleared": at least one board cleared
+        cleared = boards > 0 if full else env.is_done() and env.lives() == 3
         results.append({"speed": g["speed"], "seed": g["seed"], "score": env.score(), "steps": g["steps"],
-                        "cleared": cleared, "pellets_left": 0 if cleared else env.remaining_pellets()})
+                        "cleared": cleared, "pellets_left": 0 if cleared and not full else env.remaining_pellets(),
+                        "boards": boards, "lives": env.lives()})
     return results
