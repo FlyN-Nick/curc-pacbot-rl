@@ -266,6 +266,7 @@ def _actor(
     random_start_proportion: float = 0.0,
     random_pellet_removal: bool = False,
     near_ghost_epsilon: "tuple[float, int] | None" = None,
+    reward_parts: bool = False,
 ) -> None:
     """
     Plays this actor's environments continuously. Each experience step goes into a free slot of
@@ -287,6 +288,7 @@ def _actor(
             maxlen=num_envs, policy=policy, num_parallel_envs=num_envs,
             random_start_proportion=random_start_proportion, device=_CPU,
             random_pellet_removal=random_pellet_removal, near_ghost_epsilon=near_ghost_epsilon,
+            reward_parts=reward_parts,
         )
         obs_out[0] = buffer._last_obs.numpy()
         conn.send(("ready",))
@@ -362,7 +364,9 @@ class ActorReplayBuffer:
         random_start_proportion: float = 0.0,
         random_pellet_removal: bool = False,
         near_ghost_epsilon: "tuple[float, int] | None" = None,
+        reward_parts: int = 1,
     ) -> None:
+        # reward_parts > 1: transitions hold the game's reward parts (see ReplayStorage)
         if not 1 <= num_actors <= num_parallel_envs:
             raise ValueError(f"num_actors must be 1..{num_parallel_envs}, got {num_actors}")
         # Buffers that are state (in the state dict, like batch norm statistics) would differ
@@ -372,7 +376,7 @@ class ActorReplayBuffer:
         if stateful:
             raise ValueError(f"ActorReplayBuffer only shares parameters; this model has buffers {sorted(stateful)}")
 
-        self.storage = ReplayStorage(maxlen, num_parallel_envs, device)
+        self.storage = ReplayStorage(maxlen, num_parallel_envs, device, reward_parts)
         # train_dqn reads and sets the exploration rate through policy.epsilon
         self.policy = SimpleNamespace(epsilon=epsilon)
         self.device = device
@@ -416,7 +420,7 @@ class ActorReplayBuffer:
                         child, count, num_slots, obs_shm.name, weights_shm.name,
                         self._weights_lock, num_params, model_name, threads_per_actor,
                         _fresh_seed(), random_start_proportion, random_pellet_removal,
-                        near_ghost_epsilon,
+                        near_ghost_epsilon, reward_parts > 1,
                     ),
                     daemon=True,
                 )
