@@ -1,0 +1,46 @@
+name: LightZero
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lightzero/**"
+      - "model_package/**"
+      - "pacbot_rs/**"
+      - "src/**"
+      - "tests/test_lightzero.py"
+      - ".github/workflows/lightzero.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "lightzero/**"
+      - "model_package/**"
+      - "pacbot_rs/**"
+      - "src/**"
+      - "tests/test_lightzero.py"
+      - ".github/workflows/lightzero.yml"
+
+jobs:
+  lightzero:
+    # The MuZero family's own environment (docs/muzero.md), with docs/muzero.md's commands
+    name: LightZero on ubuntu-22.04
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: pacbot_rs -> target
+          key: lightzero
+      - name: Check lockfile
+        run: uv lock --check --project lightzero
+      - name: Install locked dependencies
+        run: uv sync --locked --project lightzero
+      - name: Build Rust extension
+        run: uv run --project ../lightzero --directory pacbot_rs maturin develop --release
+      - name: Test the LightZero environment and policies
+        working-directory: src
+        run: uv run --locked --project ../lightzero python -m unittest discover -s ../tests -p test_lightzero.py -v

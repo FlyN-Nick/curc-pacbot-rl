@@ -67,6 +67,10 @@ uv run --project . --directory src python -m algorithms.train_dqn --single-model
 
 [DQN training](docs/dqn-training.md) covers its other options: actor processes, the replay buffer, several trainings on one machine, bfloat16 and the hyperparameters. On a machine several people train on, start runs with [`pacbot-train`](docs/shared-machine.md).
 
+## MuZero, EfficientZero, Gumbel MuZero and Stochastic MuZero
+
+These are trained with [LightZero](https://github.com/opendilab/LightZero) on our game, in their own locked environment (`lightzero/`, Linux and macOS); see [the MuZero family](docs/muzero.md).
+
 ## Environment versions
 
 Checkpoints record the version of the environment rules they were trained with as `env_version` (see `LATEST_ENV_VERSION` in `pacbot_rs/src/env.rs`); checkpoints without it are version 1. The evaluation scripts, `--eval` and the bot client use each checkpoint's version, so older checkpoints keep the rules they were trained with. When changing rules that affect what the agent sees or which model plays, add a new version instead of changing an old one.
