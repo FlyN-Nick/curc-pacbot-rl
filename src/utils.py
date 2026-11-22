@@ -189,7 +189,7 @@ def replay_buffer_obs_config() -> PacmanGymConfiguration:
     return SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION if single_model() else REPLAY_BUFFER_OBS_GYM_CONFIGURATION
 def replay_buffer_action_mask(env: PacmanGym) -> list[bool]:
     allowed = env.action_mask() if single_model() else env.purgatory_action_mask()
-    return env.safety_action_mask(allowed)
+    return allowed
 
 P = TypeVar("P", bound=Policy)
 
@@ -225,7 +225,7 @@ def safetensors_qnet(filename: str, force_reload: bool=False, device="cpu") -> P
 
 def _step_always_with(env: PacmanGym, policy: Policy, config: PacmanGymConfiguration, action_mask: list[bool], device) -> tuple[int, bool]:
     obs = torch.from_numpy(env.obs_numpy(config)).to(device).unsqueeze(0)
-    action_mask = torch.tensor(env.safety_action_mask(action_mask), device=device).unsqueeze(0)
+    action_mask = torch.tensor(action_mask, device=device).unsqueeze(0)
     return env.step(policy(obs, action_mask).item())
 
 def reset_env(env: PacmanGym, config: PacmanGymConfiguration) -> None:
@@ -282,7 +282,7 @@ def step_envs_while_not_policy(envs: list[PacmanGym], device) -> None:
         obs = torch.from_numpy(
             np.stack([env.obs_numpy(SUPER_PELLET_MODE_CONFIGUARTION) for env in active])
         ).to(device)
-        masks = torch.from_numpy(np.array([env.safety_action_mask(env.action_mask()) for env in active])).to(device)
+        masks = torch.from_numpy(np.array([env.action_mask() for env in active])).to(device)
         for env, action in zip(active, policy(obs, masks).tolist()):
             _, done = env.step(action)
             if done:
