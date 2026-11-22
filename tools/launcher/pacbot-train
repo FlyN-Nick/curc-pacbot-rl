@@ -15,7 +15,8 @@
 # started again. A run that's stopped or paused saves a checkpoint and its replay memory first,
 # so it resumes exactly where it stopped.
 #
-# At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way.
+# At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way
+# (any of the training scripts: DQN, AlphaZero, PPO, LightZero).
 # Waiting runs start in the order they were queued. The machine's owner sets how many of
 # those may be teammates' runs with pacbot-capacity; when it goes down, the newest teammate
 # runs stop (saving as above) and wait, and resume once there's room.
@@ -25,7 +26,8 @@ STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
 OWNER=${PACBOT_TRAIN_OWNER:-nassa}          # whose runs pacbot-capacity doesn't limit
 MAX=${PACBOT_TRAIN_MAX:-3}
 POLL=${PACBOT_TRAIN_POLL:-20}               # seconds between checks
-MATCH=${PACBOT_TRAIN_MATCH:-algorithms.train_dqn}  # how other training processes are found
+# How other training processes are found: every training script (DQN, AlphaZero, PPO, LightZero)
+MATCH=${PACBOT_TRAIN_MATCH:-algorithms[.]train_(dqn|alphazero|ppo|lightzero)}
 JOBS=$STATE/jobs
 ME=$(id -un)
 

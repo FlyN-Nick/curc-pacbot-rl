@@ -1,6 +1,6 @@
 # Training on a shared machine (`pacbot-train`)
 
-On a machine several people train on, start runs with `pacbot-train` (in `tools/launcher/`; install it once with `sudo bash tools/launcher/install.sh`, which also creates the `pacbot` group's shared state in `/var/lib/pacbot-train`). It keeps at most three runs training at once, counting runs started any other way, and starts waiting runs in the order they were queued:
+On a machine several people train on, start runs with `pacbot-train` (in `tools/launcher/`; install it once with `sudo bash tools/launcher/install.sh`, which also creates the `pacbot` group's shared state in `/var/lib/pacbot-train`). It keeps at most three runs training at once, counting runs started any other way (DQN, AlphaZero, PPO or LightZero training), and starts waiting runs in the order they were queued:
 
 ```bash
 pacbot-train start my-run -- --single-model --random_start_proportion 0.25   # queue it and return
