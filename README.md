@@ -1,6 +1,6 @@
 # What is this repo?
 
-Reinforcement learning agents that control a robot in the Harvard PacBot competition. Three algorithms are implemented from scratch: **DQN**, **PPO** and **AlphaZero** (Gumbel search). The training and evaluation scripts are in `src/algorithms/` and `src/`.
+Reinforcement learning agents that control a robot in the Pacbot competition. Two algorithms are implemented from scratch and maintained: **DQN** and **AlphaZero** (Gumbel search). The training and evaluation scripts are in `src/algorithms/` and `src/`. An early **PPO** implementation is kept in `src/algorithms/deprecated/` for reference; it no longer runs against the current game code.
 
 The game environment and other performance-sensitive code, such as the batched Gumbel search, are written in Rust as a Python extension module (`pyo3` and `maturin`), in `pacbot_rs/`.
 
