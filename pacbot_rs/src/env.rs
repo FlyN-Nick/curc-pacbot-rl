@@ -247,6 +247,14 @@ pub struct PacmanGym {
     /// direction it is moving in) instead of a copy of its current square. Kept across resets.
     #[pyo3(get, set)]
     pub ghost_next_obs: bool,
+
+    /// If true, play the whole game, as in competition: a lost life costs the death penalty but
+    /// the game goes on (from the respawn, pellets kept), a cleared board earns the clear bonus
+    /// and the next level starts (the engine resets the board and speeds up the ghosts), and the
+    /// game ends when the last life is lost. If false (the default), the game ends at the first
+    /// lost life or cleared board. Kept across resets.
+    #[pyo3(get, set)]
+    pub full_game: bool,
 }
 
 #[cfg(not(feature = "python"))]
@@ -266,6 +274,9 @@ pub struct PacmanGym {
 
     /// See the Python build's field of the same name.
     pub ghost_next_obs: bool,
+
+    /// See the Python build's field of the same name.
+    pub full_game: bool,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -315,6 +326,7 @@ impl PacmanGym {
             ticks_per_step: NORMAL_TICKS_PER_STEP,
             env_version: LATEST_ENV_VERSION,
             ghost_next_obs: false,
+            full_game: false,
         };
         s.reset_with_seed(config, seed);
         s
@@ -426,6 +438,9 @@ impl PacmanGym {
     pub fn step(&mut self, action: Action) -> (i32, bool) {
         let pellets_before = self.remaining_pellets();
         let prox_old = self.calc_ghost_proximities();
+        // Before the move: Pacman can die walking into a ghost
+        let lives_before = self.game_state.get_lives();
+        let level_before = self.game_state.get_level();
         // Update Pacman pos
         self.move_one_cell(action);
 
@@ -437,11 +452,21 @@ impl PacmanGym {
         };
         for _ in 0..self.ticks_per_step {
             self.game_state.step();
-            if self.is_done() {
+            // A step ends at a lost life or a cleared board, so its reward is that event's
+            if self.is_done()
+                || self.game_state.get_lives() < lives_before
+                || self.game_state.get_level() != level_before
+            {
                 break;
             }
         }
         self.last_action = action;
+        let lost_life = self.game_state.get_lives() < lives_before;
+        let cleared = !lost_life && self.game_state.get_level() != level_before;
+        if self.full_game && lost_life {
+            // The engine pauses at a death; the competition server, in competition mode, doesn't
+            self.game_state.paused = false;
+        }
 
         let game_state = &self.game_state;
 
@@ -455,14 +480,12 @@ impl PacmanGym {
         // The reward is raw difference in game score, minus a penalty for dying or
         // plus a bonus for clearing the board.
         let mut reward = (game_state.curr_score as i32 - self.last_score as i32) + turn_penalty;
-        if done {
-            if game_state.curr_lives < 3 {
-                // Pacman died.
-                reward += -200;
-            } else {
-                // Pacman cleared the board! Good Pacman.
-                reward += LAST_REWARD as i32;
-            }
+        if lost_life {
+            // Pacman died.
+            reward += -200;
+        } else if cleared {
+            // Pacman cleared the board! Good Pacman.
+            reward += LAST_REWARD as i32;
         }
         // Punishment for being too close to a ghost
         let pacbot_pos = self.game_state.pacman_loc;
@@ -502,7 +525,16 @@ impl PacmanGym {
     }
 
     pub fn is_done(&self) -> bool {
-        self.game_state.get_lives() < 3 || self.game_state.get_level() != INIT_LEVEL
+        if self.full_game {
+            self.game_state.get_lives() == 0
+        } else {
+            self.game_state.get_lives() < 3 || self.game_state.get_level() != INIT_LEVEL
+        }
+    }
+
+    /// The level being played (1 at the start; each cleared board adds one).
+    pub fn level(&self) -> u8 {
+        self.game_state.get_level()
     }
 
     pub fn first_ai_done(&self) -> bool {
@@ -826,6 +858,11 @@ impl PacmanGym {
     #[pyo3(name = "lives")]
     pub fn py_lives(&self) -> u8 {
         self.lives()
+    }
+
+    #[pyo3(name = "level")]
+    pub fn py_level(&self) -> u8 {
+        self.level()
     }
 
     #[pyo3(name = "is_done")]

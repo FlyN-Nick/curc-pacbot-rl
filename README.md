@@ -86,6 +86,14 @@ keeps `model-best.ckpt.pt` and `model-best-search.ckpt.pt`. SIGTERM or Ctrl-C sa
 `model-latest.ckpt.pt`; `--resume` continues from it. `RAYON_NUM_THREADS` sets the search's
 CPU threads (on a busy machine, fewer is faster).
 
+`--full_game true` trains on full games instead, as in competition: three lives and board after
+board (`PacmanGym.full_game`). A lost life costs the death penalty and the game goes on from the
+respawn with the pellets kept; a cleared board earns the clear bonus and the next level starts,
+with faster ghosts (the observation's speed channel shows it); the game ends with the last life.
+The observation is unchanged, so full-game checkpoints play wherever the others do. Checkpoints
+record `full_game`. `PACBOT_FULL_GAME=1 python eval_az_seeds.py ...` plays any checkpoint's
+fixed-seed games as full games, with `boards` (boards cleared) and `lives` (lives left) columns.
+
 ### Weights & Biases setup
 
 Training logs metrics to the `pacbot-ind-study` project and uploads a checkpoint as a model artifact every 1,000 iterations. `wandb` is already installed by `uv sync`. To set it up once per machine:
