@@ -28,6 +28,7 @@ MAX=${PACBOT_TRAIN_MAX:-3}
 POLL=${PACBOT_TRAIN_POLL:-20}               # seconds between checks
 # How other training processes are found: every training script (DQN, AlphaZero, PPO, LightZero)
 MATCH=${PACBOT_TRAIN_MATCH:-algorithms[.]train_(dqn|alphazero|ppo|lightzero)}
+TRAIN_MODULE=algorithms.train_dqn            # what runs started here train with
 JOBS=$STATE/jobs
 ME=$(id -un)
 
@@ -154,7 +155,7 @@ supervise() {
           cd "$dir"
           export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -e systemprofile -e WindowsApps | paste -sd:)
           export WANDB_NAME=$name
-          exec setsid "${PACBOT_TRAIN_PYTHON:-../.venv/bin/python}" -u -m "$MATCH" \
+          exec setsid "${PACBOT_TRAIN_PYTHON:-../.venv/bin/python}" -u -m "$TRAIN_MODULE" \
             --checkpoint-dir "checkpoints/$name" "${resume[@]}" "${args[@]}" \
             >> "checkpoints/$name/train.log" 2>&1 < /dev/null
         ) &
