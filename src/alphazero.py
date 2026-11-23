@@ -11,6 +11,8 @@ Pieces of AlphaZero-style training (algorithms/train_alphazero.py) with Gumbel s
   value target) on the training device, observations stored as bits like replay_storage.
 - evaluate_games: fixed-seed games at each speed, played by the network alone (greedy policy)
   or with search, several games at once.
+- search_config: the search a run trains or plays with, from its settings: Gumbel's rules (the
+  default) or classic AlphaZero / MuZero PUCT ("search": "puct").
 """
 
 from __future__ import annotations
@@ -25,6 +27,52 @@ import torch.nn.functional as F
 from pacbot_rs import GumbelConfig, PacmanGym, gumbel_search
 from replay_storage import ObsCodec
 from utils import NUM_ACTIONS, OBS_SHAPE, full_game, make_gym, speed_configuration
+
+
+# Search settings added after the first runs, with the values those runs used (Gumbel search)
+SEARCH_DEFAULTS = {
+    "search": "gumbel",  # or "puct": classic AlphaZero / MuZero search (pacbot_rs/src/gumbel.rs)
+    "c_puct": 1.25,  # PUCT's exploration constant and its growth with visits (MuZero's c1, c2)
+    "c_puct_base": 19652.0,
+    "dirichlet_alpha": 10.0,  # root noise concentration, divided among the legal moves
+    "dirichlet_fraction": 0.25,  # share of the root prior that is noise, in training
+    "puct_temperature": "muzero",  # training moves ~ visits^(1/T); "muzero": 1, 0.5, 0.25 by progress
+}
+SEARCH_RULES = ("gumbel", "puct")
+
+
+def puct_temperature(setting, progress: float) -> float:
+    """
+    The temperature of PUCT's training moves: a number, or "muzero" for MuZero's schedule
+    (1 for the first half of training, 0.5 for the next quarter, 0.25 after).
+    """
+    if setting == "muzero":
+        return 1.0 if progress < 0.5 else 0.5 if progress < 0.75 else 0.25
+    return float(setting)
+
+
+def search_config(cfg, num_simulations: int, explore: bool, threads: int = 1, progress: float = 0.0) -> GumbelConfig:
+    """
+    The search an AlphaZero run trains with (explore: Gumbel or Dirichlet noise and, for PUCT,
+    sampled moves) or plays with (no exploration), from its settings (a checkpoint's config or
+    wandb.config). Runs from before the PUCT option get Gumbel search, as they trained with.
+    """
+    def get(key):
+        try:
+            value = cfg[key]
+        except KeyError:
+            return SEARCH_DEFAULTS[key]
+        return SEARCH_DEFAULTS[key] if value is None else value
+
+    rule = get("search")
+    if rule not in SEARCH_RULES:
+        raise ValueError(f"search must be one of {SEARCH_RULES}, got {rule!r}")
+    return GumbelConfig(num_simulations=num_simulations, discount=cfg["discount"], reward_scale=cfg["reward_scale"],
+                        c_visit=cfg["c_visit"], c_scale=cfg["c_scale"], gumbel_scale=1.0 if explore else 0.0,
+                        threads=threads, puct=rule == "puct", c_puct=float(get("c_puct")),
+                        c_puct_base=float(get("c_puct_base")), dirichlet_alpha=float(get("dirichlet_alpha")),
+                        dirichlet_fraction=float(get("dirichlet_fraction")),
+                        temperature=puct_temperature(get("puct_temperature"), progress))
 
 
 class NetworkEvaluator:

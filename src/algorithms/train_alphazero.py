@@ -38,8 +38,9 @@ from tqdm import tqdm
 
 import models
 import utils
-from alphazero import NetworkEvaluator, Targets, TrainingStore, evaluate_games, losses
-from pacbot_rs import GumbelConfig, gumbel_search
+from alphazero import (SEARCH_DEFAULTS, SEARCH_RULES, NetworkEvaluator, Targets, TrainingStore, evaluate_games,
+                       losses, puct_temperature, search_config)
+from pacbot_rs import gumbel_search
 from speed_sampling import SpeedSampler
 from utils import ENV_VERSION, NUM_ACTIONS, OBS_SHAPE, make_gym, reset_env, training_configuration, training_speeds
 
@@ -67,6 +68,7 @@ HYPERPARAMS = {
     "c_visit": 50.0,
     "c_scale": 0.1,
     "search_threads": 1,  # 1 was fastest (see GumbelConfig.threads)
+    **SEARCH_DEFAULTS,  # Gumbel search, or --search puct (alphazero.search_config)
     "eval_every": 200_000,  # moves
     "eval_seeds": 2,  # games per speed
     "search_eval_every": 1_000_000,
@@ -93,6 +95,12 @@ def main() -> None:
         kind = utils.parse_bool if isinstance(default, bool) else type(default)
         parser.add_argument(f"--{name}", type=kind, default=default, help="Default: %(default)s")
     args = parser.parse_args()
+    if args.search not in SEARCH_RULES:
+        parser.error(f"--search must be one of {SEARCH_RULES}")
+    try:
+        puct_temperature(args.puct_temperature, 0.0)
+    except ValueError:
+        parser.error('--puct_temperature must be a number or "muzero"')
     if not hasattr(models, args.model):
         parser.error(f"unknown --model {args.model!r}")
     if args.speed_sampling not in utils.SPEED_SAMPLING_MODES:
@@ -142,12 +150,11 @@ def main() -> None:
         print(f"Resuming from step {step} ({step * cfg.num_games} moves)")
 
     num_steps = cfg.num_moves // cfg.num_games
-    search = GumbelConfig(num_simulations=cfg.num_simulations, discount=cfg.discount,
-                          reward_scale=cfg.reward_scale, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
-                          gumbel_scale=1.0, threads=cfg.search_threads)
-    eval_search = GumbelConfig(num_simulations=cfg.num_simulations, discount=cfg.discount,
-                               reward_scale=cfg.reward_scale, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
-                               gumbel_scale=0.0, threads=cfg.search_threads)
+    search = search_config(cfg, cfg.num_simulations, explore=True, threads=cfg.search_threads,
+                           progress=step / max(num_steps, 1))
+    eval_search = search_config(cfg, cfg.num_simulations, explore=False, threads=cfg.search_threads)
+    if search.puct:
+        print(f"PUCT search: {search}")
     store = TrainingStore(cfg.buffer_capacity, device)
     targets = Targets(cfg.num_games, cfg.td_steps, cfg.discount)
     evaluator = NetworkEvaluator(net, device, max_batch=cfg.num_games)  # one CUDA graph
@@ -208,6 +215,8 @@ def main() -> None:
         # Search and play one move in every game
         t0 = time.perf_counter()
         net.eval()
+        if search.puct:
+            search.temperature = puct_temperature(cfg.puct_temperature, step / max(num_steps, 1))
         actions, policy, value, network_value, _ = gumbel_search(games, evaluator, search, obs_config, rng.getrandbits(63))
         t1 = time.perf_counter()
         examples = []
