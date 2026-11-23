@@ -14,6 +14,19 @@
 //!   randomness (an open-loop tree, whose statistics average over the random outcomes), so the
 //!   search doesn't know how the real game's randomness will turn out.
 //!
+//! With `puct` set, the same batched search uses classic AlphaZero / MuZero rules instead
+//! (Silver et al. 2018; Schrittwieser et al. 2020), for comparing the two:
+//!
+//! - Selection, at the root and inside the tree: argmax Q(a) + P(a) sqrt(N) / (1 + N(a))
+//!   (c_puct + ln((N + c_puct_base + 1) / c_puct_base)), with N the node's visits (its children's
+//!   plus one) and Q rescaled to [0, 1] by the min and max Q seen in the tree so far, as in
+//!   MuZero (rewards are unbounded); unvisited actions get the node's mixed value estimate.
+//! - Exploration (gumbel_scale > 0, i.e. training): the root prior is mixed with Dirichlet noise,
+//!   (1 - dirichlet_fraction) P + dirichlet_fraction Dir(dirichlet_alpha / legal actions), and
+//!   the action played is sampled in proportion to visits^(1 / temperature). With
+//!   gumbel_scale = 0 (evaluation) there is no noise and the most visited action is played.
+//! - The policy target is the root's visit distribution.
+//!
 //! Rewards are game rewards times `reward_scale`, discounted by `discount` per move; values and
 //! logits come from the evaluator, a Python callable
 //! `(obs: float32 (B, 17, 28, 31), legal: bool (B, 5)) -> (values float32 (B,), logits float32 (B, 5))`.
@@ -24,6 +37,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
+use rand_distr::{Dirichlet, Distribution};
 use rayon::prelude::*;
 
 use crate::env::{Action, PacmanGym, PacmanGymConfiguration, OBS_SHAPE};
@@ -43,7 +57,8 @@ pub struct GumbelConfig {
     /// sigma(q) = (c_visit + max N) * c_scale * q (mctx defaults 50 and 0.1)
     pub c_visit: f32,
     pub c_scale: f32,
-    /// Scale of the Gumbel noise at the root: 1 for training (exploration), 0 for evaluation
+    /// Scale of the Gumbel noise at the root: 1 for training (exploration), 0 for evaluation.
+    /// With `puct`, any value above 0 turns on PUCT's exploration (Dirichlet noise and sampling)
     pub gumbel_scale: f32,
     /// Simulations stop descending (and bootstrap from the network) this many moves deep
     pub max_depth: usize,
@@ -52,12 +67,25 @@ pub struct GumbelConfig {
     /// to other threads mostly adds waiting: 1 thread was fastest on a busy 16-thread machine
     /// (726 moves/s against 318 with 4 and 194 with 8, 152 games, 32 simulations).
     pub threads: usize,
+    /// Classic AlphaZero / MuZero search (PUCT) instead of Gumbel's rules (see the module docs)
+    pub puct: bool,
+    /// PUCT's exploration constant and its slow growth with visits (MuZero's c1 and c2)
+    pub c_puct: f32,
+    pub c_puct_base: f32,
+    /// Total concentration of the root's Dirichlet noise, divided among the legal actions
+    /// (AlphaZero's rule of thumb, alpha = 10 / typical number of legal moves)
+    pub dirichlet_alpha: f32,
+    /// Share of the root prior that is noise, when exploring
+    pub dirichlet_fraction: f32,
+    /// The played action is sampled in proportion to visits^(1 / temperature), when exploring
+    pub temperature: f32,
 }
 
 #[pymethods]
 impl GumbelConfig {
     #[new]
-    #[pyo3(signature = (num_simulations = 32, discount = 0.99, reward_scale = 0.02, c_visit = 50.0, c_scale = 0.1, gumbel_scale = 1.0, max_depth = 64, threads = 1))]
+    #[pyo3(signature = (num_simulations = 32, discount = 0.99, reward_scale = 0.02, c_visit = 50.0, c_scale = 0.1, gumbel_scale = 1.0, max_depth = 64, threads = 1, puct = false, c_puct = 1.25, c_puct_base = 19652.0, dirichlet_alpha = 10.0, dirichlet_fraction = 0.25, temperature = 1.0))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_simulations: usize,
         discount: f32,
@@ -67,6 +95,12 @@ impl GumbelConfig {
         gumbel_scale: f32,
         max_depth: usize,
         threads: usize,
+        puct: bool,
+        c_puct: f32,
+        c_puct_base: f32,
+        dirichlet_alpha: f32,
+        dirichlet_fraction: f32,
+        temperature: f32,
     ) -> PyResult<Self> {
         if num_simulations < 1 {
             return Err(PyValueError::new_err("num_simulations must be at least 1"));
@@ -74,7 +108,28 @@ impl GumbelConfig {
         if max_depth < 1 {
             return Err(PyValueError::new_err("max_depth must be at least 1"));
         }
-        Ok(Self { num_simulations, discount, reward_scale, c_visit, c_scale, gumbel_scale, max_depth, threads })
+        if !(dirichlet_alpha > 0.0) || !(0.0..=1.0).contains(&dirichlet_fraction) {
+            return Err(PyValueError::new_err("dirichlet_alpha must be above 0 and dirichlet_fraction in [0, 1]"));
+        }
+        if !(temperature > 0.0) || !(c_puct_base > 0.0) {
+            return Err(PyValueError::new_err("temperature and c_puct_base must be above 0"));
+        }
+        Ok(Self {
+            num_simulations,
+            discount,
+            reward_scale,
+            c_visit,
+            c_scale,
+            gumbel_scale,
+            max_depth,
+            threads,
+            puct,
+            c_puct,
+            c_puct_base,
+            dirichlet_alpha,
+            dirichlet_fraction,
+            temperature,
+        })
     }
 
     pub fn __repr__(&self) -> String {
@@ -169,6 +224,29 @@ impl Node {
         let policy = self.improved_policy(config);
         let total = self.total_visits() as f32;
         argmax_legal(&self.legal, |a| policy[a] - self.visits[a] as f32 / (1.0 + total))
+    }
+
+    /// PUCT's choice among the legal actions, with `prior` (the root's may include noise) and Q
+    /// rescaled by the tree's min and max Q.
+    fn select_puct(&self, prior: &[f32; A], bounds: (f32, f32), config: &GumbelConfig) -> usize {
+        let (lo, hi) = bounds;
+        let normalize = |q: f32| if hi > lo { (q - lo) / (hi - lo) } else { 0.0 };
+        let unvisited = normalize(self.mixed_value());
+        let n = self.total_visits() as f32 + 1.0;
+        let c = config.c_puct + ((n + config.c_puct_base + 1.0) / config.c_puct_base).ln();
+        argmax_legal(&self.legal, |a| {
+            let q = if self.visits[a] > 0 { normalize(self.q(a)) } else { unvisited };
+            q + c * prior[a] * n.sqrt() / (1.0 + self.visits[a] as f32)
+        })
+    }
+
+    /// The visit distribution over the legal actions (PUCT's policy target).
+    fn visit_policy(&self) -> [f32; A] {
+        let total = self.total_visits() as f32;
+        if total == 0.0 {
+            return self.prior();
+        }
+        std::array::from_fn(|a| if self.legal[a] { self.visits[a] as f32 / total } else { 0.0 })
     }
 
     /// The node's search value: the network's value and the visits' returns, averaged.
@@ -271,6 +349,9 @@ struct Search {
     gumbel: [f32; A],
     sequence: Vec<u32>,
     rng: SmallRng,
+    /// PUCT: the root's prior, with exploration noise, and the min and max Q seen in the tree
+    root_prior: [f32; A],
+    q_bounds: (f32, f32),
     /// The pending simulation: (node, action, scaled reward) per move, and the state reached
     path: Vec<(u32, usize, f32)>,
     leaf: Leaf,
@@ -301,9 +382,12 @@ impl Search {
         scores
     }
 
-    /// The root action of simulation `k` (sequential halving).
+    /// The root action of simulation `k` (sequential halving; PUCT with the root's prior).
     fn root_action(&self, k: usize, config: &GumbelConfig) -> usize {
         let root = &self.nodes[0];
+        if config.puct {
+            return root.select_puct(&self.root_prior, self.q_bounds, config);
+        }
         let target = self.sequence[k];
         let scores = self.root_scores(config);
         let eligible: [bool; A] = std::array::from_fn(|a| root.legal[a] && root.visits[a] == target);
@@ -314,9 +398,35 @@ impl Search {
         }
     }
 
-    /// The action to play: the best-scoring of the most visited root actions.
-    fn chosen_action(&self, config: &GumbelConfig) -> usize {
+    /// The action to play: the best-scoring of the most visited root actions (PUCT: sampled by
+    /// visits when exploring, else the most visited, ties to the higher Q).
+    fn chosen_action(&mut self, config: &GumbelConfig) -> usize {
         let root = &self.nodes[0];
+        if config.puct {
+            let max_visits = (0..A).filter(|&a| root.legal[a]).map(|a| root.visits[a]).max().unwrap();
+            if config.gumbel_scale > 0.0 && max_visits > 0 {
+                let weights: [f64; A] = std::array::from_fn(|a| {
+                    if root.legal[a] && root.visits[a] > 0 {
+                        (root.visits[a] as f64 / max_visits as f64).powf(1.0 / config.temperature as f64)
+                    } else {
+                        0.0
+                    }
+                });
+                let total: f64 = weights.iter().sum();
+                let mut u = self.rng.gen::<f64>() * total;
+                for a in 0..A {
+                    if weights[a] > 0.0 {
+                        if u < weights[a] {
+                            return a;
+                        }
+                        u -= weights[a];
+                    }
+                }
+                return argmax_legal(&root.legal, |a| weights[a] as f32);
+            }
+            let eligible: [bool; A] = std::array::from_fn(|a| root.legal[a] && root.visits[a] == max_visits);
+            return argmax_legal(&eligible, |a| if root.visits[a] > 0 { root.q(a) } else { 0.0 });
+        }
         let max_visits = (0..A).filter(|&a| root.legal[a]).map(|a| root.visits[a]).max().unwrap();
         let scores = self.root_scores(config);
         let eligible: [bool; A] = std::array::from_fn(|a| root.legal[a] && root.visits[a] == max_visits);
@@ -347,7 +457,12 @@ impl Search {
                 return;
             }
             node = child;
-            action = self.nodes[node as usize].select_interior(config);
+            action = if config.puct {
+                let n = &self.nodes[node as usize];
+                n.select_puct(&n.prior(), self.q_bounds, config)
+            } else {
+                self.nodes[node as usize].select_interior(config)
+            };
             if !env.action_mask()[action] {
                 // An open-loop node can be reached in a state where its chosen action is
                 // illegal only if legality differs between random outcomes, which it doesn't
@@ -376,6 +491,8 @@ impl Search {
             let node = &mut self.nodes[node as usize];
             node.visits[action] += 1;
             node.q_sum[action] += ret;
+            let q = node.q(action);
+            self.q_bounds = (self.q_bounds.0.min(q), self.q_bounds.1.max(q));
         }
         self.leaf = Leaf::Terminal;
     }
@@ -422,8 +539,8 @@ fn evaluate(
 
 /// Searches every game in `envs` (left unchanged) with `config.num_simulations` simulations.
 ///
-/// Returns (actions (B,) uint8: the action to play; policy (B, 5) float32: the improved policy,
-/// the policy target; value (B,) float32: the root's search value, in the network's units;
+/// Returns (actions (B,) uint8: the action to play; policy (B, 5) float32: the improved policy
+/// (PUCT: the visit distribution), the policy target; value (B,) float32: the root's search value, in the network's units;
 /// network_value (B,) float32: the network's value of the root; q (B, 5) float32: the root's
 /// completed Q values, 0 for illegal actions).
 #[pyfunction]
@@ -464,12 +581,27 @@ pub fn gumbel_search<'py>(
             let num_legal = legal.iter().filter(|&&l| l).count();
             let mut nodes = Vec::with_capacity(config.num_simulations + 1);
             nodes.push(Node::new(legal, logits, value));
+            let mut root_prior = nodes[0].prior();
+            if config.puct && config.gumbel_scale > 0.0 && config.dirichlet_fraction > 0.0 && num_legal > 1 {
+                let noise = Dirichlet::new_with_size(config.dirichlet_alpha / num_legal as f32, num_legal)
+                    .expect("dirichlet_alpha is above 0 and there are at least 2 legal actions")
+                    .sample(&mut rng);
+                let mut noise = noise.into_iter();
+                for a in 0..A {
+                    if legal[a] {
+                        let eps = config.dirichlet_fraction;
+                        root_prior[a] = (1.0 - eps) * root_prior[a] + eps * noise.next().unwrap();
+                    }
+                }
+            }
             Search {
                 root_env: env,
                 nodes,
                 gumbel,
                 sequence: considered_visit_sequence(num_legal, config.num_simulations),
                 rng,
+                root_prior,
+                q_bounds: (f32::INFINITY, f32::NEG_INFINITY),
                 path: Vec::new(),
                 leaf: Leaf::Terminal,
                 evaluation: None,
@@ -502,10 +634,10 @@ pub fn gumbel_search<'py>(
     let mut value = Array1::<f32>::zeros(n);
     let mut network_value = Array1::<f32>::zeros(n);
     let mut q = Array2::<f32>::zeros((n, A));
-    for (i, s) in searches.iter().enumerate() {
-        let root = &s.nodes[0];
+    for (i, s) in searches.iter_mut().enumerate() {
         actions[i] = s.chosen_action(&config) as u8;
-        let improved = root.improved_policy(&config);
+        let root = &s.nodes[0];
+        let improved = if config.puct { root.visit_policy() } else { root.improved_policy(&config) };
         let mixed = root.mixed_value();
         for a in 0..A {
             policy[(i, a)] = improved[a];
@@ -536,6 +668,41 @@ mod tests {
         assert_eq!(seq, vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
         assert_eq!(considered_visit_sequence(1, 3), vec![0, 1, 2]);
         assert_eq!(considered_visit_sequence(5, 7).len(), 7);
+    }
+
+    fn puct_config() -> GumbelConfig {
+        GumbelConfig::new(8, 0.99, 0.02, 50.0, 0.1, 0.0, 64, 1, true, 1.25, 19652.0, 10.0, 0.25, 1.0).unwrap()
+    }
+
+    #[test]
+    fn puct_starts_with_the_prior_then_follows_q() {
+        let config = puct_config();
+        let legal = [true, true, true, false, false];
+        let mut node = Node::new(legal, [0.0, 2.0, 0.0, 5.0, 0.0], 0.0);
+        // Nothing visited: the most likely legal action (the illegal one's logit doesn't count)
+        assert_eq!(node.select_puct(&node.prior(), (f32::INFINITY, f32::NEG_INFINITY), &config), 1);
+        // Once action 1 has looked bad many times and action 0 good, action 0 wins
+        node.visits = [3, 20, 0, 0, 0];
+        node.q_sum = [3.0 * 1.0, 20.0 * -1.0, 0.0, 0.0, 0.0];
+        assert_eq!(node.select_puct(&node.prior(), (-1.0, 1.0), &config), 0);
+    }
+
+    #[test]
+    fn puct_explores_less_visited_actions() {
+        let config = puct_config();
+        let legal = [true, true, false, false, false];
+        let mut node = Node::new(legal, [0.0, 0.0, 0.0, 0.0, 0.0], 0.0);
+        // Equal priors and equal Q: the less visited action gets the bigger bonus
+        node.visits = [10, 2, 0, 0, 0];
+        node.q_sum = [5.0, 1.0, 0.0, 0.0, 0.0];
+        assert_eq!(node.select_puct(&node.prior(), (0.0, 1.0), &config), 1);
+    }
+
+    #[test]
+    fn visit_policy_is_the_visit_share() {
+        let mut node = Node::new([true, true, false, true, false], [0.0; A], 0.0);
+        node.visits = [1, 3, 0, 0, 0];
+        assert_eq!(node.visit_policy(), [0.25, 0.75, 0.0, 0.0, 0.0]);
     }
 
     #[test]
