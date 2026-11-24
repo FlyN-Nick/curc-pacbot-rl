@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import shutil
 import signal
+import sys
 import time
 import numpy as np
 
@@ -774,11 +775,12 @@ if __name__ == "__main__":
             # Not finished: the queue scripts and the launcher only mark a run done on exit 0
             raise SystemExit(128 + _exit_signal)
 
-    if not args.no_eval:
+    # The episode viewer waits for Enter, so only at a terminal (not under the launcher or nohup)
+    if not args.no_eval and sys.stdin.isatty():
         while True:
             visualize_agent()
             try:
                 input("Press enter to view another episode")
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):  # Ctrl-C or Ctrl-D ends it
                 print()
                 break
