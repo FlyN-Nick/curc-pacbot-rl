@@ -151,6 +151,24 @@ class LauncherTests(unittest.TestCase):
         (self.state / "jobs" / f"teammate.{name}.args").write_bytes(b"")
         return job
 
+    def test_starting_again_by_name_keeps_its_settings(self):
+        root = self.tmp / "shared"
+        root.mkdir()
+        self.launcher("run", "--algorithm", "ppo", "--checkpoints", str(root), "p2", "--",
+                      "--model", "PVNetV2", "--entropy_coef", "0.05", exit_code=1)  # e.g. the machine restarted
+        (root / "p2" / "model-latest.ckpt.pt").write_text("latest")
+        self.assertEqual(self.launcher("run", "p2").returncode, 0)
+        args = self.last_call()["args"]
+        self.assertEqual(args[2], "algorithms.train_ppo")
+        self.assertEqual(args[args.index("--checkpoint-dir") + 1], str(root / "p2"))
+        self.assertEqual(args[-4:], ["--model", "PVNetV2", "--entropy_coef", "0.05"])
+        self.assertRegex(self.launcher("list").stdout, r"p2\s+ppo\s+done")
+
+    def test_new_arguments_replace_the_saved_ones(self):
+        self.launcher("run", "d3", "--", "--eval_freq", "5", exit_code=1)
+        self.launcher("run", "d3", "--", "--single-model")
+        self.assertEqual(self.last_call()["args"][-1:], ["--single-model"])
+
     def test_forget_removes_your_own_finished_run(self):
         self.assertEqual(self.launcher("run", "mine").returncode, 0)
         result = self.launcher("forget", "mine")

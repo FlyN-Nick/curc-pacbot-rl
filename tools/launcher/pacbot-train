@@ -18,7 +18,8 @@
 #   ../.venv/bin/python -m algorithms.train_dqn --checkpoint-dir checkpoints/NAME ARGS...
 # from that checkout's src/ (LightZero: ../lightzero/.venv/bin/python, see docs/muzero.md),
 # logging to checkpoints/NAME/train.log. Starting a NAME again resumes it from its latest
-# checkpoint; a run that finished leaves a `done` file and isn't started again. A DQN, AlphaZero
+# checkpoint, and `pacbot-train start NAME` alone (e.g. after a reboot) keeps its algorithm,
+# folder and arguments; a run that finished leaves a `done` file and isn't started again. A DQN, AlphaZero
 # or PPO run that's stopped or paused saves a checkpoint first (DQN also its replay memory), so
 # it resumes where it stopped. LightZero saves checkpoints only every so often and resumes with
 # the network alone, so a resumed LightZero run starts its move count over.
@@ -239,7 +240,7 @@ checkout_top() {
 
 cmd_start() {
   local wait=$1; shift
-  local algorithm=dqn root="" from=""
+  local algorithm="" root="" from=""
   while [ $# -gt 0 ]; do
     case $1 in
       --algorithm) [ $# -ge 2 ] || die "--algorithm needs a value"; algorithm=$2; shift 2 ;;
@@ -256,15 +257,22 @@ cmd_start() {
   local name=$1; shift
   [ "${1:-}" = "--" ] && shift
   [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "NAME may use letters, digits, '.', '_' and '-'"
-  [[ " $ALGORITHMS " == *" $algorithm "* ]] || die "--algorithm must be one of: $ALGORITHMS"
   local a; for a in "$@"; do
     case $a in
       --checkpoint-dir*|--finetune*|--resume*) die "$a is set by the launcher (to start from a checkpoint, use --from)" ;;
       --eval|--eval=*) die "$a is set by the launcher" ;;
     esac
   done
-  local id=$ME.$name top dir ckpt python
+  local id=$ME.$name top dir ckpt="" python reuse=0
   top=$(checkout_top); dir=$top/src
+  # Starting a run again with nothing new (e.g. after a reboot) keeps its algorithm, folder and arguments
+  if [ -f "$JOBS/$id" ]; then
+    [ -n "$algorithm" ] || algorithm=$(get "$id" algorithm)
+    [ -n "$root" ] || ckpt=$(get "$id" ckpt)
+    [ $# -eq 0 ] && [ -s "$JOBS/$id.args" ] && reuse=1
+  fi
+  algorithm=${algorithm:-dqn}
+  [[ " $ALGORITHMS " == *" $algorithm "* ]] || die "--algorithm must be one of: $ALGORITHMS"
   [ -f "$dir/algorithms/train_$algorithm.py" ] || die "this checkout has no src/algorithms/train_$algorithm.py"
   if [ -n "${PACBOT_TRAIN_PYTHON:-}" ]; then
     python=$PACBOT_TRAIN_PYTHON
@@ -278,7 +286,7 @@ cmd_start() {
   if [ -n "$root" ]; then
     [ -d "$root" ] || die "--checkpoints $root isn't a directory"
     ckpt=$(cd "$root" && pwd)/$name
-  else
+  elif [ -z "$ckpt" ]; then
     ckpt=$dir/checkpoints/$name
   fi
   if [ -n "$from" ]; then
@@ -291,6 +299,9 @@ cmd_start() {
   [ -f "$ckpt/done" ] && die "$name already finished ($ckpt/done)"
   mkdir -p "$ckpt"
   rm -f "$JOBS/$id.stop"
+  if [ "$reuse" = 1 ]; then
+    local saved=(); mapfile -d '' saved < "$JOBS/$id.args"; set -- "${saved[@]}"
+  fi
   if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi > "$JOBS/$id.args"; chmod 644 "$JOBS/$id.args"
   local seq
   exec 9>>"$STATE/lock"; flock 9
@@ -378,6 +389,6 @@ case ${1:-} in
   log) [ $# -ge 2 ] || die "usage: pacbot-train log NAME [USER]"; cmd_log "$2" "${3:-}" ;;
   forget) [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: pacbot-train forget NAME [USER]"; cmd_forget "$2" "${3:-}" ;;
   __supervise) supervise "$2" ;;
-  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command $1 (try: pacbot-train help)" ;;
 esac

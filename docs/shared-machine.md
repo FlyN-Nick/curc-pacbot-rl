@@ -26,6 +26,8 @@ pacbot-train start --checkpoints /path/to/shared/checkpoints my-run -- --single-
 - `--checkpoints DIR` keeps the run in `DIR/NAME` instead of the checkout's `src/checkpoints/NAME`.
 - `pacbot-train list` shows each run's algorithm.
 
+To resume a run, for example after the machine restarts, start it again by name alone: `pacbot-train start my-run` keeps its algorithm, `--checkpoints` folder and training arguments. Options or arguments given then replace the saved ones.
+
 Stopping and resuming depends on the algorithm. DQN, AlphaZero and PPO save a checkpoint when stopped and resume from it (`model-latest.ckpt.pt` for AlphaZero and PPO). LightZero saves checkpoints every so often, not when stopped, and resumes with the network alone, so a resumed LightZero run loses the progress since its last checkpoint and starts its move count over.
 
 The machine's owner limits how many teammates' runs may train at once with `pacbot-capacity N` (`wsl pacbot-capacity 0` from Windows, e.g. before using the GPU for something else). When it goes down, the newest teammate runs stop and wait; they resume when there's room again.
