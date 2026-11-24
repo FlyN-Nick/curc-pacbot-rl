@@ -1,0 +1,29 @@
+# The environment for the MuZero family (docs/muzero.md). LightZero needs numpy below 2, which
+# the main project can't use, so it gets its own locked environment.
+# LightZero 0.2.0 publishes wheels for Linux and macOS only (no Windows, no source).
+[project]
+name = "pacbot-rl-lightzero"
+version = "0.1.0"
+description = "LightZero (MuZero, EfficientZero, Gumbel and Stochastic MuZero) for the Pacbot competition."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pacbot-rl-models",
+    "LightZero==0.2.0",
+    "torch>=2.9.1,<2.10",
+    "maturin>=1.3,<2",
+    "safetensors>=0.8,<0.9",
+    "tqdm>=4.66.1,<5",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
+
+[tool.uv.sources]
+pacbot-rl-models = { path = "../model_package", editable = true }
+torch = [{ index = "torch-cuda", marker = "sys_platform != 'darwin'" }]
+
+[[tool.uv.index]]
+name = "torch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

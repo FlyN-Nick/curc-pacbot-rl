@@ -1,21 +1,29 @@
 #!/bin/bash
-# pacbot-train: shared launcher for DQN training runs on a machine several people use.
+# pacbot-train: shared launcher for training runs on a machine several people use.
 #
-#   pacbot-train start NAME [-- TRAIN_DQN_ARGS...]   queue a run and return (runs detached)
-#   pacbot-train run NAME [-- TRAIN_DQN_ARGS...]     the same, but wait until it finishes
+#   pacbot-train start [OPTIONS] NAME [-- TRAINING_ARGS...]   queue a run and return (runs detached)
+#   pacbot-train run [OPTIONS] NAME [-- TRAINING_ARGS...]     the same, but wait until it finishes
 #   pacbot-train list                                everyone's runs and the queue
 #   pacbot-train stop NAME                           stop one of your runs (it can be resumed)
 #   pacbot-train log NAME [USER]                     follow a run's training log
 #   pacbot-train forget NAME                         remove a finished run from the list
 #
+# Options (before NAME):
+#   --algorithm dqn|alphazero|ppo|lightzero   the training script (default dqn): src/algorithms/train_ALGORITHM.py
+#   --checkpoints DIR    keep the run in DIR/NAME instead of the checkout's src/checkpoints/NAME
+#   --from CHECKPOINT    start from this checkpoint (e.g. another run's), the first time only
+#
 # Run it from your own curc-pacbot-rl checkout (anywhere inside it). A run trains with
 #   ../.venv/bin/python -m algorithms.train_dqn --checkpoint-dir checkpoints/NAME ARGS...
-# from that checkout's src/, logging to src/checkpoints/NAME/train.log. Starting a NAME again
-# resumes it from its latest checkpoint; a run that finished leaves a `done` file and isn't
-# started again. A run that's stopped or paused saves a checkpoint and its replay memory first,
-# so it resumes exactly where it stopped.
+# from that checkout's src/ (LightZero: ../lightzero/.venv/bin/python, see docs/muzero.md),
+# logging to checkpoints/NAME/train.log. Starting a NAME again resumes it from its latest
+# checkpoint; a run that finished leaves a `done` file and isn't started again. A DQN, AlphaZero
+# or PPO run that's stopped or paused saves a checkpoint first (DQN also its replay memory), so
+# it resumes where it stopped. LightZero saves checkpoints only every so often and resumes with
+# the network alone, so a resumed LightZero run starts its move count over.
 #
-# At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way.
+# At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way
+# (any of the training scripts: DQN, AlphaZero, PPO, LightZero).
 # Waiting runs start in the order they were queued. The machine's owner sets how many of
 # those may be teammates' runs with pacbot-capacity; when it goes down, the newest teammate
 # runs stop (saving as above) and wait, and resume once there's room.
@@ -25,7 +33,9 @@ STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
 OWNER=${PACBOT_TRAIN_OWNER:-nassa}          # whose runs pacbot-capacity doesn't limit
 MAX=${PACBOT_TRAIN_MAX:-3}
 POLL=${PACBOT_TRAIN_POLL:-20}               # seconds between checks
-MATCH=${PACBOT_TRAIN_MATCH:-algorithms.train_dqn}  # how other training processes are found
+# How other training processes are found: every training script (DQN, AlphaZero, PPO, LightZero)
+MATCH=${PACBOT_TRAIN_MATCH:-algorithms[.]train_(dqn|alphazero|ppo|lightzero)}
+ALGORITHMS="dqn alphazero ppo lightzero"
 JOBS=$STATE/jobs
 ME=$(id -un)
 
@@ -51,6 +61,21 @@ put() {  # put ID key value: rewrite one field, atomically
   chmod 644 "$tmp"
   mv -f "$tmp" "$JOBS/$1"
 }
+# Records written before --algorithm and --checkpoints existed are DQN runs in src/checkpoints
+job_algorithm() { local a; a=$(get "$1" algorithm); echo "${a:-dqn}"; }
+job_ckpt() { local c; c=$(get "$1" ckpt); echo "${c:-$(get "$1" dir)/checkpoints/$(get "$1" name)}"; }
+
+# The checkpoint a run resumes from: its own latest, if it has one
+latest_checkpoint() {  # ALGORITHM DIR
+  case $1 in
+    dqn) [ -f "$2/q_net-latest.ckpt.pt" ] && echo "$2/q_net-latest.ckpt.pt" ;;
+    alphazero|ppo) [ -f "$2/model-latest.ckpt.pt" ] && echo "$2/model-latest.ckpt.pt" ;;
+    lightzero) ls -t "$2"/run-*/ckpt/iteration_*.pth.tar 2>/dev/null | head -1 ;;
+  esac
+  return 0
+}
+resume_flag() { [ "$1" = dqn ] && echo --finetune || echo --resume; }
+
 # /proc, not kill -0, so other users' processes count too
 alive() { [ -n "${1:-}" ] && [ -d "/proc/$1" ]; }
 job_ids() {
@@ -129,9 +154,10 @@ stop_training() {  # stop a training run and wait for it
 }
 
 supervise() {
-  local id=$1 dir name log pid code args=()
-  dir=$(get "$id" dir); name=$(get "$id" name)
-  log=$dir/checkpoints/$name/launcher.log
+  local id=$1 dir name ckpt algorithm python log pid code args=()
+  dir=$(get "$id" dir); name=$(get "$id" name); ckpt=$(job_ckpt "$id"); algorithm=$(job_algorithm "$id")
+  python=$(get "$id" python); python=${python:-${PACBOT_TRAIN_PYTHON:-../.venv/bin/python}}
+  log=$ckpt/launcher.log
   [ -s "$JOBS/$id.args" ] && mapfile -d '' args < "$JOBS/$id.args"
   put "$id" sup "$$"
   while true; do
@@ -142,24 +168,29 @@ supervise() {
       fi
       exec 9>>"$STATE/lock"; flock 9
       if may_start "$id"; then
-        local ckpt=$dir/checkpoints/$name resume=()
-        if [ -f "$ckpt/q_net-latest.ckpt.pt" ]; then
-          cp "$ckpt/q_net-latest.ckpt.pt" "$ckpt/resume-from.ckpt.pt"
-          resume=(--finetune "checkpoints/$name/resume-from.ckpt.pt")
+        local resume=() from latest
+        latest=$(latest_checkpoint "$algorithm" "$ckpt")
+        from=${latest:-$(get "$id" from)}
+        if [ -n "$from" ]; then
+          if [ "$algorithm" != lightzero ]; then
+            # The run overwrites its latest checkpoint as it goes
+            cp "$from" "$ckpt/resume-from.ckpt.pt"; from=$ckpt/resume-from.ckpt.pt
+          fi
+          resume=("$(resume_flag "$algorithm")" "$from")
         fi
         (
           exec 9>&-
           cd "$dir"
           export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -e systemprofile -e WindowsApps | paste -sd:)
-          export WANDB_NAME=$name
-          exec setsid "${PACBOT_TRAIN_PYTHON:-../.venv/bin/python}" -u -m "$MATCH" \
-            --checkpoint-dir "checkpoints/$name" "${resume[@]}" "${args[@]}" \
-            >> "checkpoints/$name/train.log" 2>&1 < /dev/null
+          export WANDB_NAME=$name PYTHONPATH=.:../model_package${PYTHONPATH:+:$PYTHONPATH}
+          exec setsid "$python" -u -m "algorithms.train_$algorithm" \
+            --checkpoint-dir "$ckpt" "${resume[@]}" "${args[@]}" \
+            >> "$ckpt/train.log" 2>&1 < /dev/null
         ) &
         pid=$!
         put "$id" pid "$pid"; put "$id" state running; put "$id" started "$(now)"
         flock -u 9
-        echo "$(now) started (pid $pid)${resume:+, resuming from the latest checkpoint}" >> "$log"
+        echo "$(now) started (pid $pid)${latest:+, resuming from the latest checkpoint}${from:+ ($from)}" >> "$log"
         break
       fi
       flock -u 9
@@ -189,7 +220,7 @@ supervise() {
       put "$id" state paused
       echo "$(now) paused to make room (pacbot-capacity $(capacity)); resumes when there's room" >> "$log"
     elif [ "$code" = 0 ]; then
-      touch "$dir/checkpoints/$name/done"; put "$id" state done; put "$id" finished "$(now)"
+      touch "$ckpt/done"; put "$id" state done; put "$id" finished "$(now)"
       echo "$(now) finished" >> "$log"; return
     else
       put "$id" state failed; put "$id" finished "$(now) (exit $code)"
@@ -198,28 +229,66 @@ supervise() {
   done
 }
 
-checkout_src() {
+checkout_top() {
   local top
   top=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside your curc-pacbot-rl checkout"
   [ -f "$top/src/algorithms/train_dqn.py" ] || die "$top isn't a curc-pacbot-rl checkout (no src/algorithms/train_dqn.py)"
-  [ -x "$top/.venv/bin/python" ] || [ -n "${PACBOT_TRAIN_PYTHON:-}" ] || die "$top/.venv is missing; set up the checkout first (see its README)"
-  echo "$top/src"
+  echo "$top"
 }
 
 cmd_start() {
-  local wait=$1 name=$2; shift 2
+  local wait=$1; shift
+  local algorithm=dqn root="" from=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --algorithm) [ $# -ge 2 ] || die "--algorithm needs a value"; algorithm=$2; shift 2 ;;
+      --algorithm=*) algorithm=${1#*=}; shift ;;
+      --checkpoints) [ $# -ge 2 ] || die "--checkpoints needs a directory"; root=$2; shift 2 ;;
+      --checkpoints=*) root=${1#*=}; shift ;;
+      --from) [ $# -ge 2 ] || die "--from needs a checkpoint"; from=$2; shift 2 ;;
+      --from=*) from=${1#*=}; shift ;;
+      -*) die "unknown option $1 (options go before NAME; training arguments after --)" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || die "usage: pacbot-train start [OPTIONS] NAME [-- ARGS...]"
+  local name=$1; shift
   [ "${1:-}" = "--" ] && shift
   [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "NAME may use letters, digits, '.', '_' and '-'"
+  [[ " $ALGORITHMS " == *" $algorithm "* ]] || die "--algorithm must be one of: $ALGORITHMS"
   local a; for a in "$@"; do
-    case $a in --checkpoint-dir*|--finetune*|--eval*) die "$a is set by the launcher" ;; esac
+    case $a in
+      --checkpoint-dir*|--finetune*|--resume*) die "$a is set by the launcher (to start from a checkpoint, use --from)" ;;
+      --eval|--eval=*) die "$a is set by the launcher" ;;
+    esac
   done
-  local id=$ME.$name dir
-  dir=$(checkout_src)
+  local id=$ME.$name top dir ckpt python
+  top=$(checkout_top); dir=$top/src
+  [ -f "$dir/algorithms/train_$algorithm.py" ] || die "this checkout has no src/algorithms/train_$algorithm.py"
+  if [ -n "${PACBOT_TRAIN_PYTHON:-}" ]; then
+    python=$PACBOT_TRAIN_PYTHON
+  elif [ "$algorithm" = lightzero ]; then
+    python=$top/lightzero/.venv/bin/python
+    [ -x "$python" ] || die "$top/lightzero/.venv is missing; set it up first (see docs/muzero.md)"
+  else
+    python=$top/.venv/bin/python
+    [ -x "$python" ] || die "$top/.venv is missing; set up the checkout first (see its README)"
+  fi
+  if [ -n "$root" ]; then
+    [ -d "$root" ] || die "--checkpoints $root isn't a directory"
+    ckpt=$(cd "$root" && pwd)/$name
+  else
+    ckpt=$dir/checkpoints/$name
+  fi
+  if [ -n "$from" ]; then
+    [ -f "$from" ] || die "--from $from isn't a file"
+    from=$(cd "$(dirname "$from")" && pwd)/$(basename "$from")
+  fi
   if alive "$(get "$id" sup)" || running "$id"; then
     die "$name is already $(get "$id" state)"
   fi
-  [ -f "$dir/checkpoints/$name/done" ] && die "$name already finished ($dir/checkpoints/$name/done)"
-  mkdir -p "$dir/checkpoints/$name"
+  [ -f "$ckpt/done" ] && die "$name already finished ($ckpt/done)"
+  mkdir -p "$ckpt"
   rm -f "$JOBS/$id.stop"
   if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi > "$JOBS/$id.args"; chmod 644 "$JOBS/$id.args"
   local seq
@@ -228,13 +297,15 @@ cmd_start() {
   flock -u 9
   : > "$JOBS/$id"; chmod 644 "$JOBS/$id"
   put "$id" user "$ME"; put "$id" name "$name"; put "$id" dir "$dir"; put "$id" seq "$seq"
+  put "$id" algorithm "$algorithm"; put "$id" ckpt "$ckpt"; put "$id" python "$python"
+  [ -n "$from" ] && put "$id" from "$from"
   put "$id" queued "$(now)"; put "$id" state queued
-  echo "$(now) queued: $*" >> "$dir/checkpoints/$name/launcher.log"
+  echo "$(now) queued ($algorithm${from:+, from $from}): $*" >> "$ckpt/launcher.log"
   if [ "$wait" = 1 ]; then
     supervise "$id"
     [ "$(get "$id" state)" = done ]
   else
-    setsid nohup "$0" __supervise "$id" >> "$dir/checkpoints/$name/launcher.log" 2>&1 < /dev/null &
+    setsid nohup "$0" __supervise "$id" >> "$ckpt/launcher.log" 2>&1 < /dev/null &
     echo "Queued $name. Follow it with: pacbot-train log $name   (or: pacbot-train list)"
   fi
 }
@@ -255,15 +326,15 @@ cmd_list() {
   local o; o=$(others)
   printf 'Training now: %s of at most %s (teammate runs: %s of at most %s)\n\n' \
     "$((n + o))" "$MAX" "$t" "$(capacity)"
-  printf '%-4s %-8s %-24s %-9s %s\n' SEQ USER NAME STATE PROGRESS
+  printf '%-4s %-8s %-24s %-10s %-9s %s\n' SEQ USER NAME ALGORITHM STATE PROGRESS
   for id in $(for j in $(job_ids); do echo "$(get "$j" seq) $j"; done | sort -n | cut -d' ' -f2); do
     local state; state=$(get "$id" state)
     case $state in
       running) alive "$(get "$id" pid)" || state="gone" ;;
       queued|paused) alive "$(get "$id" sup)" || state="gone" ;;
     esac
-    printf '%-4s %-8s %-24s %-9s %s\n' "$(get "$id" seq)" "$(get "$id" user)" "$(get "$id" name)" \
-      "$state" "$(progress "$(get "$id" dir)/checkpoints/$(get "$id" name)/train.log" 2>/dev/null)"
+    printf '%-4s %-8s %-24s %-10s %-9s %s\n' "$(get "$id" seq)" "$(get "$id" user)" "$(get "$id" name)" \
+      "$(job_algorithm "$id")" "$state" "$(progress "$(job_ckpt "$id")/train.log" 2>/dev/null)"
   done
   [ "$o" -gt 0 ] && printf '\n%s more training run(s) started outside the launcher\n' "$o"
   return 0
@@ -284,7 +355,7 @@ cmd_log() {
   local user=${2:-$ME} id
   id=$user.$1
   [ -f "$JOBS/$id" ] || die "no run $1 for $user"
-  tail -n 20 -F "$(get "$id" dir)/checkpoints/$1/train.log"
+  tail -n 20 -F "$(job_ckpt "$id")/train.log"
 }
 
 cmd_forget() {
@@ -296,13 +367,13 @@ cmd_forget() {
 }
 
 case ${1:-} in
-  start) [ $# -ge 2 ] || die "usage: pacbot-train start NAME [-- ARGS...]"; shift; cmd_start 0 "$@" ;;
-  run) [ $# -ge 2 ] || die "usage: pacbot-train run NAME [-- ARGS...]"; shift; cmd_start 1 "$@" ;;
+  start) [ $# -ge 2 ] || die "usage: pacbot-train start [OPTIONS] NAME [-- ARGS...]"; shift; cmd_start 0 "$@" ;;
+  run) [ $# -ge 2 ] || die "usage: pacbot-train run [OPTIONS] NAME [-- ARGS...]"; shift; cmd_start 1 "$@" ;;
   list|"") cmd_list ;;
   stop) [ $# -eq 2 ] || die "usage: pacbot-train stop NAME"; cmd_stop "$2" ;;
   log) [ $# -ge 2 ] || die "usage: pacbot-train log NAME [USER]"; cmd_log "$2" "${3:-}" ;;
   forget) [ $# -eq 2 ] || die "usage: pacbot-train forget NAME"; cmd_forget "$2" ;;
   __supervise) supervise "$2" ;;
-  -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command $1 (try: pacbot-train help)" ;;
 esac

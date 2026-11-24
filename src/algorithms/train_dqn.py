@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import shutil
 import signal
+import sys
 import time
 import numpy as np
 
@@ -447,6 +448,8 @@ def train():
             )
         # use epsilon recovered from checkpoint if finetuning,
         # otherwise use configured initial epsilon
+        # Split-reward networks (models.HRANetV2) learn a value for each of the game's reward parts
+        reward_parts = getattr(model_class, "REWARD_PARTS", 1)
         fill_epsilon = resume_epsilon if resume_epsilon is not None else (wandb.config.initial_epsilon if args.finetune else 1.0)
         # Initialize the replay buffer.
         if actors:
@@ -463,6 +466,7 @@ def train():
                 random_start_proportion=wandb.config.random_start_proportion,
                 random_pellet_removal=wandb.config.random_pellet_removal,
                 near_ghost_epsilon=near_ghost_epsilon(),
+                reward_parts=reward_parts,
             )
         else:
             replay_buffer = ReplayBuffer(
@@ -474,8 +478,9 @@ def train():
                 near_ghost_epsilon=near_ghost_epsilon(),
                 device=device,
                 storage=ReplayStorage(
-                    wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device
+                    wandb.config.replay_buffer_size, wandb.config.num_parallel_envs, device, reward_parts
                 ),
+                reward_parts=reward_parts > 1,
             )
         if wandb.config.n_step > 1:
             if replay_buffer.storage is None:
@@ -770,11 +775,12 @@ if __name__ == "__main__":
             # Not finished: the queue scripts and the launcher only mark a run done on exit 0
             raise SystemExit(128 + _exit_signal)
 
-    if not args.no_eval:
+    # The episode viewer waits for Enter, so only at a terminal (not under the launcher or nohup)
+    if not args.no_eval and sys.stdin.isatty():
         while True:
             visualize_agent()
             try:
                 input("Press enter to view another episode")
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):  # Ctrl-C or Ctrl-D ends it
                 print()
                 break

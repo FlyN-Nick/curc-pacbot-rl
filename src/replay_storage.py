@@ -154,7 +154,7 @@ class Batch(NamedTuple):
     done: torch.Tensor
     next_action_mask: torch.Tensor
     action: torch.Tensor
-    reward: torch.Tensor  # unscaled; float64, or float32 on MPS (see ReplayStorage)
+    reward: torch.Tensor  # unscaled; float64, or float32 on MPS (see ReplayStorage); (batch, parts) with reward_parts
 
 
 class BatchIndices(NamedTuple):
@@ -170,8 +170,14 @@ class ReplayStorage:
     gather() give a batch drawn uniformly without replacement, like random.sample().
     """
 
-    def __init__(self, capacity: int, num_envs: int, device: torch.device) -> None:
+    def __init__(self, capacity: int, num_envs: int, device: torch.device, reward_parts: int = 1) -> None:
+        """
+        With reward_parts > 1, each transition's reward is a vector of that many parts (the
+        game's reward_parts(), for split-reward training), and batches' rewards have shape
+        (batch, reward_parts); with 1, a number per transition, as before.
+        """
         self.capacity = capacity
+        self.reward_parts = reward_parts
         self.num_envs = num_envs
         self.device = device
         self.codec = ObsCodec(device)
@@ -187,7 +193,8 @@ class ReplayStorage:
         # Rewards are kept (and scaled) in float64 like the original Python code did, except on
         # MPS, which has no float64; rewards are integers, so float32 holds them exactly too.
         self._float = torch.float32 if device.type == "mps" else torch.float64
-        self._reward = torch.zeros(capacity, dtype=self._float, device=device)
+        reward_shape = (capacity,) if reward_parts == 1 else (capacity, reward_parts)
+        self._reward = torch.zeros(reward_shape, dtype=self._float, device=device)
         self._done = torch.zeros(capacity, dtype=torch.bool, device=device)
         self._next_mask = torch.zeros((capacity, NUM_ACTIONS), dtype=torch.bool, device=device)
         self._initialized = False
@@ -269,7 +276,7 @@ class ReplayStorage:
         # the CPU wait for the device's queued work first.
         packed = torch.cat([
             torch.as_tensor(actions, dtype=self._float).view(n, 1),
-            torch.as_tensor(rewards, dtype=self._float).view(n, 1),
+            torch.as_tensor(rewards, dtype=self._float).view(n, self.reward_parts),
             torch.as_tensor(dones, dtype=self._float).view(n, 1),
             torch.as_tensor(next_action_masks, dtype=self._float).view(n, NUM_ACTIONS),
         ], dim=1)
@@ -280,11 +287,12 @@ class ReplayStorage:
         else:
             # Elsewhere (e.g. MPS) a background copy could read this temporary after it's freed
             packed = packed.to(self.device)
+        k = self.reward_parts
         columns = (
             (self._action, packed[:, 0].long()),
-            (self._reward, packed[:, 1]),
-            (self._done, packed[:, 2].bool()),
-            (self._next_mask, packed[:, 3:].bool()),
+            (self._reward, packed[:, 1] if k == 1 else packed[:, 1:1 + k]),
+            (self._done, packed[:, 1 + k].bool()),
+            (self._next_mask, packed[:, 2 + k:].bool()),
         )
         for dst, end, src in self._ranges(self.total, n, self.capacity):
             for column, values in columns:
@@ -373,13 +381,16 @@ class ReplayStorage:
         dones = self._done[idx.position]
         playing = torch.cumprod((~dones).to(self._float), dim=1)
         playing = torch.cat([torch.ones_like(playing[:, :1]), playing[:, :-1]], dim=1)
+        weights = playing * self._step_discounts
+        if self.reward_parts > 1:
+            weights = weights.unsqueeze(2)
         return Batch(
             obs=obs(idx.obs_row),
             next_obs=obs(idx.next_row),
             done=dones.any(dim=1),
             next_action_mask=self._next_mask[idx.position[:, -1]],
             action=self._action[idx.position[:, 0]],
-            reward=(self._reward[idx.position] * playing * self._step_discounts).sum(dim=1),
+            reward=(self._reward[idx.position] * weights).sum(dim=1),
         )
 
     def sample(self, batch_size: int) -> Batch:
@@ -395,5 +406,5 @@ class ReplayStorage:
         return dict(
             obs=b.obs[0], next_obs=None if b.done.item() else b.next_obs[0],
             done=b.done.item(), next_action_mask=b.next_action_mask[0].tolist(),
-            action=b.action.item(), reward=b.reward.item(),
+            action=b.action.item(), reward=b.reward.item() if self.reward_parts == 1 else b.reward[0].tolist(),
         )

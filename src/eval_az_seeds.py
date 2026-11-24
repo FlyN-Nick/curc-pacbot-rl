@@ -11,11 +11,11 @@ least one board, and the boards and lives columns say how many boards it cleared
 import csv, sys, time
 import numpy as np, torch
 import models, utils
-from alphazero import QNetworkEvaluator, evaluate_games
+from alphazero import QNetworkEvaluator, evaluate_games, search_config
 from pacbot_rs import GumbelConfig
 utils.set_single_model(True)
 obs_config = utils.replay_buffer_obs_config()
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
 lo, _, hi = sys.argv[1].partition("-")
 seeds = range(int(lo), int(hi) + 1) if hi else range(1, int(lo) + 1)
@@ -34,8 +34,7 @@ with open(sys.argv[2], "w", newline="") as f:
         alphazero = isinstance(net, models.PVNetV2)  # PVNetV2Wide too
         temperature = float(temp[0]) if temp else 0.1
         if alphazero:
-            search = GumbelConfig(num_simulations=int(sims), discount=cfg["discount"], reward_scale=cfg["reward_scale"],
-                                  c_visit=cfg["c_visit"], c_scale=cfg["c_scale"], gumbel_scale=0.0)
+            search = search_config(cfg, int(sims), explore=False)  # Gumbel or PUCT, as the run trained
             evaluator, temperature = None, ""
         else:  # DQN: its own reward scale and discount, AlphaZero's search settings
             search = GumbelConfig(num_simulations=int(sims), discount=cfg["discount_factor"],

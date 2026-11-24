@@ -1,6 +1,6 @@
 # What is this repo?
 
-Reinforcement learning agents that control a robot in the Pacbot competition. Three algorithms are implemented from scratch: **DQN**, **PPO** and **AlphaZero** (Gumbel search). The training and evaluation scripts are in `src/algorithms/` and `src/`. (`src/algorithms/deprecated/` keeps an early PPO, which no longer runs against the current game code, for reference.)
+Reinforcement learning agents that control a robot in the Pacbot competition. Three algorithms are implemented from scratch: **DQN**, **PPO** and **AlphaZero** (Gumbel search, or classic PUCT search). The training and evaluation scripts are in `src/algorithms/` and `src/`. (`src/algorithms/deprecated/` keeps an early PPO, which no longer runs against the current game code, for reference.)
 
 The game environment and other performance-sensitive code, such as the batched Gumbel search, are written in Rust as a Python extension module (`pyo3` and `maturin`), in `pacbot_rs/`.
 
@@ -36,6 +36,12 @@ RAYON_NUM_THREADS=4 uv run --project . --directory src python -m algorithms.trai
   - The observation is unchanged, so full-game checkpoints play wherever the others do.
 - `--speed_sampling equal_moves --max_speed 18` gives each speed from 4 to 18 game ticks per move about the same number of training moves. The default trains on speeds 4 to 14 with the same number of games at each, which gives the slow speeds most of the moves (see `src/speed_sampling.py`).
 - `--num_moves` sets the run's length (20M by default). `--num_simulations` sets the search simulations per training move (32 by default).
+- `--search puct` trains with classic AlphaZero / MuZero search instead of Gumbel's, in the same batched search, for comparison:
+  - It selects moves by PUCT, with Q rescaled by the tree's min and max.
+  - Training adds Dirichlet noise to the root's prior and plays moves sampled by visit counts. The temperature follows MuZero's schedule (1, then 0.5, then 0.25) unless `--puct_temperature` sets a number.
+  - The network learns the root's visit distribution.
+  - `--c_puct`, `--c_puct_base`, `--dirichlet_alpha` and `--dirichlet_fraction` set the constants.
+  - Checkpoints record the search, so `eval_az_seeds.py` plays each run with the search it trained with.
 - **Checkpoints:**
   - It evaluates on fixed-seed games at every speed, with the network alone and with search, and keeps `model-best.ckpt.pt` and `model-best-search.ckpt.pt`.
   - SIGTERM or Ctrl-C saves `model-latest.ckpt.pt`, and `--resume` continues from it.
@@ -66,6 +72,10 @@ uv run --project . --directory src python -m algorithms.train_dqn --single-model
 `--single-model` trains one network that plays the whole game. Without it, a fixed super pellet model takes over when ghosts are close or frightened. `--finetune path/to/checkpoint` starts from a checkpoint, and `--checkpoint-dir` sets where checkpoints go (`./checkpoints/` by default).
 
 [DQN training](docs/dqn-training.md) covers its other options: actor processes, the replay buffer, several trainings on one machine, bfloat16 and the hyperparameters. On a machine several people train on, start runs with [`pacbot-train`](docs/shared-machine.md).
+
+## MuZero, EfficientZero, Gumbel MuZero and Stochastic MuZero
+
+These are trained with [LightZero](https://github.com/opendilab/LightZero) on our game, in their own locked environment (`lightzero/`, Linux and macOS); see [the MuZero family](docs/muzero.md).
 
 ## Environment versions
 

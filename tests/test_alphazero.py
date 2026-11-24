@@ -163,6 +163,84 @@ class GumbelSearchTests(unittest.TestCase):
             gumbel_search([game], uniform, GumbelConfig(num_simulations=2), OBS_CONFIG, 0)
 
 
+class PuctSearchTests(unittest.TestCase):
+    """The classic AlphaZero / MuZero rules (GumbelConfig(puct=True)), in the same batched search."""
+
+    def test_outputs_are_well_formed_and_the_policy_is_the_visit_share(self):
+        envs = random_states(12, seed=21)
+        before = [e.game_state_bytes() for e in envs]
+        for explore in (0.0, 1.0):
+            config = GumbelConfig(num_simulations=16, puct=True, gumbel_scale=explore)
+            actions, policy, value, _, q = gumbel_search(envs, uniform, config, OBS_CONFIG, 7)
+            self.assertEqual([e.game_state_bytes() for e in envs], before)
+            for i, env in enumerate(envs):
+                legal = np.array(env.action_mask())
+                self.assertTrue(legal[actions[i]])
+                self.assertAlmostEqual(float(policy[i].sum()), 1.0, places=5)
+                self.assertTrue((policy[i][~legal] == 0).all())
+                self.assertTrue((q[i][~legal] == 0).all())
+                # 16 simulations, each one root visit: the policy is visits / 16
+                np.testing.assert_allclose(policy[i] * 16, np.round(policy[i] * 16), atol=1e-4)
+                if not explore:  # without exploration, the most visited move is played
+                    self.assertEqual(policy[i][actions[i]], policy[i].max())
+            self.assertTrue(np.isfinite(value).all())
+
+    def test_same_seed_same_search_and_threads_alike(self):
+        envs = random_states(9, seed=22)
+        config = lambda t: GumbelConfig(num_simulations=8, puct=True, threads=t)  # noqa: E731
+        results = [gumbel_search(envs, uniform, config(t), OBS_CONFIG, 5) for t in (1, 1, 0, 3)]
+        for other in results[1:]:
+            for x, y in zip(results[0], other):
+                self.assertTrue(np.array_equal(x, y))
+
+    def test_exploration_adds_noise_and_samples_moves(self):
+        envs = random_states(40, seed=23)
+        greedy = GumbelConfig(num_simulations=16, puct=True, gumbel_scale=0.0)
+        noisy = GumbelConfig(num_simulations=16, puct=True, gumbel_scale=1.0, temperature=1.0)
+        g = [gumbel_search(envs, uniform, greedy, OBS_CONFIG, seed) for seed in (1, 2)]
+        self.assertTrue(all(np.array_equal(x, y) for x, y in zip(*g)))  # no randomness left but the game's
+        n = [gumbel_search(envs, uniform, noisy, OBS_CONFIG, seed) for seed in (1, 2)]
+        self.assertFalse(np.array_equal(n[0][1], n[1][1]))  # the noise changes the visits
+        # Sampled moves aren't always the most visited
+        played_best = np.mean([n[0][1][i][n[0][0][i]] == n[0][1][i].max() for i in range(len(envs))])
+        self.assertLess(played_best, 1.0)
+
+    def test_finds_the_best_move_when_one_loses_a_life(self):
+        # As for Gumbel search above
+        cases = deadly_states(8, seed=5)
+        envs = [env for env, _ in cases]
+        config = GumbelConfig(num_simulations=32, gumbel_scale=0.0, max_depth=3, puct=True)
+        actions, _, _, _, _ = gumbel_search(envs, uniform, config, OBS_CONFIG, 1)
+        avoided = 0
+        for i, (env, deadly) in enumerate(cases):
+            true = {a: lookahead_value(env, a, depth=3) for a in range(NUM_ACTIONS) if env.action_mask()[a]}
+            if max(v for a, v in true.items() if a not in deadly) > max(true[a] for a in deadly) + 1.0:
+                self.assertNotIn(int(actions[i]), deadly)
+                avoided += 1
+        self.assertGreaterEqual(avoided, 2)
+
+    def test_rejects_bad_settings(self):
+        for bad in ({"dirichlet_alpha": 0.0}, {"dirichlet_fraction": 1.5}, {"temperature": 0.0}, {"c_puct_base": 0.0}):
+            with self.subTest(**bad), self.assertRaises(ValueError):
+                GumbelConfig(puct=True, **bad)
+
+    def test_search_config_follows_the_run(self):
+        from alphazero import puct_temperature, search_config
+        old = {"discount": 0.99, "reward_scale": 0.02, "c_visit": 50.0, "c_scale": 0.1}  # before --search
+        self.assertFalse(search_config(old, 8, explore=False).puct)
+        self.assertEqual(search_config(old, 8, explore=True).gumbel_scale, 1.0)
+        puct = {**old, "search": "puct", "c_puct": 2.0, "dirichlet_fraction": 0.1, "puct_temperature": "muzero"}
+        c = search_config(puct, 8, explore=True, progress=0.6)
+        self.assertTrue(c.puct)
+        self.assertEqual((c.c_puct, c.temperature, c.gumbel_scale), (2.0, 0.5, 1.0))
+        self.assertAlmostEqual(c.dirichlet_fraction, 0.1, places=6)
+        self.assertEqual(search_config(puct, 8, explore=False).gumbel_scale, 0.0)
+        self.assertEqual([puct_temperature("muzero", p) for p in (0.0, 0.5, 0.8)], [1.0, 0.5, 0.25])
+        self.assertEqual(puct_temperature("0.3", 0.9), 0.3)
+        with self.assertRaises(ValueError):
+            search_config({**old, "search": "mcts"}, 8, explore=False)
+
+
 class TargetTests(unittest.TestCase):
     def test_td_targets_bootstrap_from_the_search_value(self):
         targets = Targets(num_games=2, td_steps=2, discount=0.5)
