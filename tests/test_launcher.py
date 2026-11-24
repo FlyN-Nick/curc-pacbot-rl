@@ -48,10 +48,10 @@ class LauncherTests(unittest.TestCase):
             python.chmod(0o755)
         subprocess.run(["git", "init", "-q", str(self.top)], check=True)
 
-    def launcher(self, *args, exit_code=0, cwd=None):
+    def launcher(self, *args, exit_code=0, cwd=None, owner="the-owner"):
         env = {**os.environ, "PACBOT_TRAIN_STATE": str(self.state), "PACBOT_TRAIN_MAX": "99",
                "PACBOT_TRAIN_POLL": "1", "PACBOT_TRAIN_MATCH": "no-such-training-process",
-               "FAKE_EXIT": str(exit_code)}
+               "PACBOT_TRAIN_OWNER": owner, "FAKE_EXIT": str(exit_code)}
         env.pop("PACBOT_TRAIN_PYTHON", None)
         return subprocess.run(["bash", str(LAUNCHER), *args], cwd=cwd or self.top, env=env,
                               capture_output=True, text=True, timeout=60)
@@ -144,6 +144,42 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.last_call()["args"], ["-u", "-m", "algorithms.train_dqn", "--checkpoint-dir", str(ckpt),
                                                     "--single-model"])
         self.assertTrue((ckpt / "done").exists())
+
+    def teammate_run(self, name, state="done"):
+        job = self.state / "jobs" / f"teammate.{name}"
+        job.write_text(f"user=teammate\nname={name}\ndir={self.top / 'src'}\nseq=9\nstate={state}\n")
+        (self.state / "jobs" / f"teammate.{name}.args").write_bytes(b"")
+        return job
+
+    def test_forget_removes_your_own_finished_run(self):
+        self.assertEqual(self.launcher("run", "mine").returncode, 0)
+        result = self.launcher("forget", "mine")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("mine", self.launcher("list").stdout)
+        self.assertTrue((self.top / "src/checkpoints/mine/done").exists())  # its checkpoints stay
+
+    def test_only_the_owner_can_forget_someone_elses_run(self):
+        job = self.teammate_run("theirs")
+        result = self.launcher("forget", "theirs", "teammate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only the-owner can remove other people's runs", result.stderr)
+        self.assertTrue(job.exists())
+
+        me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+        result = self.launcher("forget", "theirs", "teammate", owner=me)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(job.exists())
+        self.assertFalse(job.with_name(job.name + ".args").exists())
+
+    def test_nobody_can_forget_a_run_in_progress(self):
+        me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+        job = self.teammate_run("busy", state="running")
+        with job.open("a") as f:
+            f.write(f"pid={os.getpid()}\n")  # a live process
+        result = self.launcher("forget", "busy", "teammate", owner=me)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stop it first", result.stderr)
+        self.assertTrue(job.exists())
 
     def test_rejects_what_the_launcher_sets_and_bad_options(self):
         for args in (["run", "x", "--", "--resume", "c.pt"], ["run", "x", "--", "--finetune=c.pt"],

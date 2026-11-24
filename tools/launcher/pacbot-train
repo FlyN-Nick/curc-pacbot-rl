@@ -6,7 +6,8 @@
 #   pacbot-train list                                everyone's runs and the queue
 #   pacbot-train stop NAME                           stop one of your runs (it can be resumed)
 #   pacbot-train log NAME [USER]                     follow a run's training log
-#   pacbot-train forget NAME                         remove a finished run from the list
+#   pacbot-train forget NAME [USER]                  remove a finished run from the list (the
+#                                                    machine's owner can remove anyone's)
 #
 # Options (before NAME):
 #   --algorithm dqn|alphazero|ppo|lightzero   the training script (default dqn): src/algorithms/train_ALGORITHM.py
@@ -359,10 +360,13 @@ cmd_log() {
 }
 
 cmd_forget() {
-  local id=$ME.$1
-  [ -f "$JOBS/$id" ] || die "you have no run named $1"
+  local user=${2:-$ME} id
+  [ "$user" = "$ME" ] || [ "$ME" = "$OWNER" ] || die "only $OWNER can remove other people's runs"
+  id=$user.$1
+  [ -f "$JOBS/$id" ] || die "no run $1 for $user"
   if alive "$(get "$id" sup)" || running "$id"; then die "$1 is $(get "$id" state); stop it first"; fi
-  rm -f "$JOBS/$id" "$JOBS/$id.args" "$JOBS/$id.stop"
+  # The jobs directory is sticky and belongs to the owner: only a run's user or the owner can remove it
+  rm -f "$JOBS/$id" "$JOBS/$id.args" "$JOBS/$id.stop" || die "couldn't remove $user's $1"
   echo "Removed $1 from the list (its checkpoints stay)"
 }
 
@@ -372,8 +376,8 @@ case ${1:-} in
   list|"") cmd_list ;;
   stop) [ $# -eq 2 ] || die "usage: pacbot-train stop NAME"; cmd_stop "$2" ;;
   log) [ $# -ge 2 ] || die "usage: pacbot-train log NAME [USER]"; cmd_log "$2" "${3:-}" ;;
-  forget) [ $# -eq 2 ] || die "usage: pacbot-train forget NAME"; cmd_forget "$2" ;;
+  forget) [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: pacbot-train forget NAME [USER]"; cmd_forget "$2" "${3:-}" ;;
   __supervise) supervise "$2" ;;
-  -h|--help|help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command $1 (try: pacbot-train help)" ;;
 esac
