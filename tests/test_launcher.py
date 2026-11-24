@@ -13,17 +13,22 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import textwrap
 import unittest
 from pathlib import Path
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "tools" / "launcher" / "pacbot-train"
+MEMWATCH = LAUNCHER.with_name("pacbot-memwatch")
 HAVE_TOOLS = all(shutil.which(t) for t in ("bash", "flock", "setsid", "pgrep")) and os.name == "posix"
 
 FAKE_PYTHON = textwrap.dedent("""\
     #!/bin/bash
-    # Records its arguments and environment, then exits with $FAKE_EXIT (default 0)
+    # Records its arguments and environment, trains for $FAKE_SLEEP seconds (default 0; SIGTERM
+    # stops it, as it would a real run), then exits with $FAKE_EXIT (default 0)
     {{ echo "python=$0"; echo "cwd=$PWD"; echo "WANDB_NAME=$WANDB_NAME"; printf 'arg=%s\\n' "$@"; echo; }} >> {calls}
+    trap 'exit 143' TERM
+    sleep ${{FAKE_SLEEP:-0}} & wait
     exit ${{FAKE_EXIT:-0}}
     """)
 
@@ -48,10 +53,10 @@ class LauncherTests(unittest.TestCase):
             python.chmod(0o755)
         subprocess.run(["git", "init", "-q", str(self.top)], check=True)
 
-    def launcher(self, *args, exit_code=0, cwd=None, owner="the-owner"):
-        env = {**os.environ, "PACBOT_TRAIN_STATE": str(self.state), "PACBOT_TRAIN_MAX": "99",
+    def launcher(self, *args, exit_code=0, cwd=None, owner="the-owner", sleep=0, max_runs=99):
+        env = {**os.environ, "PACBOT_TRAIN_STATE": str(self.state), "PACBOT_TRAIN_MAX": str(max_runs),
                "PACBOT_TRAIN_POLL": "1", "PACBOT_TRAIN_MATCH": "no-such-training-process",
-               "PACBOT_TRAIN_OWNER": owner, "FAKE_EXIT": str(exit_code)}
+               "PACBOT_TRAIN_OWNER": owner, "FAKE_EXIT": str(exit_code), "FAKE_SLEEP": str(sleep)}
         env.pop("PACBOT_TRAIN_PYTHON", None)
         return subprocess.run(["bash", str(LAUNCHER), *args], cwd=cwd or self.top, env=env,
                               capture_output=True, text=True, timeout=60)
@@ -169,6 +174,30 @@ class LauncherTests(unittest.TestCase):
         self.launcher("run", "d3", "--", "--single-model")
         self.assertEqual(self.last_call()["args"][-1:], ["--single-model"])
 
+    def state_of(self, name):
+        job = self.state / "jobs" / f"{subprocess.run(['id', '-un'], capture_output=True, text=True).stdout.strip()}.{name}"
+        return [l[6:] for l in job.read_text().splitlines() if l.startswith("state=")][-1]
+
+    def wait_for(self, name, state, timeout=30):
+        deadline = time.time() + timeout
+        while self.state_of(name) != state:
+            self.assertLess(time.time(), deadline, f"{name} stayed {self.state_of(name)}, not {state}")
+            time.sleep(0.2)
+
+    def test_a_memory_limit_pauses_the_newest_run_until_it_lifts(self):
+        for name in ("old", "new"):
+            self.assertEqual(self.launcher("start", name, sleep=120, max_runs=3).returncode, 0)
+            self.wait_for(name, "running")
+        (self.state / "memory-limit").write_text("1\n")
+        self.wait_for("new", "paused")
+        self.assertEqual(self.state_of("old"), "running")
+        self.assertIn("lowered the limit", self.launcher("list", max_runs=3).stdout)
+        (self.state / "memory-limit").unlink()
+        self.wait_for("new", "running")
+        for name in ("old", "new"):
+            self.launcher("stop", name, max_runs=3)
+            self.wait_for(name, "stopped")
+
     def test_forget_removes_your_own_finished_run(self):
         self.assertEqual(self.launcher("run", "mine").returncode, 0)
         result = self.launcher("forget", "mine")
@@ -213,3 +242,41 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_TOOLS, "needs bash")
+class MemwatchTests(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.state)
+        self.training = self.state / "training"
+        fake = self.state / "fake-launcher"
+        fake.write_text(f'#!/bin/bash\necho "Training now: $(cat {self.training}) of at most 3"\n')
+        fake.chmod(0o755)
+        self.fake = fake
+
+    def check(self, used, training, calm=0):
+        self.training.write_text(str(training))
+        env = {**os.environ, "PACBOT_TRAIN_STATE": str(self.state), "PACBOT_TRAIN_MAX": "3",
+               "PACBOT_MEM_CMD": f"echo {used}", "PACBOT_MEM_LAUNCHER": str(self.fake),
+               "PACBOT_MEM_ONCE": "1", "PACBOT_MEM_CALM": str(calm), "PACBOT_MEM_SETTLE": "0"}
+        subprocess.run(["bash", str(MEMWATCH)], env=env, check=True, timeout=30)
+        limit = self.state / "memory-limit"
+        return int(limit.read_text()) if limit.exists() else None
+
+    def test_nearly_full_memory_allows_one_run_fewer(self):
+        self.assertEqual(self.check(used=98, training=3), 2)
+        self.assertEqual(self.check(used=97, training=2), 1)
+
+    def test_nothing_changes_between_the_thresholds_or_with_nothing_training(self):
+        self.assertIsNone(self.check(used=95, training=3))
+        self.assertIsNone(self.check(used=99, training=0))
+
+    def test_calm_memory_allows_runs_back_one_at_a_time(self):
+        (self.state / "memory-limit").write_text("1\n")
+        self.assertEqual(self.check(used=50, training=1), 2)
+        self.assertIsNone(self.check(used=50, training=2))  # back to PACBOT_TRAIN_MAX: no limit
+
+    def test_it_waits_for_memory_to_stay_calm(self):
+        (self.state / "memory-limit").write_text("1\n")
+        self.assertEqual(self.check(used=50, training=1, calm=600), 1)

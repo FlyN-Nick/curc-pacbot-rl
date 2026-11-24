@@ -1,0 +1,13 @@
+[Unit]
+Description=Pause the newest PacBot training runs while the machine's memory is nearly full
+After=multi-user.target
+
+[Service]
+User=OWNER
+ExecStart=/usr/local/bin/pacbot-memwatch
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

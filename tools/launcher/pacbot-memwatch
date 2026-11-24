@@ -1,0 +1,75 @@
+#!/bin/bash
+# pacbot-memwatch: keeps the whole machine's memory use under PACBOT_MEM_HIGH percent (97).
+# On WSL it reads Windows' memory, which counts everything WSL uses, GPU memory spilled into
+# system RAM included (the cap in .wslconfig doesn't). When use reaches PACBOT_MEM_HIGH, it
+# lowers how many runs may train at once to one fewer than are training: the newest run stops at
+# a checkpoint, as with pacbot-capacity. It waits PACBOT_MEM_SETTLE seconds (180) for memory to
+# come back before lowering again. Once use has stayed under PACBOT_MEM_LOW percent (90) for
+# PACBOT_MEM_CALM seconds (1800), it allows one more run, and so on back to PACBOT_TRAIN_MAX.
+# install.sh runs it as a service (systemctl status pacbot-memwatch); its log is
+# /var/lib/pacbot-train/memwatch.log.
+set -uo pipefail
+STATE=${PACBOT_TRAIN_STATE:-/var/lib/pacbot-train}
+MAX=${PACBOT_TRAIN_MAX:-3}
+HIGH=${PACBOT_MEM_HIGH:-97}
+LOW=${PACBOT_MEM_LOW:-90}
+EVERY=${PACBOT_MEM_EVERY:-30}
+SETTLE=${PACBOT_MEM_SETTLE:-180}
+CALM=${PACBOT_MEM_CALM:-1800}
+LAUNCHER=${PACBOT_MEM_LAUNCHER:-pacbot-train}
+POWERSHELL=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+LIMIT=$STATE/memory-limit
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S %Z') $*" >> "$STATE/memwatch.log"; }
+
+used_percent() {  # the machine's memory in use, as a whole percent
+  if [ -n "${PACBOT_MEM_CMD:-}" ]; then
+    bash -c "$PACBOT_MEM_CMD"
+  elif [ -x "$POWERSHELL" ]; then
+    "$POWERSHELL" -NoProfile -NonInteractive -Command \
+      '$o=Get-CimInstance Win32_OperatingSystem; [int](100 - 100*$o.FreePhysicalMemory/$o.TotalVisibleMemorySize)' |
+      tr -d '\r'
+  else
+    awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} END {printf "%d\n", 100 - 100*a/t}' /proc/meminfo
+  fi
+}
+
+training_now() { "$LAUNCHER" list 2>/dev/null | sed -n 's/^Training now: \([0-9]*\).*/\1/p'; }
+
+set_limit() {  # set_limit N (N >= MAX removes the limit)
+  if [ "$1" -ge "$MAX" ]; then rm -f "$LIMIT"; return; fi
+  local tmp; tmp=$(mktemp "$STATE/.memory-limit.XXXXXX")
+  echo "$1" > "$tmp"; chmod 644 "$tmp"; mv -f "$tmp" "$LIMIT"
+}
+
+limit() { local m; m=$(cat "$LIMIT" 2>/dev/null || echo "$MAX"); [[ $m =~ ^[0-9]+$ ]] || m=$MAX; echo "$m"; }
+
+last_change=0 calm_since=""
+log "watching: lower the run limit at ${HIGH}% memory use, raise it after ${CALM}s under ${LOW}%"
+while true; do
+  used=$(used_percent 2>/dev/null)
+  t=$(date +%s)
+  if ! [[ $used =~ ^[0-9]+$ ]]; then
+    log "couldn't read memory use (got '$used')"
+  elif [ "$used" -ge "$HIGH" ]; then
+    calm_since=""
+    if [ $((t - last_change)) -ge "$SETTLE" ]; then
+      n=$(training_now); n=${n:-0}
+      if [ "$n" -gt 0 ]; then
+        new=$((n - 1)); [ "$new" -lt "$(limit)" ] || new=$(( $(limit) > 0 ? $(limit) - 1 : 0 ))
+        set_limit "$new"; last_change=$t
+        log "memory ${used}% (>= ${HIGH}%) with $n training: at most $new runs now; the newest pauses"
+      fi
+    fi
+  elif [ "$used" -lt "$LOW" ] && [ "$(limit)" -lt "$MAX" ]; then
+    calm_since=${calm_since:-$t}
+    if [ $((t - calm_since)) -ge "$CALM" ]; then
+      new=$(( $(limit) + 1 )); set_limit "$new"; last_change=$t; calm_since=$t
+      log "memory ${used}% (< ${LOW}%) for ${CALM}s: at most $(( new < MAX ? new : MAX )) runs now"
+    fi
+  else
+    calm_since=""
+  fi
+  [ "${PACBOT_MEM_ONCE:-0}" = 1 ] && exit 0
+  sleep "$EVERY"
+done

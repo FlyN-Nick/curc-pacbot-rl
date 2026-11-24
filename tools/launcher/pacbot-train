@@ -25,7 +25,8 @@
 # the network alone, so a resumed LightZero run starts its move count over.
 #
 # At most PACBOT_TRAIN_MAX runs (3) train at once, counting training started any other way
-# (any of the training scripts: DQN, AlphaZero, PPO, LightZero).
+# (any of the training scripts: DQN, AlphaZero, PPO, LightZero). pacbot-memwatch lowers that
+# while the machine's memory is nearly full: the newest runs pause and resume later.
 # Waiting runs start in the order they were queued. The machine's owner sets how many of
 # those may be teammates' runs with pacbot-capacity; when it goes down, the newest teammate
 # runs stop (saving as above) and wait, and resume once there's room.
@@ -51,6 +52,15 @@ capacity() {
   c=$(cat "$STATE/capacity" 2>/dev/null || echo "$MAX")
   [[ $c =~ ^[0-9]+$ ]] || c=$MAX
   echo "$c"
+}
+
+# How many runs may train at once overall: PACBOT_TRAIN_MAX, or fewer while pacbot-memwatch
+# has lowered it because the machine's memory is nearly full ($STATE/memory-limit)
+overall() {
+  local m
+  m=$(cat "$STATE/memory-limit" 2>/dev/null || echo "$MAX")
+  [[ $m =~ ^[0-9]+$ ]] || m=$MAX
+  echo $(( m < MAX ? m : MAX ))
 }
 
 # Job records: $JOBS/USER.NAME holds key=value lines, written only by their owner (the
@@ -103,7 +113,7 @@ others() {
 
 # Called holding the lock: whether job $1 may start now
 may_start() {
-  local total teammates=0 id cap
+  local total teammates=0 id cap max
   total=$(others)
   for id in $(job_ids); do
     if running "$id"; then
@@ -111,13 +121,13 @@ may_start() {
       [ "$(get "$id" user)" = "$OWNER" ] || teammates=$((teammates + 1))
     fi
   done
-  cap=$(capacity)
+  cap=$(capacity); max=$(overall)
   # The earliest waiting run that fits goes first
   for id in $(for j in $(job_ids); do
                 # A waiting run whose launcher process is gone (e.g. after a reboot) doesn't hold its place
                 case $(get "$j" state) in queued|paused) alive "$(get "$j" sup)" && echo "$(get "$j" seq) $j" ;; esac
               done | sort -n | cut -d' ' -f2); do
-    [ "$total" -lt "$MAX" ] || return 1
+    [ "$total" -lt "$max" ] || return 1
     if [ "$(get "$id" user)" != "$OWNER" ] && [ "$teammates" -ge "$cap" ]; then
       continue
     fi
@@ -127,9 +137,21 @@ may_start() {
   return 1
 }
 
-# Called holding the lock: whether running teammate job $1 must make room
+# Called holding the lock: whether running job $1 must make room
 must_pause() {
-  local id over n=0
+  local id over n
+  # Memory: the newest runs (anyone's) beyond the overall limit stop
+  n=$(others)
+  for id in $(job_ids); do running "$id" && n=$((n + 1)); done
+  over=$((n - $(overall)))
+  if [ "$over" -gt 0 ]; then
+    for id in $(for j in $(job_ids); do running "$j" && echo "$(get "$j" seq) $j"; done |
+                sort -rn | head -n "$over" | cut -d' ' -f2); do
+      [ "$id" = "$1" ] && return 0
+    done
+  fi
+  # Capacity: the newest teammate runs beyond pacbot-capacity stop
+  n=0
   [ "$(get "$1" user)" = "$OWNER" ] && return 1
   for id in $(job_ids); do
     running "$id" && [ "$(get "$id" user)" != "$OWNER" ] && n=$((n + 1))
@@ -220,7 +242,7 @@ supervise() {
       echo "$(now) stopped by request" >> "$log"; return
     elif [ "$paused" = 1 ]; then
       put "$id" state paused
-      echo "$(now) paused to make room (pacbot-capacity $(capacity)); resumes when there's room" >> "$log"
+      echo "$(now) paused to make room (at most $(overall) runs, $(capacity) of them teammates'); resumes when there's room" >> "$log"
     elif [ "$code" = 0 ]; then
       touch "$ckpt/done"; put "$id" state done; put "$id" finished "$(now)"
       echo "$(now) finished" >> "$log"; return
@@ -336,8 +358,10 @@ cmd_list() {
     fi
   done
   local o; o=$(others)
-  printf 'Training now: %s of at most %s (teammate runs: %s of at most %s)\n\n' \
-    "$((n + o))" "$MAX" "$t" "$(capacity)"
+  printf 'Training now: %s of at most %s (teammate runs: %s of at most %s)\n' \
+    "$((n + o))" "$(overall)" "$t" "$(capacity)"
+  [ "$(overall)" -lt "$MAX" ] && echo "(pacbot-memwatch lowered the limit from $MAX because memory is nearly full)"
+  echo
   printf '%-4s %-8s %-24s %-10s %-9s %s\n' SEQ USER NAME ALGORITHM STATE PROGRESS
   for id in $(for j in $(job_ids); do echo "$(get "$j" seq) $j"; done | sort -n | cut -d' ' -f2); do
     local state; state=$(get "$id" state)
@@ -389,6 +413,6 @@ case ${1:-} in
   log) [ $# -ge 2 ] || die "usage: pacbot-train log NAME [USER]"; cmd_log "$2" "${3:-}" ;;
   forget) [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: pacbot-train forget NAME [USER]"; cmd_forget "$2" "${3:-}" ;;
   __supervise) supervise "$2" ;;
-  -h|--help|help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command $1 (try: pacbot-train help)" ;;
 esac
