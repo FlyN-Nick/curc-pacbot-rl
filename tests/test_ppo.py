@@ -6,6 +6,7 @@ AlphaZero's, and resume.
 Run from src/: python -m unittest discover ../tests
 """
 
+import copy
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import torch
 
 import models
 import utils
-from algorithms.train_ppo import gae, ppo_losses
+from algorithms.train_ppo import chunked_backward, gae, minibatch_update, ppo_losses
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -115,6 +116,99 @@ class LossTests(unittest.TestCase):
         self.assertGreaterEqual(clipped, unclipped - 1e-6)
 
 
+class MinibatchFixture(unittest.TestCase):
+    """A minibatch whose update clips some ratios and has nonzero value errors."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.net = models.PVNetV2(utils.OBS_SHAPE, utils.NUM_ACTIONS).double()  # float64: rounding far below the tolerance
+        with torch.no_grad():
+            self.net.policy_head.weight.normal_(0, 0.1)
+        n = 10
+        self.obs = torch.rand(n, *utils.OBS_SHAPE, dtype=torch.float64)
+        self.legal = torch.rand(n, utils.NUM_ACTIONS) < 0.7
+        self.legal[:, 0] = True
+        self.actions = torch.tensor([0] * n)
+        with torch.no_grad():
+            logits, value = self.net(self.obs)
+            log_policy = torch.log_softmax(logits.masked_fill(~self.legal, -torch.inf), dim=1)
+        # Off-policy, so some ratios are clipped; returns away from the values
+        self.old_log_prob = log_policy.gather(1, self.actions[:, None]).squeeze(1) + torch.linspace(-0.5, 0.5, n, dtype=torch.float64)
+        self.old_value = value
+        self.returns = value + torch.linspace(-1, 2, n, dtype=torch.float64)
+        adv = torch.randn(n, dtype=torch.float64)
+        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+
+class ChunkTests(MinibatchFixture):
+    """chunked_backward gives the same gradients and statistics as the whole minibatch at once."""
+
+    def whole(self, value_clip):
+        self.net.zero_grad(set_to_none=True)
+        out = ppo_losses(self.net, self.obs, self.legal, self.actions, self.old_log_prob, self.old_value,
+                         self.adv, self.returns, 0.2, value_clip)
+        (out["policy_loss"] + 0.5 * out["value_loss"] - 0.01 * out["entropy"]).backward()
+        return {k: v.detach() for k, v in out.items()}, [p.grad.clone() for p in self.net.parameters()]
+
+    def chunked(self, max_chunk, value_clip):
+        self.net.zero_grad(set_to_none=True)
+        out = chunked_backward(self.net, lambda rows: self.obs[rows], self.legal, self.actions, self.old_log_prob,
+                               self.old_value, self.adv, self.returns, 0.2, value_clip, 0.5, 0.01, max_chunk)
+        return out, [p.grad.clone() for p in self.net.parameters()]
+
+    def test_pieces_give_the_whole_minibatchs_gradients_and_statistics(self):
+        for value_clip in (0.0, 0.1):
+            want_out, want_grads = self.whole(value_clip)
+            self.assertGreater(want_out["clip_fraction"].item(), 0)  # the clipped branch is exercised
+            for max_chunk in (1, 3, 5, 10, 64):  # one position each, uneven, even, the whole, more than the whole
+                with self.subTest(max_chunk=max_chunk, value_clip=value_clip):
+                    out, grads = self.chunked(max_chunk, value_clip)
+                    for k in want_out:
+                        torch.testing.assert_close(out[k], want_out[k], rtol=1e-10, atol=1e-12)
+                    for g, w in zip(grads, want_grads):
+                        torch.testing.assert_close(g, w, rtol=1e-9, atol=1e-12)
+
+
+class MinibatchUpdateTests(MinibatchFixture):
+    """minibatch_update: off, exactly the step training took before --max_chunk; on, the same step."""
+
+    def step(self, max_chunk, net=None):
+        net = net or copy.deepcopy(self.net)
+        optimizer = torch.optim.AdamW(net.parameters(), lr=3e-4, eps=1e-5)
+        out = minibatch_update(net, optimizer, lambda rows: self.obs[rows], self.legal, self.actions, self.old_log_prob,
+                               self.old_value, self.adv, self.returns, 0.2, 0.0, 0.5, 0.01, 0.1, max_chunk)
+        return out, net
+
+    def test_off_is_the_step_training_took_before_chunking(self):
+        # The minibatch step as the training loop wrote it before --max_chunk
+        before = copy.deepcopy(self.net)
+        optimizer = torch.optim.AdamW(before.parameters(), lr=3e-4, eps=1e-5)
+        out = ppo_losses(before, self.obs, self.legal, self.actions, self.old_log_prob, self.old_value, self.adv,
+                         self.returns, 0.2, 0.0)
+        loss = out["policy_loss"] + 0.5 * out["value_loss"] - 0.01 * out["entropy"]
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(before.parameters(), 0.1)
+        optimizer.step()
+        for max_chunk in (0, 10, 64):  # off, and on but no minibatch bigger than it
+            with self.subTest(max_chunk=max_chunk):
+                got, net = self.step(max_chunk)
+                self.assertTrue(torch.equal(got["grad_norm"], norm))
+                for p, q in zip(net.parameters(), before.parameters()):
+                    self.assertTrue(torch.equal(p, q))  # bit for bit
+
+    def test_on_takes_the_same_step(self):
+        want, want_net = self.step(0)
+        self.assertGreater(want["grad_norm"].item(), 0.1)  # clipping is exercised
+        for max_chunk in (1, 3, 5):
+            with self.subTest(max_chunk=max_chunk):
+                got, net = self.step(max_chunk)
+                for k in want:
+                    torch.testing.assert_close(got[k], want[k], rtol=1e-9, atol=1e-12)
+                for p, q in zip(net.parameters(), want_net.parameters()):
+                    torch.testing.assert_close(p, q, rtol=1e-9, atol=1e-12)
+
+
 class TrainingRunTests(unittest.TestCase):
     def run_ppo(self, *args):
         return subprocess.run(
@@ -145,6 +239,32 @@ class TrainingRunTests(unittest.TestCase):
             self.assertEqual((ck["rollout"], ck["moves"]), (2, 128))
             self.assertTrue((Path(tmp) / "model-best.ckpt.pt").exists())
             self.assertTrue((Path(tmp) / "model-best-search.ckpt.pt").exists())
+            self.assertEqual(ck["config"]["max_chunk"], 0)  # off unless asked for
+
+    def one_rollout(self, tmp, name, *args):
+        out = self.run_ppo("--checkpoint-dir", str(Path(tmp) / name), "--num_moves", "64", *args)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        return torch.load(Path(tmp) / name / "model-latest.ckpt.pt", map_location="cpu", weights_only=False)
+
+    def test_a_resumed_run_keeps_its_chunking_unless_told_otherwise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ck = self.one_rollout(tmp, "run", "--max_chunk", "5")
+            latest = Path(tmp) / "run" / "model-latest.ckpt.pt"
+            kept = self.run_ppo("--checkpoint-dir", str(Path(tmp) / "run"), "--num_moves", "128", "--resume", str(latest))
+            self.assertEqual(kept.returncode, 0, kept.stderr[-2000:])
+            self.assertEqual(torch.load(latest, map_location="cpu", weights_only=False)["config"]["max_chunk"], 5)
+            changed = self.run_ppo("--checkpoint-dir", str(Path(tmp) / "run"), "--num_moves", "192",
+                                   "--resume", str(latest), "--max_chunk", "0")
+            self.assertEqual(changed.returncode, 0, changed.stderr[-2000:])
+            self.assertEqual(torch.load(latest, map_location="cpu", weights_only=False)["config"]["max_chunk"], 0)
+            # A checkpoint from before --max_chunk existed resumes with it off
+            del ck["config"]["max_chunk"]
+            old = Path(tmp) / "old.ckpt.pt"
+            torch.save(ck, old)
+            resumed = self.run_ppo("--checkpoint-dir", str(Path(tmp) / "old"), "--num_moves", "128", "--resume", str(old))
+            self.assertEqual(resumed.returncode, 0, resumed.stderr[-2000:])
+            self.assertEqual(torch.load(Path(tmp) / "old" / "model-latest.ckpt.pt", map_location="cpu",
+                                        weights_only=False)["config"]["max_chunk"], 0)
 
 
 if __name__ == "__main__":

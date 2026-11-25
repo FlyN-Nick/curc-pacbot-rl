@@ -19,6 +19,14 @@ and every search_eval_every moves with search too (search_eval_simulations, Alph
 constants c_visit and c_scale); the best greedy mean is kept as model-best.ckpt.pt (and with
 search, model-best-search.ckpt.pt).
 
+--max_chunk N (off by default: 0) runs each minibatch through the network in pieces of at most N
+positions and adds up their gradients before the one optimizer step, so training needs memory
+for N positions at a time instead of a whole minibatch; the update is the same (each piece's
+loss is weighted by its share of the minibatch, and advantages are normalized over the whole
+minibatch first), up to floating-point rounding. For large rollouts (e.g. --num_games 1024 has
+minibatches of 16384 positions; PVNetV2 keeps about 0.6 MB per position for the backward pass).
+It is kept in checkpoints, and can be changed when resuming.
+
 SIGTERM or SIGINT saves model-latest.ckpt.pt and exits (128 + signal); --resume continues
 from a checkpoint (the rollout in progress starts over).
 
@@ -34,6 +42,7 @@ import random
 import signal
 import time
 from argparse import ArgumentParser
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -135,6 +144,56 @@ def ppo_losses(net: torch.nn.Module, obs: torch.Tensor, legal: torch.Tensor, act
             "approx_kl": approx_kl, "clip_fraction": clip_fraction}
 
 
+def chunked_backward(net: torch.nn.Module, obs: Callable[[slice], torch.Tensor], legal: torch.Tensor,
+                     actions: torch.Tensor, old_log_prob: torch.Tensor, old_value: torch.Tensor,
+                     advantages: torch.Tensor, returns: torch.Tensor, clip_range: float, value_clip_range: float,
+                     value_loss_weight: float, entropy_coef: float, max_chunk: int) -> dict[str, torch.Tensor]:
+    """
+    The gradients of a minibatch's PPO loss, added into the parameters' .grad, computed in pieces of
+    at most max_chunk positions (obs(rows) gives a piece's observations), and the minibatch's
+    losses and statistics: each is a mean over positions, so the minibatch's is the mean of the
+    pieces' weighted by their sizes. Advantages should already be normalized over the minibatch.
+    """
+    n = actions.shape[0]
+    totals: dict[str, torch.Tensor] = {}
+    for start in range(0, n, max_chunk):
+        rows = slice(start, min(start + max_chunk, n))
+        share = (rows.stop - rows.start) / n
+        part = ppo_losses(net, obs(rows), legal[rows], actions[rows], old_log_prob[rows], old_value[rows],
+                          advantages[rows], returns[rows], clip_range, value_clip_range)
+        loss = part["policy_loss"] + value_loss_weight * part["value_loss"] - entropy_coef * part["entropy"]
+        (loss * share).backward()
+        for k, v in part.items():
+            totals[k] = totals[k] + v.detach() * share if k in totals else v.detach() * share
+    return totals
+
+
+def minibatch_update(net: torch.nn.Module, optimizer: torch.optim.Optimizer, obs: Callable[[slice], torch.Tensor],
+                     legal: torch.Tensor, actions: torch.Tensor, old_log_prob: torch.Tensor, old_value: torch.Tensor,
+                     advantages: torch.Tensor, returns: torch.Tensor, clip_range: float, value_clip_range: float,
+                     value_loss_weight: float, entropy_coef: float, grad_clip_norm: float,
+                     max_chunk: int = 0) -> dict[str, torch.Tensor]:
+    """
+    One optimizer step on a minibatch (obs(rows) gives the observations of those rows of it), and
+    its losses, statistics and gradient norm. With max_chunk 0 (the default), or a minibatch no
+    bigger than it, the whole minibatch goes through the network at once; otherwise in pieces
+    (chunked_backward).
+    """
+    if max_chunk and actions.shape[0] > max_chunk:
+        optimizer.zero_grad(set_to_none=True)
+        out = chunked_backward(net, obs, legal, actions, old_log_prob, old_value, advantages, returns,
+                               clip_range, value_clip_range, value_loss_weight, entropy_coef, max_chunk)
+    else:
+        out = ppo_losses(net, obs(slice(None)), legal, actions, old_log_prob, old_value, advantages, returns,
+                         clip_range, value_clip_range)
+        loss = out["policy_loss"] + value_loss_weight * out["value_loss"] - entropy_coef * out["entropy"]
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+    out["grad_norm"] = torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip_norm)
+    optimizer.step()
+    return out
+
+
 def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--no-wandb", action="store_true")
@@ -142,6 +201,9 @@ def main() -> None:
     parser.add_argument("--resume", metavar="CHECKPOINT", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max_chunk", type=int, default=None,
+                        help="positions per piece of a minibatch (0: no pieces; see above). Default: 0, "
+                             "or a resumed run's own")
     for name, default in HYPERPARAMS.items():
         kind = utils.parse_bool if isinstance(default, bool) else type(default)
         parser.add_argument(f"--{name}", type=kind, default=default, help="Default: %(default)s")
@@ -154,6 +216,8 @@ def main() -> None:
         parser.error(f"--max_speed must be at least {utils.MIN_SPEED}")
     if (args.num_games * args.rollout_steps) % args.minibatches:
         parser.error("num_games * rollout_steps must be a multiple of minibatches")
+    if args.max_chunk is not None and args.max_chunk < 0:
+        parser.error("--max_chunk must be 0 (off) or a positive number of positions")
 
     utils.set_single_model(True)
     obs_config = utils.replay_buffer_obs_config()
@@ -169,6 +233,9 @@ def main() -> None:
     if resumed is not None:
         # The run's own settings, except how long to run (and defaults for settings added since)
         config = {**config, **resumed["config"], **{k: v for k, v in config.items() if k == "num_moves"}}
+    # Off unless asked for: given now, or the resumed run's own (it doesn't change the update)
+    config["max_chunk"] = args.max_chunk if args.max_chunk is not None else int(
+        resumed["config"].get("max_chunk", 0) if resumed is not None else 0)
     run = wandb.init(
         project="pacbot-ind-study", group="ppo", config={**config, "device": str(device), "seed": seed},
         mode="disabled" if args.no_wandb else "online",
@@ -318,13 +385,10 @@ def main() -> None:
                 adv = advantages[idx]
                 if cfg.normalize_advantages:
                     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-                out = ppo_losses(net, decode(idx), legal_store[idx], action_store[idx], log_prob_store[idx],
-                                 old_values[idx], adv, returns[idx], cfg.clip_range, cfg.value_clip_range)
-                loss = out["policy_loss"] + cfg.value_loss_weight * out["value_loss"] - cfg.entropy_coef * out["entropy"]
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                out["grad_norm"] = torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.grad_clip_norm)
-                optimizer.step()
+                out = minibatch_update(net, optimizer, lambda rows, idx=idx: decode(idx[rows]), legal_store[idx],
+                                       action_store[idx], log_prob_store[idx], old_values[idx], adv, returns[idx],
+                                       cfg.clip_range, cfg.value_clip_range, cfg.value_loss_weight, cfg.entropy_coef,
+                                       cfg.grad_clip_norm, cfg.max_chunk)
                 for k in stats:
                     stats[k].append(out[k].detach())
             if cfg.target_kl > 0 and torch.stack(stats["approx_kl"][-cfg.minibatches:]).mean().item() > cfg.target_kl:
