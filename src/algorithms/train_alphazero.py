@@ -101,8 +101,8 @@ def main() -> None:
         puct_temperature(args.puct_temperature, 0.0)
     except ValueError:
         parser.error('--puct_temperature must be a number or "muzero"')
-    if not hasattr(models, args.model):
-        parser.error(f"unknown --model {args.model!r}")
+    if not hasattr(models, args.model) or not models.is_policy_value(getattr(models, args.model)):
+        parser.error(f"--model must be a policy and value network (PVNetV2, PVNetV2Wide or MazeGraphPVNet), got {args.model!r}")
     if args.speed_sampling not in utils.SPEED_SAMPLING_MODES:
         parser.error(f"--speed_sampling must be one of {utils.SPEED_SAMPLING_MODES}")
     if args.max_speed < utils.MIN_SPEED:
@@ -140,6 +140,10 @@ def main() -> None:
         # shape, and channels-last suits its kernels
         torch.backends.cudnn.benchmark = True
         net = net.to(memory_format=torch.channels_last)
+        if getattr(type(net), "FAST_CUDA", False):
+            # As in DQN training: models made of matrix products (MazeGraphPVNet) get them in
+            # TF32, the precision cuDNN already gives PVNetV2's convolutions
+            torch.backends.cuda.matmul.allow_tf32 = True
     print(f"{cfg.model} has {sum(p.numel() for p in net.parameters())} parameters")
     optimizer = torch.optim.AdamW(net.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     step, best, best_search = 0, -math.inf, -math.inf

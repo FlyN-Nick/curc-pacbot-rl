@@ -31,7 +31,7 @@ with open(sys.argv[2], "w", newline="") as f:
         cfg = ck["config"]
         net = getattr(models, cfg["model"])(utils.OBS_SHAPE, utils.NUM_ACTIONS).to(device)
         net.load_state_dict(ck["state_dict"]); net = net.to(memory_format=torch.channels_last).eval()
-        alphazero = isinstance(net, models.PVNetV2)  # PVNetV2Wide too
+        alphazero = models.is_policy_value(net)  # AlphaZero or PPO; otherwise a DQN
         temperature = float(temp[0]) if temp else 0.1
         if alphazero:
             search = search_config(cfg, int(sims), explore=False)  # Gumbel or PUCT, as the run trained

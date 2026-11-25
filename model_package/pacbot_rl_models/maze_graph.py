@@ -1,5 +1,5 @@
 """
-The maze as a graph, and the pieces the graph models (MazeGraphQNet, MazeTransformerQNet)
+The maze as a graph, and the pieces the graph models (MazeGraphQNet, MazeGraphPVNet, MazeTransformerQNet)
 share: reading the observation at the maze's squares, and scoring each move from the square it
 leads to.
 
@@ -227,6 +227,10 @@ class MazeGraphQNet(nn.Module):
         return torch.sparse.mm(within, flat)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.head(*self.embed(obs))
+
+    def embed(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(node embeddings (B, NUM_NODES, dim), whole-board features (B, dim), Pacman's node (B,))."""
         nodes, whole, pacman = self.reader(obs)
         whole = self.whole(whole)
         h = self.node_in(nodes) + self.position + whole[:, None]  # (B, NUM_NODES, dim)
@@ -235,4 +239,32 @@ class MazeGraphQNet(nn.Module):
         h = h.transpose(0, 1).contiguous()
         for i, layer in enumerate(self.layers):
             h = h + layer(torch.cat([h, self._mean_within(i, h)], dim=2))
-        return self.head(h.transpose(0, 1), whole, pacman)
+        return h.transpose(0, 1), whole, pacman
+
+
+class MazeGraphPVNet(MazeGraphQNet):
+    """
+    MazeGraphQNet as a policy and value network for AlphaZero and PPO: forward returns (policy
+    logits (B, 5), value (B,)), as PVNetV2 does. The graph layers are MazeGraphQNet's; the
+    policy logits come from its MoveHead (each move scored from the node it leads to), and the
+    value from an MLP of Pacman's node, the mean over all nodes and the whole-board features.
+    Both heads output zeros at the start (a uniform policy, value 0).
+    """
+
+    POLICY_VALUE = True
+
+    def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
+        super().__init__(obs_shape, action_count)
+        dim = self.DIM
+        self.value_head = nn.Sequential(
+            nn.Linear(3 * dim, 2 * dim), nn.SiLU(), nn.Linear(2 * dim, 2 * dim), nn.SiLU(), nn.Linear(2 * dim, 1),
+        )
+        with torch.no_grad():
+            self.value_head[-1].weight.fill_(0)
+            self.value_head[-1].bias.fill_(0)
+
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h, whole, pacman = self.embed(obs)
+        at_pacman = h[torch.arange(h.shape[0], device=h.device), pacman]
+        value = self.value_head(torch.cat([at_pacman, h.mean(dim=1), whole], dim=1)).squeeze(1)
+        return self.head(h, whole, pacman), value
