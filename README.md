@@ -72,6 +72,8 @@ uv run --project . --directory src python -m algorithms.train_dqn --single-model
 
 `--single-model` trains one network that plays the whole game. Without it, a fixed super pellet model takes over when ghosts are close or frightened. `--finetune path/to/checkpoint` starts from a checkpoint, and `--checkpoint-dir` sets where checkpoints go (`./checkpoints/` by default).
 
+`--full_game true` (with `--single-model`) trains on full games, as in competition: three lives and board after board. A lost life costs the death penalty and play goes on, and the in-training evaluations play full games too (up to 40,000 moves; a game counts as cleared once it clears a board). Checkpoints record the setting, so `--eval` replays the same kind of game.
+
 [DQN training](docs/dqn-training.md) covers its other options: actor processes, the replay buffer, several trainings on one machine, bfloat16 and the hyperparameters. On a machine several people train on, start runs with [`pacbot-train`](docs/shared-machine.md).
 
 ## MuZero, EfficientZero, Gumbel MuZero and Stochastic MuZero
