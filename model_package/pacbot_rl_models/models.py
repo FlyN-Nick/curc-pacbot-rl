@@ -323,6 +323,7 @@ class PVNetV2(nn.Module):
 
     WIDTHS = (16, 32, 64, 128)
     FC_WIDTH = 256
+    POLICY_VALUE = True  # see is_policy_value
 
     def __init__(self, obs_shape: torch.Size, action_count: int) -> None:
         super().__init__()
@@ -345,3 +346,10 @@ class PVNetV2Wide(PVNetV2):
 
     WIDTHS = (32, 64, 128, 256)
     FC_WIDTH = 512
+
+
+def is_policy_value(model) -> bool:
+    """Whether a network (or network class) returns (policy logits, value), as AlphaZero's and
+    PPO's do (PVNetV2, PVNetV2Wide, MazeGraphQNet's MazeGraphPVNet), rather than Q values."""
+    cls = model if isinstance(model, type) else type(model)
+    return bool(getattr(cls, "POLICY_VALUE", False))

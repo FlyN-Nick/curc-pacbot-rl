@@ -36,6 +36,10 @@ RAYON_NUM_THREADS=4 uv run --project . --directory src python -m algorithms.trai
   - The observation is unchanged, so full-game checkpoints play wherever the others do.
 - `--speed_sampling equal_moves --max_speed 18` gives each speed from 4 to 18 game ticks per move about the same number of training moves. The default trains on speeds 4 to 14 with the same number of games at each, which gives the slow speeds most of the moves (see `src/speed_sampling.py`).
 - `--num_moves` sets the run's length (20M by default). `--num_simulations` sets the search simulations per training move (32 by default).
+- `--model PVNetV2Wide` trains a network with twice the channels. `--model MazeGraphPVNet` trains MazeGraphQNet's graph network (the maze's squares as a graph, see `model_package/pacbot_rl_models/maze_graph.py`) as a policy and value network:
+  - The policy scores each move from the square it leads to, as MazeGraphQNet scores its Q values.
+  - The value comes from Pacman's square, the mean over all squares and the whole-board features.
+  - On CUDA its matrix products run in TF32, as in DQN training.
 - `--search puct` trains with classic AlphaZero / MuZero search instead of Gumbel's, in the same batched search, for comparison:
   - It selects moves by PUCT, with Q rescaled by the tree's min and max.
   - Training adds Dirichlet noise to the root's prior and plays moves sampled by visit counts. The temperature follows MuZero's schedule (1, then 0.5, then 0.25) unless `--puct_temperature` sets a number.

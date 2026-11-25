@@ -208,8 +208,8 @@ def main() -> None:
         kind = utils.parse_bool if isinstance(default, bool) else type(default)
         parser.add_argument(f"--{name}", type=kind, default=default, help="Default: %(default)s")
     args = parser.parse_args()
-    if not hasattr(models, args.model) or not issubclass(getattr(models, args.model), models.PVNetV2):
-        parser.error(f"--model must be a policy and value network (PVNetV2 or PVNetV2Wide), got {args.model!r}")
+    if not hasattr(models, args.model) or not models.is_policy_value(getattr(models, args.model)):
+        parser.error(f"--model must be a policy and value network (PVNetV2, PVNetV2Wide or MazeGraphPVNet), got {args.model!r}")
     if args.speed_sampling not in utils.SPEED_SAMPLING_MODES:
         parser.error(f"--speed_sampling must be one of {utils.SPEED_SAMPLING_MODES}")
     if args.max_speed < utils.MIN_SPEED:
