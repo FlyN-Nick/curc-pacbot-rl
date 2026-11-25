@@ -1,6 +1,7 @@
 """
 The maze graph models' shared pieces (pacbot_rl_models.maze_graph) checked against the real
-game, MazeGraphQNet in training updates, and MazeGraphPVNet as AlphaZero's network.
+game, MazeGraphQNet and MazeTransformerQNet in training updates, and MazeGraphPVNet as AlphaZero's
+network.
 
 Run from src/: python -m unittest discover -s ../tests -p test_maze_graph.py
 """
@@ -29,7 +30,7 @@ from utils import NUM_ACTIONS, OBS_SHAPE  # noqa: E402
 SRC = Path(__file__).resolve().parent.parent / "src"
 
 CONFIG = utils.SINGLE_MODEL_REPLAY_BUFFER_OBS_GYM_CONFIGURATION
-GRAPH_MODELS = [models.MazeGraphQNet]
+GRAPH_MODELS = [models.MazeGraphQNet, models.MazeTransformerQNet]
 
 
 def random_states(n: int, seed: int = 0):
@@ -94,6 +95,15 @@ class MazeGraphTests(unittest.TestCase):
                 on_graph = nodes[b, :, 2:10].sum(0)
                 self.assertTrue(torch.allclose(whole[b, :8] + on_graph, ghost_total))
                 self.assertAlmostEqual(whole[b, -1].item(), obs[b, 15, 0, 0].item())
+
+    def test_distance_buckets(self):
+        from pacbot_rl_models.maze_transformer import DISTANCE_BUCKETS, distance_buckets
+        buckets, dist = distance_buckets(), mg.distances()
+        self.assertTrue((buckets[dist == 0] == 0).all())
+        self.assertTrue((buckets[dist == 1] == 1).all())
+        self.assertTrue((buckets[dist > DISTANCE_BUCKETS[-1]] == len(DISTANCE_BUCKETS)).all())
+        self.assertTrue((buckets[:, :-1] <= buckets[:, 1:]).any())  # not constant
+        self.assertTrue(((buckets >= 0) & (buckets <= len(DISTANCE_BUCKETS))).all())
 
     def test_distances_are_maze_distances(self):
         dist = mg.distances()
@@ -207,12 +217,18 @@ class FastPathTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_compiled_updates_replay_as_a_cuda_graph(self):
+        for cls in GRAPH_MODELS:
+            with self.subTest(cls.__name__):
+                self._compiled_updates_replay(cls)
+
+    def _compiled_updates_replay(self, cls):
+        self.assertTrue(cls.FAST_CUDA)
         device = torch.device("cuda")
         storage = filled_storage(device)
         runs = []
         for compiled in (False, True):
             torch.manual_seed(0)
-            q_net = models.MazeGraphQNet(OBS_SHAPE, NUM_ACTIONS).to(device)
+            q_net = cls(OBS_SHAPE, NUM_ACTIONS).to(device)
             with torch.no_grad():
                 q_net.head.mlp[-1].weight.normal_(std=0.01)
             target = copy.deepcopy(q_net)
