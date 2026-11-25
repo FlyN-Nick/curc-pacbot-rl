@@ -34,6 +34,7 @@ from utils import (
     NUM_ACTIONS,
     OBS_SHAPE,
     SUPER_PELLET_MODEL_PATH,
+    full_game,
     make_gym,
     safetensors_qnet,
     step_env_until_done,
@@ -85,7 +86,7 @@ def state_dict_to_numpy(module: torch.nn.Module) -> dict[str, np.ndarray]:
 
 @torch.no_grad()
 def evaluate_episode(
-    q_net: torch.nn.Module, device: torch.device, env_version: int, max_steps: int = 1000,
+    q_net: torch.nn.Module, device: torch.device, env_version: int, max_steps: int | None = None,
     ticks_per_step: int | None = None, seed: int | None = None,
 ) -> tuple[int, int, bool, int, int, int, float]:
     """
@@ -94,18 +95,25 @@ def evaluate_episode(
     unless a `seed` is given; then the same seed and the same moves give the same game, so
     checkpoints can be compared on the same games.
 
+    The game ends at the first lost life, a cleared board or max_steps (1,000), or with
+    utils.full_game() at the last lost life or max_steps (40,000, as alphazero.evaluate_games);
+    a full game's board counts as cleared once at least one board is.
+
     Returns (score, total_steps, is_board_cleared, pellets_start, pellets_end,
     purgatory_pellets, ghost_proximities).
     """
     config = DETERMINISTIC_START_CONFIGURATION if ticks_per_step is None else speed_configuration(ticks_per_step)
+    full = full_game()
+    if max_steps is None:
+        max_steps = 40_000 if full else 1000
     gym = make_gym(config, env_version)
     if seed is not None:
         gym.seed = seed
     pellets_start = gym.remaining_pellets()
     q_net.eval()
     done, step_num = step_env_until_done(gym, MaxQPolicy(q_net), device, max_steps=max_steps)
-    is_board_cleared = done and gym.lives() == 3
-    pellets_end = 0 if is_board_cleared else gym.remaining_pellets()
+    is_board_cleared = gym.level() > 1 if full else done and gym.lives() == 3
+    pellets_end = 0 if is_board_cleared and not full else gym.remaining_pellets()
     return (
         gym.score(),
         step_num,

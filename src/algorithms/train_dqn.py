@@ -80,7 +80,7 @@ from replay_buffer import ReplayBuffer
 from replay_storage import ReplayStorage
 from dqn_update import EagerUpdate, GraphedUpdate, set_capturable, set_learning_rate
 from timing import time_block
-from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, training_speeds, NORMAL_SPEED, set_speed_sampling, set_max_speed, SPEED_SAMPLING_MODES, MIN_SPEED
+from utils import lerp, reset_env, step_env_until_done, step_env_once, select_device, OBS_SHAPE, NUM_ACTIONS, DETERMINISTIC_START_CONFIGURATION, ENV_VERSION, checkpoint_env_version, checkpoint_single_model, set_single_model, single_model, make_gym, checkpoint_ghost_next_obs, set_ghost_next_obs, ghost_next_obs, checkpoint_full_game, set_full_game, full_game, training_speeds, NORMAL_SPEED, set_speed_sampling, set_max_speed, SPEED_SAMPLING_MODES, MIN_SPEED
 import parallel_training
 
 
@@ -157,6 +157,11 @@ if __name__ == "__main__":
     # Before any actor or evaluation process starts, so they inherit it (--eval uses the checkpoint's)
     set_single_model(args.single_model)
     set_ghost_next_obs(args.ghost_next_obs)
+    # Full games (three lives, board after board): only in single-model mode, as the fixed super
+    # pellet model of the two-model mode was trained on games that end at the first lost life
+    if args.full_game and not args.single_model:
+        parser.error("--full_game true needs --single-model")
+    set_full_game(args.full_game)
     if args.speed_sampling not in SPEED_SAMPLING_MODES:
         parser.error(f"--speed_sampling must be one of {SPEED_SAMPLING_MODES}")
     if args.max_speed < MIN_SPEED:
@@ -278,6 +283,9 @@ if __name__ == "__main__":
                         f"--finetune checkpoint was trained with --ghost_next_obs {checkpoint_ghost_next_obs(loaded)}; "
                         "pass the same setting"
                     )
+                if checkpoint_full_game(loaded) != args.full_game:
+                    print(f"Checkpoint was trained {'on' if checkpoint_full_game(loaded) else 'without'} full games; "
+                          f"finetuning continues with --full_game {args.full_game}")
                 if checkpoint_env_version(loaded) != ENV_VERSION:
                     print(f"Checkpoint was trained with environment version {checkpoint_env_version(loaded)}; "
                           f"finetuning continues with version {ENV_VERSION}")
@@ -292,7 +300,7 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"--finetune checkpoint not found: {args.finetune}")
 
 
-def evaluate_episode(max_steps: int = 1000) -> tuple[int, int, bool, int, int, int, float]:
+def evaluate_episode(max_steps: int | None = None) -> tuple[int, int, bool, int, int, int, float]:
     """
     Performs a single evaluation episode.
 
@@ -531,6 +539,7 @@ def _train(replay_buffer, evaluator, actors: bool):
             "env_version": ENV_VERSION,
             "single_model": single_model(),
             "ghost_next_obs": ghost_next_obs(),
+            "full_game": full_game(),
         }
         try:
             if wandb.run is not None and getattr(wandb.run, "id", None):
@@ -758,6 +767,7 @@ if __name__ == "__main__":
             visualize_env_version = checkpoint_env_version(loaded)
             set_single_model(checkpoint_single_model(loaded))
             set_ghost_next_obs(checkpoint_ghost_next_obs(loaded))
+            set_full_game(checkpoint_full_game(loaded))
             print(f"Using environment version {visualize_env_version}")
             if isinstance(loaded, dict) and "state_dict" in loaded:
                 q_net.load_state_dict(loaded["state_dict"])

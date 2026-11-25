@@ -1,5 +1,5 @@
 """
-Full games (PacmanGym.full_game, utils.set_full_game, train_alphazero --full_game true): three
+Full games (PacmanGym.full_game, utils.set_full_game, train_alphazero / train_dqn --full_game true): three
 lives and board after board, as in competition. A lost life costs the death penalty and the game
 goes on from the respawn; a cleared board earns the clear bonus and the next level starts; the
 game ends with the last life. Off, the game ends at the first lost life or cleared board, as
@@ -10,13 +10,18 @@ Run from src/: python -m unittest discover ../tests
 
 import os
 import random
+import subprocess
+import sys
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
 
 import models
+import parallel_training
 import utils
 from alphazero import evaluate_games
 from pacbot_rs import GumbelConfig, PacmanGym, PacmanGymConfiguration, gumbel_search
@@ -25,6 +30,7 @@ from utils import ENV_VERSION
 OBS = PacmanGymConfiguration({})
 STEP = {1: (1, 0), 2: (-1, 0), 3: (0, -1), 4: (0, 1)}  # action: (row, col) change
 DEATH_PENALTY = -200
+SRC = Path(__file__).resolve().parents[1] / "src"
 CLEAR_BONUS = 3_000
 
 
@@ -175,6 +181,83 @@ class FullGameTests(unittest.TestCase):
             self.assertIn("lives", r)
             self.assertEqual(r["boards"], 0)
             self.assertTrue(r["lives"] == 0 or r["steps"] == 300)
+
+
+class StayingQNet(torch.nn.Module):
+    """A DQN that always stays put (the largest Q value is Stay's), so the ghosts catch Pacman."""
+
+    def forward(self, obs):
+        q = torch.zeros(obs.shape[0], utils.NUM_ACTIONS)
+        q[:, 0] = 1.0
+        return q
+
+
+class DqnFullGameTests(unittest.TestCase):
+    """train_dqn --full_game true: training, evaluation and checkpoints play full games."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("PACBOT_FULL_GAME", "PACBOT_SINGLE_MODEL")}
+        utils.set_single_model(True)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def play(self, full: bool, **kwargs):
+        utils.set_full_game(full)
+        return parallel_training.evaluate_episode(StayingQNet(), torch.device("cpu"), ENV_VERSION,
+                                                  ticks_per_step=8, seed=3, **kwargs)
+
+    def test_evaluation_plays_on_to_the_last_life(self):
+        short, full = self.play(False), self.play(True)
+        score, steps, cleared, _, pellets_end, _, _ = full
+        self.assertFalse(short[2])
+        self.assertFalse(cleared)
+        self.assertGreater(steps, short[1])  # it played on after the first lost life
+        self.assertLess(steps, 40_000)  # and ended at the last one, before the step limit
+        self.assertEqual(pellets_end, short[4])  # staying put eats nothing more
+        # The same game, one life at a time: the one-life game is the full game's start
+        self.assertEqual(self.play(True, max_steps=short[1])[:2], short[:2])
+
+    def test_step_limits(self):
+        # 1,000 steps for one life, as before; 40,000 for a full game
+        self.assertEqual(self.play(False, max_steps=None)[1], self.play(False, max_steps=1000)[1])
+        self.assertEqual(self.play(True, max_steps=None)[1], self.play(True, max_steps=40_000)[1])
+
+    def run_dqn(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "algorithms.train_dqn", "--no-wandb", "--no-eval", "--device", "cpu",
+             "--num-actors", "0", "--eval-workers", "0", "--num_iters", "2", "--batch_size", "8",
+             "--replay_buffer_size", "64", "--num_parallel_envs", "4", "--evaluate_steps", "1000",
+             "--candidate_games_per_speed", "1", "--max_speed", "4", *args],
+            cwd=SRC, capture_output=True, text=True, timeout=900)
+
+    def test_training_records_full_games_in_its_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dqn("--checkpoint-dir", tmp, "--single-model", "--full_game", "true")
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+            for name in ("q_net-latest.ckpt.pt", "q_net-best.ckpt.pt"):
+                ck = torch.load(Path(tmp) / name, map_location="cpu", weights_only=False)
+                self.assertTrue(ck["full_game"])
+                self.assertTrue(ck["config"]["full_game"])
+                self.assertTrue(utils.checkpoint_full_game(ck))
+
+    def test_off_by_default_in_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dqn("--checkpoint-dir", tmp, "--single-model")
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+            ck = torch.load(Path(tmp) / "q_net-latest.ckpt.pt", map_location="cpu", weights_only=False)
+            self.assertFalse(ck["full_game"])
+            self.assertFalse(utils.checkpoint_full_game(ck))
+
+    def test_full_games_need_the_single_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dqn("--checkpoint-dir", tmp, "--full_game", "true")
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("--full_game true needs --single-model", run.stderr)
 
 
 if __name__ == "__main__":

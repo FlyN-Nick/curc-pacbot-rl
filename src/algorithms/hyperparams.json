@@ -8,6 +8,7 @@
     "random_start_proportion": 0.0,
     "random_pellet_removal": false,
     "ghost_next_obs": false,
+    "full_game": false,
     "experience_steps": 4,
     "target_network_update_steps": 5000,
     "evaluate_steps": 10,
