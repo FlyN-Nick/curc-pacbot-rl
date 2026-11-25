@@ -60,6 +60,7 @@ uv run --project . --directory src python -m algorithms.train_ppo \
 - **Each rollout:** each of `--num_games` games (256) plays `--rollout_steps` moves (128), sampling from the policy over the legal moves.
 - **Then training:** `--epochs` passes (4) over the rollout in `--minibatches` (8), with PPO's clipped policy loss (`--clip_range` 0.2), the value loss (`--value_loss_weight` 0.5, optionally clipped with `--value_clip_range`) and an entropy bonus (`--entropy_coef` 0.01).
 - **Advantages:** GAE (`--discount` 0.99, `--gae_lambda` 0.95), on rewards scaled by `--reward_scale` (0.02), so the value is in the search's units.
+- **Large rollouts:** `--max_chunk N` (off by default) runs each minibatch through the network in pieces of at most N positions and adds up their gradients before the one optimizer step: the same update, with memory for N positions at a time. A minibatch is `num_games * rollout_steps / minibatches` positions, and PVNetV2 keeps about 0.6 MB per position for the backward pass, so `--num_games 1024` (16,384 per minibatch, about 10 GB) fits a 16 GB GPU beside other runs with `--max_chunk 4096`.
 - **Shared options:** `--full_game`, `--speed_sampling`, `--max_speed`, the evaluations and checkpoints (`model-best.ckpt.pt`, `model-best-search.ckpt.pt`, `model-latest.ckpt.pt`; `--resume`) work as in AlphaZero training.
 - **More:** `--target_kl` stops a rollout's epochs early once the policy has moved that far. Every hyperparameter is a flag (`HYPERPARAMS` at the top of the script, or `--help`).
 
