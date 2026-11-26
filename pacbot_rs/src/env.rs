@@ -269,6 +269,19 @@ pub struct PacmanGym {
     /// lost life or cleared board. Kept across resets.
     #[pyo3(get, set)]
     pub full_game: bool,
+
+    /// Latency: before each move, the game runs a random 0 to `latency_max` extra ticks with
+    /// Pacman still on his square (the ghosts keep moving), as when the robot carries a move out
+    /// late; a lost life during them ends the step. 0 (the default) adds none and draws nothing,
+    /// so games are exactly as without it. Kept across resets.
+    #[pyo3(get, set)]
+    pub latency_max: u32,
+
+    /// The seed of the latency draws, apart from the game's own (see `latency_max`). Set from the
+    /// seed given to reset and to `seed`, so a seeded game's delays repeat too; search copies of
+    /// the game draw a new one, so a search can't see the real game's coming delays.
+    #[pyo3(get, set)]
+    pub latency_seed: u64,
 }
 
 #[cfg(not(feature = "python"))]
@@ -292,6 +305,12 @@ pub struct PacmanGym {
 
     /// See the Python build's field of the same name.
     pub full_game: bool,
+
+    /// See the Python build's field of the same name.
+    pub latency_max: u32,
+
+    /// See the Python build's field of the same name.
+    pub latency_seed: u64,
 }
 
 fn modify_bit_u32(num: &mut u32, bit_idx: usize, bit_val: bool) {
@@ -324,6 +343,11 @@ fn ghost_next_pos(loc: LocationState) -> Option<(usize, usize)> {
     }
 }
 
+/// The latency seed of a game with this seed: a different stream from the game's own.
+fn latency_seed_for(seed: u64) -> u64 {
+    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x4C41_5445_4E43_5900
+}
+
 // Common Rust Implementation
 impl PacmanGym {
     pub fn new(config: &PacmanGymConfiguration) -> Self {
@@ -343,6 +367,8 @@ impl PacmanGym {
             env_version: LATEST_ENV_VERSION,
             ghost_next_obs: false,
             full_game: false,
+            latency_max: 0,
+            latency_seed: 0,
         };
         s.reset_with_seed(config, seed);
         s
@@ -359,6 +385,11 @@ impl PacmanGym {
         let rng = &mut match seed {
             Some(seed) => SmallRng::seed_from_u64(seed),
             None => SmallRng::from_entropy(),
+        };
+        // Apart from `rng`, so the rest of the game is the same with and without latency
+        self.latency_seed = match seed {
+            Some(seed) => latency_seed_for(seed),
+            None => rand::random(),
         };
         self.purgatory_pellets = 0;
         self.last_score = 0;
@@ -457,8 +488,22 @@ impl PacmanGym {
         // Before the move: Pacman can die walking into a ghost
         let lives_before = self.game_state.get_lives();
         let level_before = self.game_state.get_level();
-        // Update Pacman pos
-        self.move_one_cell(action);
+        // Latency: the ghosts move on while Pacman's move is still to come
+        let delay = self.draw_latency();
+        for _ in 0..delay {
+            self.game_state.step();
+            if self.is_done()
+                || self.game_state.get_lives() < lives_before
+                || self.game_state.get_level() != level_before
+            {
+                break;
+            }
+        }
+        let delayed_out = self.game_state.get_lives() < lives_before || self.is_done();
+        // Update Pacman pos (not after a life lost waiting for it)
+        if !delayed_out {
+            self.move_one_cell(action);
+        }
         // Pacman moves only here, so a pellet eaten this step is on this square
         let pacman_square = (self.game_state.pacman_loc.row, self.game_state.pacman_loc.col);
 
@@ -468,7 +513,7 @@ impl PacmanGym {
         } else {
             TURN_PENALTY
         };
-        for _ in 0..self.ticks_per_step {
+        for _ in 0..if delayed_out { 0 } else { self.ticks_per_step } {
             self.game_state.step();
             // A step ends at a lost life or a cleared board, so its reward is that event's
             if self.is_done()
@@ -715,6 +760,17 @@ impl PacmanGym {
 
         self.last_action = Action::Stay;
         self.last_score = self.game_state.curr_score;
+    }
+
+    /// This move's latency in game ticks (see `latency_max`); draws nothing when it is 0.
+    fn draw_latency(&mut self) -> u32 {
+        if self.latency_max == 0 {
+            return 0;
+        }
+        let mut rng = SmallRng::seed_from_u64(self.latency_seed);
+        let delay = rng.gen_range(0..=self.latency_max);
+        self.latency_seed = rng.gen();
+        delay
     }
 
     fn move_one_cell(&mut self, action: Action) {
@@ -976,6 +1032,7 @@ impl PacmanGym {
         let mut env = self.clone();
         if reseed {
             env.game_state.seed = rand::random();
+            env.latency_seed = rand::random();
         }
         env
     }
@@ -992,6 +1049,7 @@ impl PacmanGym {
     #[setter]
     pub fn set_seed(&mut self, seed: u64) {
         self.game_state.seed = seed;
+        self.latency_seed = latency_seed_for(seed);
     }
 
     #[classattr]

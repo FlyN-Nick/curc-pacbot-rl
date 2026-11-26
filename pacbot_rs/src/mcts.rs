@@ -301,6 +301,10 @@ impl MCTSContext {
     pub fn select_trajectory(&self) -> (Vec<Transition>, Option<(Array3<f32>, [bool; 5])>) {
         assert!(!self.env.is_done());
         let mut env = self.env.clone();
+        if env.latency_max > 0 {
+            // A search can't see the real game's coming delays (see PacmanGym::latency_max)
+            env.latency_seed = rand::random();
+        }
 
         let mut trajectory = Vec::new();
         let mut node = &self.root;

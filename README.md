@@ -100,6 +100,7 @@ PYTHONPATH=.:../model_package ../.venv/bin/python eval_az_seeds.py 48 results.cs
 
 - Each checkpoint is written as `PATH:SIMULATIONS[:TEMPERATURE]`. The temperature applies to DQN priors and defaults to 0.1; 0.3 worked best.
 - `PACBOT_FULL_GAME=1` plays every game as a full game, adding `boards` (boards cleared) and `lives` (lives left) columns.
+- `PACBOT_LATENCY_MAX=N` plays every game with latency: before each move, a random 0 to N extra game ticks (1 tick is about 42 ms) with Pacman still on his square while the ghosts move, as when the robot carries a move out late. Each game's delays come from its seed, and the search draws its own, so it can't see the real game's coming delays. 0, the default, adds none: games are exactly as without it.
 - `src/game_report.py` plays the same seeded games without search and reports how each one ends, and what was going on just before a lost life.
 
 To watch a checkpoint play in the terminal:

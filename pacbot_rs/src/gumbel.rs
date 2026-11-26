@@ -437,6 +437,10 @@ impl Search {
     fn select(&mut self, k: usize, config: &GumbelConfig) {
         let mut env = self.root_env.clone();
         env.game_state.seed = self.rng.gen();
+        if env.latency_max > 0 {
+            // Its own delays, too; drawn only with latency on, so searches without it are unchanged
+            env.latency_seed = self.rng.gen();
+        }
         self.path.clear();
         let mut node = 0u32;
         let mut action = self.root_action(k, config);
