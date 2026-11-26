@@ -59,6 +59,23 @@ def full_game() -> bool:
     return os.environ.get(_FULL_GAME_ENV) == "1"
 
 
+# Latency (PacmanGym.latency_max): before each move, a random 0 to N extra game ticks with Pacman
+# still on his square while the ghosts move, as when the robot carries a move out late. Kept in
+# the environment like full games, so every game make_gym builds plays with it; 0 (the default)
+# adds none, and games are exactly as without it.
+_LATENCY_MAX_ENV = "PACBOT_LATENCY_MAX"
+
+
+def set_latency_max(ticks: int) -> None:
+    if ticks < 0:
+        raise ValueError(f"latency_max must be at least 0, got {ticks}")
+    os.environ[_LATENCY_MAX_ENV] = str(ticks)
+
+
+def latency_max() -> int:
+    return int(os.environ.get(_LATENCY_MAX_ENV, "0"))
+
+
 def parse_bool(text: str) -> bool:
     """An argparse type for true/false flags (bool("False") would be True)."""
     lowered = text.strip().lower()
@@ -138,6 +155,7 @@ def make_gym(config: "PacmanGymConfiguration", env_version: int, seed: int | Non
     env.env_version = env_version
     env.ghost_next_obs = ghost_next_obs()
     env.full_game = full_game()
+    env.latency_max = latency_max()
     return env
 
 
