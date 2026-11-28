@@ -7,6 +7,8 @@ Usage: eval_az_seeds.py SEEDS OUT.csv CKPT:SIMS[:TEMP] ...
 With PACBOT_FULL_GAME=1, every checkpoint plays full games (three lives, board after board, as in
 competition) instead of ending at the first lost life or cleared board; "cleared" is then at
 least one board, and the boards and lives columns say how many boards it cleared and lives it kept.
+Each game's row is written as soon as that game ends (so rows come in the order games finish), and
+a progress line is printed every 48 games; the games play exactly as when the rows came at the end.
 """
 import csv, sys, time
 import numpy as np, torch
@@ -41,13 +43,21 @@ with open(sys.argv[2], "w", newline="") as f:
                                   reward_scale=cfg["reward_scale"], gumbel_scale=0.0)
             evaluator = QNetworkEvaluator(net, device, temperature)
         t = time.perf_counter()
-        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.training_speeds(), seeds, search=search,
-                             evaluator=evaluator)
         name = path.split("/checkpoints/")[-1]
-        for r in res:
+        total = len(utils.training_speeds()) * len(seeds)
+        finished = []
+
+        def write(r, name=name, sims=sims, temperature=temperature, t=t):
             out.writerow([name, sims, temperature, r["speed"], r["seed"], r["score"], r["steps"], int(r["cleared"]), r["pellets_left"],
                           r["boards"], r["lives"]])
-        f.flush()
+            f.flush()
+            finished.append(r)
+            if len(finished) % 48 == 0 or len(finished) == total:
+                print(f"  {name} sims {sims}: {len(finished)} of {total} games done, "
+                      f"{time.perf_counter()-t:.0f}s", flush=True)
+
+        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.training_speeds(), seeds, search=search,
+                             evaluator=evaluator, on_done=write)
         sc = np.array([r["score"] for r in res])
         by = lambda lo, hi: np.mean([r["score"] for r in res if lo <= r["speed"] <= hi])
         slow = f" 15-18 {by(15, 18):.0f}" if utils.max_speed() > 14 else ""

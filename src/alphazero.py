@@ -269,7 +269,7 @@ def losses(net: torch.nn.Module, batch: Batch) -> tuple[torch.Tensor, torch.Tens
 @torch.inference_mode()
 def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int, obs_config,
                    speeds, seeds, search: GumbelConfig | None = None, max_steps: int | None = None,
-                   search_seed: int = 0, evaluator=None) -> list[dict]:
+                   search_seed: int = 0, evaluator=None, on_done=None) -> list[dict]:
     """
     Plays one game per (speed, seed) from the normal start, all at once, until each loses a
     life, clears the board or reaches max_steps (10,000), or with utils.full_game() until it
@@ -277,7 +277,8 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
     with `search` (use gumbel_scale=0 for no exploration). The search evaluates states with
     `evaluator` if given (e.g. QNetworkEvaluator), else with the network. Returns one dict per
     game: speed, seed, score, steps, cleared, pellets_left, boards (boards cleared) and lives
-    (lives left).
+    (lives left). `on_done`, if given, is called with each game's dict as soon as that game ends
+    (the games still play exactly as without it).
     """
     full = full_game()
     if max_steps is None:
@@ -310,13 +311,17 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
             g["steps"] += 1
             if done or g["steps"] >= max_steps:
                 g["done"] = True
-    results = []
-    for g in games:
-        env = g["env"]
-        boards = env.level() - 1
-        # A full game's "cleared": at least one board cleared
-        cleared = boards > 0 if full else env.is_done() and env.lives() == 3
-        results.append({"speed": g["speed"], "seed": g["seed"], "score": env.score(), "steps": g["steps"],
-                        "cleared": cleared, "pellets_left": 0 if cleared and not full else env.remaining_pellets(),
-                        "boards": boards, "lives": env.lives()})
-    return results
+                if on_done is not None:
+                    on_done(_game_result(g, full))
+    return [_game_result(g, full) for g in games]
+
+
+def _game_result(g: dict, full: bool) -> dict:
+    """evaluate_games' dict for one game (a finished game's env no longer changes)."""
+    env = g["env"]
+    boards = env.level() - 1
+    # A full game's "cleared": at least one board cleared
+    cleared = boards > 0 if full else env.is_done() and env.lives() == 3
+    return {"speed": g["speed"], "seed": g["seed"], "score": env.score(), "steps": g["steps"],
+            "cleared": cleared, "pellets_left": 0 if cleared and not full else env.remaining_pellets(),
+            "boards": boards, "lives": env.lives()}

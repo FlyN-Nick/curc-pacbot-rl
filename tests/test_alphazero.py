@@ -335,6 +335,21 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(len(searched), 1)
         self.assertGreater(searched[0]["steps"], 0)
 
+    def test_on_done_reports_each_game_as_it_ends(self):
+        torch.manual_seed(0)
+        net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)
+        device = torch.device("cpu")
+        search = GumbelConfig(num_simulations=4, gumbel_scale=0.0)
+        plain = evaluate_games(net, device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2], search=search, max_steps=200)
+        reported = []
+        results = evaluate_games(net, device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2], search=search, max_steps=200,
+                                 on_done=reported.append)
+        self.assertEqual(results, plain)  # the callback changes nothing about the games
+        # Each game once, in the order the games ended (by length), with its final result
+        key = lambda g: (g["speed"], g["seed"])
+        self.assertEqual(sorted(reported, key=key), sorted(results, key=key))
+        self.assertEqual([g["steps"] for g in reported], sorted(g["steps"] for g in results))
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_graphed_evaluator_matches_and_follows_updates(self):
         device = torch.device("cuda")
