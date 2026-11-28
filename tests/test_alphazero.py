@@ -7,6 +7,8 @@ Run from src/: python -m unittest discover -s ../tests -p test_alphazero.py
 
 import random
 import sys
+import tempfile
+import os
 import unittest
 from pathlib import Path
 
@@ -334,6 +336,62 @@ class EvaluationTests(unittest.TestCase):
                                   search=GumbelConfig(num_simulations=4, gumbel_scale=0.0))
         self.assertEqual(len(searched), 1)
         self.assertGreater(searched[0]["steps"], 0)
+
+    def test_on_done_reports_each_game_as_it_ends(self):
+        torch.manual_seed(0)
+        net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)
+        device = torch.device("cpu")
+        search = GumbelConfig(num_simulations=4, gumbel_scale=0.0)
+        plain = evaluate_games(net, device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2], search=search, max_steps=200)
+        reported = []
+        results = evaluate_games(net, device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2], search=search, max_steps=200,
+                                 on_done=reported.append)
+        self.assertEqual(results, plain)  # the callback changes nothing about the games
+        # Each game once, in the order the games ended (by length), with its final result
+        key = lambda g: (g["speed"], g["seed"])
+        self.assertEqual(sorted(reported, key=key), sorted(results, key=key))
+        self.assertEqual([g["steps"] for g in reported], sorted(g["steps"] for g in results))
+
+    def test_a_stopped_evaluation_resumes_exactly(self):
+        torch.manual_seed(0)
+        net = models.PVNetV2(OBS_SHAPE, NUM_ACTIONS)
+        with torch.no_grad():
+            for p in net.parameters():
+                p.add_(torch.randn_like(p) * 0.05)  # a policy that plays differently from game to game
+        device = torch.device("cpu")
+        search = GumbelConfig(num_simulations=4, gumbel_scale=0.0)
+        run = lambda **kw: evaluate_games(net, device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2, 3], search=search,
+                                          max_steps=200, **kw)
+        plain = run()
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "eval.moves")
+            self.assertEqual(run(move_log=log, log_key="a"), plain)  # logging changes nothing
+            with open(log) as f:
+                whole = f.read()
+            lines = whole.split("\n")[:-1]
+            self.assertEqual(len(lines) - 1, max(g["steps"] for g in plain))  # a header, then one line per move
+            # Stopped partway, after some games ended, with half a line written
+            ended = sorted(g["steps"] for g in plain)
+            cut = (ended[0] + ended[-1]) // 2
+            self.assertLess(ended[0], cut)
+            with open(log, "w") as f:
+                f.write("\n".join(lines[:cut + 1]) + "\n" + lines[cut + 1][:1])
+            reported = []
+            self.assertEqual(run(move_log=log, log_key="a", on_done=reported.append), plain)
+            self.assertEqual(len(reported), len(plain))  # the games that ended before the stop are reported again
+            with open(log) as f:
+                self.assertEqual(f.read(), whole)
+            # A whole log replays without searching
+            class NoNet(torch.nn.Module):
+                def forward(self, x):
+                    raise AssertionError("searched while replaying")
+            replayed = evaluate_games(NoNet(), device, utils.ENV_VERSION, OBS_CONFIG, [8, 12], [1, 2, 3], search=search,
+                                      max_steps=200, move_log=log, log_key="a")
+            self.assertEqual(replayed, plain)
+            # Another evaluation's log is moved aside, not replayed
+            self.assertEqual(run(move_log=log, log_key="b"), plain)
+            with open(log + ".stale") as f:
+                self.assertEqual(f.read(), whole)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_graphed_evaluator_matches_and_follows_updates(self):

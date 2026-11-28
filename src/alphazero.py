@@ -17,6 +17,8 @@ Pieces of AlphaZero-style training (algorithms/train_alphazero.py) with Gumbel s
 
 from __future__ import annotations
 
+import json
+import os
 from collections import deque
 from typing import NamedTuple
 
@@ -26,7 +28,7 @@ import torch.nn.functional as F
 
 from pacbot_rs import GumbelConfig, PacmanGym, gumbel_search
 from replay_storage import ObsCodec
-from utils import NUM_ACTIONS, OBS_SHAPE, full_game, make_gym, speed_configuration
+from utils import NUM_ACTIONS, OBS_SHAPE, full_game, latency_max, make_gym, speed_configuration
 
 
 # Search settings added after the first runs, with the values those runs used (Gumbel search)
@@ -269,7 +271,8 @@ def losses(net: torch.nn.Module, batch: Batch) -> tuple[torch.Tensor, torch.Tens
 @torch.inference_mode()
 def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int, obs_config,
                    speeds, seeds, search: GumbelConfig | None = None, max_steps: int | None = None,
-                   search_seed: int = 0, evaluator=None) -> list[dict]:
+                   search_seed: int = 0, evaluator=None, on_done=None, move_log: str | None = None,
+                   log_key: str = "") -> list[dict]:
     """
     Plays one game per (speed, seed) from the normal start, all at once, until each loses a
     life, clears the board or reaches max_steps (10,000), or with utils.full_game() until it
@@ -277,7 +280,17 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
     with `search` (use gumbel_scale=0 for no exploration). The search evaluates states with
     `evaluator` if given (e.g. QNetworkEvaluator), else with the network. Returns one dict per
     game: speed, seed, score, steps, cleared, pellets_left, boards (boards cleared) and lives
-    (lives left).
+    (lives left). `on_done`, if given, is called with each game's dict as soon as that game ends
+    (the games still play exactly as without it).
+
+    `move_log`, if given, is a file the moves are written to as they are played, one line per
+    move of the games still playing, after a header naming the evaluation (`log_key`, e.g. a
+    checkpoint's hash, with the speeds, seeds, search and game settings). If the file already
+    holds a log of the same evaluation (a stopped run's), its moves are replayed without
+    searching and play continues from there: the games still playing are then exactly those of
+    the stopped run, in the same places in the batch, so each search draws the same random
+    numbers and the results are those of a run that was never stopped (given the same
+    network outputs). A log of a different evaluation is moved aside to FILE.stale.
     """
     full = full_game()
     if max_steps is None:
@@ -291,32 +304,74 @@ def evaluate_games(net: torch.nn.Module, device: torch.device, env_version: int,
             games.append({"speed": speed, "seed": seed, "env": env, "steps": 0, "done": False})
     if search is not None and evaluator is None:
         evaluator = NetworkEvaluator(net, device, max_batch=len(games))
+    logged, log = _open_move_log(move_log, {
+        "key": log_key, "env_version": env_version, "speeds": list(speeds), "seeds": list(seeds),
+        "search": repr(search), "search_seed": search_seed, "max_steps": max_steps, "full_game": full,
+        "latency_max": latency_max(), "evaluator": type(evaluator).__name__,
+        "temperature": getattr(evaluator, "temperature", None)})
     step = 0
     while True:
         live = [g for g in games if not g["done"]]
         if not live:
             break
         envs: list[PacmanGym] = [g["env"] for g in live]
-        if search is None:
+        if step < len(logged):  # replaying a stopped run's moves
+            actions = logged[step]
+            if len(actions) != len(live):
+                raise ValueError(f"{move_log}: move {step} has {len(actions)} moves for {len(live)} games")
+        elif search is None:
             obs = np.stack([e.obs_numpy(obs_config) for e in envs])
             legal = torch.tensor([e.action_mask() for e in envs], device=device)
             logits, _ = net(torch.from_numpy(obs).to(device))
             actions = logits.masked_fill(~legal, -torch.inf).argmax(dim=1).tolist()
         else:
             actions = gumbel_search(envs, evaluator, search, obs_config, search_seed + step)[0].tolist()
+        if log is not None and step >= len(logged):
+            log.write(" ".join(str(int(a)) for a in actions) + "\n")
+            log.flush()
         step += 1
         for g, action in zip(live, actions):
             _, done = g["env"].step(int(action))
             g["steps"] += 1
             if done or g["steps"] >= max_steps:
                 g["done"] = True
-    results = []
-    for g in games:
-        env = g["env"]
-        boards = env.level() - 1
-        # A full game's "cleared": at least one board cleared
-        cleared = boards > 0 if full else env.is_done() and env.lives() == 3
-        results.append({"speed": g["speed"], "seed": g["seed"], "score": env.score(), "steps": g["steps"],
-                        "cleared": cleared, "pellets_left": 0 if cleared and not full else env.remaining_pellets(),
-                        "boards": boards, "lives": env.lives()})
-    return results
+                if on_done is not None:
+                    on_done(_game_result(g, full))
+    if log is not None:
+        log.close()
+    return [_game_result(g, full) for g in games]
+
+
+def _open_move_log(path: str | None, header: dict):
+    """evaluate_games' move log: (the moves already logged for this evaluation, the file open
+    for appending), keeping only whole lines of a log with this header; (no moves, None) without
+    a path."""
+    if path is None:
+        return [], None
+    head = json.dumps(header, sort_keys=True)
+    logged = []
+    if os.path.exists(path):
+        with open(path) as f:
+            text = f.read()
+        lines = text.split("\n")[:-1]  # whole lines only: a stopped run may have left half of one
+        if lines and lines[0] == head:
+            logged = [[int(a) for a in line.split()] for line in lines[1:]]
+        else:
+            os.replace(path, path + ".stale")
+    log = open(path, "w")  # rewritten with only whole lines, then appended to
+    log.write(head + "\n")
+    for actions in logged:
+        log.write(" ".join(map(str, actions)) + "\n")
+    log.flush()
+    return logged, log
+
+
+def _game_result(g: dict, full: bool) -> dict:
+    """evaluate_games' dict for one game (a finished game's env no longer changes)."""
+    env = g["env"]
+    boards = env.level() - 1
+    # A full game's "cleared": at least one board cleared
+    cleared = boards > 0 if full else env.is_done() and env.lives() == 3
+    return {"speed": g["speed"], "seed": g["seed"], "score": env.score(), "steps": g["steps"],
+            "cleared": cleared, "pellets_left": 0 if cleared and not full else env.remaining_pellets(),
+            "boards": boards, "lives": env.lives()}

@@ -7,8 +7,14 @@ Usage: eval_az_seeds.py SEEDS OUT.csv CKPT:SIMS[:TEMP] ...
 With PACBOT_FULL_GAME=1, every checkpoint plays full games (three lives, board after board, as in
 competition) instead of ending at the first lost life or cleared board; "cleared" is then at
 least one board, and the boards and lives columns say how many boards it cleared and lives it kept.
+Each game's row is written as soon as that game ends (so rows come in the order games finish), and
+a progress line is printed every 48 games; the games play exactly as when the rows came at the end.
+The moves are logged to OUT.csv.K.moves (K: the checkpoint's place in the list). Run the same
+command again after it is stopped and it resumes: it replays the logged moves (seconds, no search),
+rewrites the finished games' rows and plays on, with the results of a run that was never stopped.
+Delete the .moves files to score from scratch.
 """
-import csv, sys, time
+import csv, hashlib, os, sys, time
 import numpy as np, torch
 import models, utils
 from alphazero import QNetworkEvaluator, evaluate_games, search_config
@@ -25,7 +31,7 @@ with open(sys.argv[2], "w", newline="") as f:
                   "boards", "lives"])
     if utils.full_game():
         print("Full games: three lives, board after board", flush=True)
-    for spec in sys.argv[3:]:
+    for k, spec in enumerate(sys.argv[3:]):
         path, sims, *temp = spec.split(":")
         ck = torch.load(path, map_location=device, weights_only=False)
         cfg = ck["config"]
@@ -41,13 +47,27 @@ with open(sys.argv[2], "w", newline="") as f:
                                   reward_scale=cfg["reward_scale"], gumbel_scale=0.0)
             evaluator = QNetworkEvaluator(net, device, temperature)
         t = time.perf_counter()
-        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.training_speeds(), seeds, search=search,
-                             evaluator=evaluator)
         name = path.split("/checkpoints/")[-1]
-        for r in res:
+        total = len(utils.training_speeds()) * len(seeds)
+        finished = []
+
+        def write(r, name=name, sims=sims, temperature=temperature, t=t):
             out.writerow([name, sims, temperature, r["speed"], r["seed"], r["score"], r["steps"], int(r["cleared"]), r["pellets_left"],
                           r["boards"], r["lives"]])
-        f.flush()
+            f.flush()
+            finished.append(r)
+            if len(finished) % 48 == 0 or len(finished) == total:
+                print(f"  {name} sims {sims}: {len(finished)} of {total} games done, "
+                      f"{time.perf_counter()-t:.0f}s", flush=True)
+
+        with open(path, "rb") as ckf:
+            key = hashlib.sha256(ckf.read()).hexdigest()
+        move_log = f"{sys.argv[2]}.{k}.moves"
+        if os.path.exists(move_log):
+            with open(move_log) as lf:
+                print(f"  {name} sims {sims}: found {move_log} ({sum(1 for _ in lf) - 1} moves), resuming from it if it is this evaluation's", flush=True)
+        res = evaluate_games(net, device, utils.ENV_VERSION, obs_config, utils.training_speeds(), seeds, search=search,
+                             evaluator=evaluator, on_done=write, move_log=move_log, log_key=key)
         sc = np.array([r["score"] for r in res])
         by = lambda lo, hi: np.mean([r["score"] for r in res if lo <= r["speed"] <= hi])
         slow = f" 15-18 {by(15, 18):.0f}" if utils.max_speed() > 14 else ""
